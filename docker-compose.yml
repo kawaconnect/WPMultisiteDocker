@@ -208,18 +208,17 @@ services:
           memory: 256M
 
   # ---------------------------------------------------------------------------
-  # Cloudflare Tunnel
+  # Cloudflare Tunnels, one per CF account
   # ---------------------------------------------------------------------------
-  # One container per Cloudflare ACCOUNT (not per domain). A single tunnel
-  # serves unlimited domains/subdomains, add them in the CF Zero Trust
-  # dashboard under the tunnel's Public Hostname tab, all pointing to
-  # http://nginx:80.
+  # Each Cloudflare account needs its own tunnel + container. A single tunnel
+  # handles ALL domains on that account. Add hostnames in each account's
+  # Zero Trust dashboard → Tunnels → Public Hostname → http://nginx:80
   #
-  # Uses the "tunnels" profile, does NOT start with `docker compose up -d`.
-  # Start with:  docker compose --profile tunnels up -d
-  # Or use:      ./scripts/failover-activate.sh
+  # Start all tunnels:  docker compose --profile tunnels up -d
   # ---------------------------------------------------------------------------
-  cloudflared:
+
+  # Standby tunnel, standby.example.net account (*.standby.example.net)
+  cloudflared-standby.example.net:
     image: cloudflare/cloudflared:latest
     restart: unless-stopped
     profiles:
@@ -228,13 +227,15 @@ services:
       - frontend
     command: tunnel --no-autoupdate run
     environment:
-      TUNNEL_TOKEN: ${CLOUDFLARE_TUNNEL_TOKEN}
+      TUNNEL_TOKEN: ${CF_TUNNEL_STANDBY}
     deploy:
       resources:
         limits:
           memory: 128M
 
-  # --- Additional Cloudflare account (only if domains span multiple accounts) ---
+  # Failover tunnels, one per CF account with real domains
+  # Create a tunnel in each account, paste token in .env, uncomment below.
+
   # cloudflared-account2:
   #   image: cloudflare/cloudflared:latest
   #   restart: unless-stopped
@@ -244,7 +245,22 @@ services:
   #     - frontend
   #   command: tunnel --no-autoupdate run
   #   environment:
-  #     TUNNEL_TOKEN: ${CLOUDFLARE_TUNNEL_TOKEN_ACCOUNT2}
+  #     TUNNEL_TOKEN: ${CF_TUNNEL_ACCOUNT2}
+  #   deploy:
+  #     resources:
+  #       limits:
+  #         memory: 128M
+
+  # cloudflared-account3:
+  #   image: cloudflare/cloudflared:latest
+  #   restart: unless-stopped
+  #   profiles:
+  #     - tunnels
+  #   networks:
+  #     - frontend
+  #   command: tunnel --no-autoupdate run
+  #   environment:
+  #     TUNNEL_TOKEN: ${CF_TUNNEL_ACCOUNT3}
   #   deploy:
   #     resources:
   #       limits:
