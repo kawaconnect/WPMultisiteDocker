@@ -66,6 +66,6 @@ if [ "$ALL_HEALTHY" = true ]; then
 else
     echo "=== Failover activation completed with WARNINGS ==="
     echo "Some tunnel containers are not running. Check logs:"
-    echo "  docker compose --profile tunnels logs cloudflared-account1"
+    echo "  docker compose --profile tunnels logs cloudflared"
     exit 1
 fi

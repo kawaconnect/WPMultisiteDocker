@@ -208,9 +208,18 @@ services:
           memory: 256M
 
   # ---------------------------------------------------------------------------
-  # Cloudflare Tunnel, Account 1
+  # Cloudflare Tunnel
   # ---------------------------------------------------------------------------
-  cloudflared-account1:
+  # One container per Cloudflare ACCOUNT (not per domain). A single tunnel
+  # serves unlimited domains/subdomains, add them in the CF Zero Trust
+  # dashboard under the tunnel's Public Hostname tab, all pointing to
+  # http://nginx:80.
+  #
+  # Uses the "tunnels" profile, does NOT start with `docker compose up -d`.
+  # Start with:  docker compose --profile tunnels up -d
+  # Or use:      ./scripts/failover-activate.sh
+  # ---------------------------------------------------------------------------
+  cloudflared:
     image: cloudflare/cloudflared:latest
     restart: unless-stopped
     profiles:
@@ -219,15 +228,13 @@ services:
       - frontend
     command: tunnel --no-autoupdate run
     environment:
-      TUNNEL_TOKEN: ${CLOUDFLARE_TUNNEL_TOKEN_ACCOUNT1}
+      TUNNEL_TOKEN: ${CLOUDFLARE_TUNNEL_TOKEN}
     deploy:
       resources:
         limits:
           memory: 128M
 
-  # ---------------------------------------------------------------------------
-  # Cloudflare Tunnel, Account 2 (uncomment when needed)
-  # ---------------------------------------------------------------------------
+  # --- Additional Cloudflare account (only if domains span multiple accounts) ---
   # cloudflared-account2:
   #   image: cloudflare/cloudflared:latest
   #   restart: unless-stopped

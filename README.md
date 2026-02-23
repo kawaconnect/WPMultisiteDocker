@@ -1,6 +1,6 @@
 # WordPress Multisite: Docker Infrastructure
 
-Docker-based WordPress Multisite (subdirectory mode) with Nginx reverse proxy, MariaDB, Redis object cache, WP-CLI cron, and Cloudflare tunnel support. Designed as standby/failover infrastructure with automatic multisite activation on DB sync.
+Docker-based WordPress Multisite with Nginx reverse proxy, MariaDB, Redis object cache, WP-CLI cron, and Cloudflare tunnel support. Designed as standby/failover infrastructure with automatic multisite activation on DB sync.
 
 ## Architecture
 
@@ -9,7 +9,7 @@ Docker-based WordPress Multisite (subdirectory mode) with Nginx reverse proxy, M
                     │              frontend network               │
                     │                 (bridge)                    │
                     │                                             │
-   :8080 ──────────┤► nginx ◄──── cloudflared-account1           │
+   :8080 ──────────┤► nginx ◄──── cloudflared                    │
                     │    │         (profiles: tunnels)            │
                     │    │                                        │
                     │  wordpress (PHP-FPM)                        │
@@ -24,7 +24,7 @@ Docker-based WordPress Multisite (subdirectory mode) with Nginx reverse proxy, M
                     └─────────────────────────────────────────────┘
 ```
 
-**6 services** (5 core + 1 tunnel per Cloudflare account):
+**6 services** (5 core + 1 Cloudflare tunnel):
 
 | Service | Image | Purpose |
 |---------|-------|---------|
@@ -33,7 +33,7 @@ Docker-based WordPress Multisite (subdirectory mode) with Nginx reverse proxy, M
 | **wordpress** | wordpress:6-fpm | PHP-FPM application |
 | **nginx** | nginx:1.27-alpine | Reverse proxy, static files, security |
 | **wp-cron** | wordpress:cli | Runs WP cron every 5 minutes via WP-CLI |
-| **cloudflared-account1** | cloudflare/cloudflared | Tunnel connector (only starts with `--profile tunnels`) |
+| **cloudflared** | cloudflare/cloudflared | Tunnel connector (only starts with `--profile tunnels`) |
 
 ## Quick Start
 
@@ -48,11 +48,6 @@ cd /opt/docker/wordpressmultisite
 
 ```bash
 cp .env.example .env
-```
-
-Edit `.env` and set real passwords:
-
-```bash
 vi .env
 ```
 
@@ -61,7 +56,7 @@ At minimum, change these:
 - `MYSQL_PASSWORD`: strong random password
 - `WORDPRESS_DB_PASSWORD`: must match `MYSQL_PASSWORD`
 - `WP_DOMAIN_CURRENT_SITE`: your primary domain (default: `example.com`)
-- `CLOUDFLARE_TUNNEL_TOKEN_ACCOUNT1`: your tunnel token (when ready)
+- `CLOUDFLARE_TUNNEL_TOKEN`: your tunnel token (when ready)
 
 ### 3. Create data directories
 
@@ -164,37 +159,74 @@ Nginx is configured with `server_name _` (catch-all), so it accepts any hostname
 
 ## Cloudflare Tunnels
 
-Tunnel containers are behind a Docker Compose profile and **do not start by default**.
+A single Cloudflare tunnel serves **all domains and subdomains** in one Cloudflare account. You only need one `cloudflared` container, hostname routing is configured in the Cloudflare Zero Trust dashboard, not in Docker.
 
-### Activate tunnels (failover)
+The tunnel container uses a Docker Compose profile and **does not start by default**.
+
+### Setup
+
+1. **Create a tunnel** in Cloudflare Zero Trust:
+   - Go to **Zero Trust → Networks → Tunnels**
+   - Click **Create a tunnel** → choose **Cloudflared**
+   - Name it (e.g., `wp-standby`)
+   - Copy the connector **token**
+
+2. **Paste the token** in `.env`:
+   ```
+   CLOUDFLARE_TUNNEL_TOKEN=eyJhIjoiYWJj...
+   ```
+
+3. **Add hostnames** to the tunnel in CF Zero Trust dashboard:
+   - Go to **Tunnels → your tunnel → Public Hostname tab**
+   - Add each hostname pointing to `http://nginx:80`
+
+   For example (standby subdomains):
+   | Hostname | Service |
+   |----------|---------|
+   | `*.standby.example.net` | `http://nginx:80` |
+
+   Or for production failover (real domains):
+   | Hostname | Service |
+   |----------|---------|
+   | `example-primary.com` | `http://nginx:80` |
+   | `www.example-primary.com` | `http://nginx:80` |
+   | `example-shop.com` | `http://nginx:80` |
+   | `www.example-shop.com` | `http://nginx:80` |
+
+   You can add as many hostnames as you need, there is no limit. All traffic flows through the single tunnel container to Nginx, which passes it to WordPress. WordPress matches the hostname to the correct site automatically.
+
+4. **Start the tunnel**:
+   ```bash
+   docker compose --profile tunnels up -d
+   ```
+
+### Standby Mode (normal operation)
+
+Use a wildcard subdomain like `*.standby.example.net` on the tunnel. All sites are accessible as subdomains (e.g., `main.standby.example.net`). WordPress routes each request to the correct site based on the `wp_blogs` table.
+
+### Production Failover
+
+When production goes down:
+
+1. Run `./scripts/failover-activate.sh` (or `docker compose --profile tunnels up -d`)
+2. In the CF dashboard, add the real domains to the tunnel's Public Hostname tab (or they can already be there, Cloudflare only routes traffic when DNS points to the tunnel)
+3. Update DNS: point each domain's CNAME to the tunnel's `.cfargotunnel.com` address
+4. All sites come up instantly, domain mapping and plugins are already in the synced DB
+
+To switch back to production, just revert the DNS changes. The tunnel keeps running harmlessly.
+
+### Multiple Cloudflare Accounts
+
+If your domains span **different** Cloudflare accounts (different logins), you need one tunnel container per account. Uncomment the `cloudflared-account2` block in `docker-compose.yml` and add the token to `.env`:
 
 ```bash
-# Option 1: Use the failover script
-./scripts/failover-activate.sh
+# .env
+CLOUDFLARE_TUNNEL_TOKEN_ACCOUNT2=eyJ...
 
-# Option 2: Manual
-docker compose --profile tunnels up -d
+# docker-compose.yml: uncomment the cloudflared-account2 service
 ```
 
-### Adding tunnel tokens
-
-1. Create a tunnel in Cloudflare Zero Trust dashboard
-2. Copy the connector token
-3. Add it to `.env`:
-
-```
-CLOUDFLARE_TUNNEL_TOKEN_ACCOUNT1=eyJhIjoiYWJj...
-```
-
-### Multiple Cloudflare accounts
-
-To add another account, uncomment the `cloudflared-account2` block in `docker-compose.yml` and add the token to `.env`:
-
-```
-CLOUDFLARE_TUNNEL_TOKEN_ACCOUNT2=eyJhIjoiZGVm...
-```
-
-Hostname-to-service mapping is configured in the Cloudflare Zero Trust dashboard, not in Docker. Point your tunnel hostnames to `http://nginx:80`.
+This is only needed when domains are on separate Cloudflare accounts. If all domains are under one account, the single `cloudflared` container handles everything.
 
 ## Directory Structure
 
@@ -276,6 +308,7 @@ Server version is hidden (`server_tokens off`).
 docker compose logs -f wordpress
 docker compose logs -f nginx
 docker compose logs -f mariadb
+docker compose logs -f cloudflared
 
 # Restart a service
 docker compose restart wordpress
@@ -288,6 +321,10 @@ docker compose exec mariadb mariadb -u wordpress -p wordpress
 
 # Check Redis
 docker compose exec redis redis-cli info memory
+
+# Start/stop tunnels only
+docker compose --profile tunnels up -d
+docker compose --profile tunnels stop
 
 # Stop everything
 docker compose down
@@ -302,9 +339,10 @@ docker compose down && docker compose up -d --force-recreate
 ## Failover Flow
 
 1. Sync database from production to this instance's MariaDB
-2. Run `./scripts/failover-activate.sh`, starts tunnel containers
-3. In each Cloudflare account's Zero Trust dashboard, update DNS to point domains to the tunnel CNAME
-4. All sites come up on standby instantly, domain mapping and network-activated plugins are already in the DB
+2. Run `./scripts/failover-activate.sh`, starts tunnel container
+3. In the Cloudflare Zero Trust dashboard, add real domains to the tunnel's Public Hostname tab (if not already there)
+4. Update DNS to point domains to the tunnel CNAME
+5. All sites come up on standby instantly, domain mapping and network-activated plugins are already in the DB
 
 ## Updating Cloudflare IP Ranges
 
