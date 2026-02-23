@@ -60,6 +60,7 @@ At minimum, change these:
 - `MYSQL_ROOT_PASSWORD`: strong random password
 - `MYSQL_PASSWORD`: strong random password
 - `WORDPRESS_DB_PASSWORD`: must match `MYSQL_PASSWORD`
+- `WP_DOMAIN_CURRENT_SITE`: your primary domain (default: `example.com`)
 - `CLOUDFLARE_TUNNEL_TOKEN_ACCOUNT1`: your tunnel token (when ready)
 
 ### 3. Create data directories
@@ -96,21 +97,49 @@ docker compose logs mariadb | tail -5
 
 Visit `http://your-server:8080` and complete the WordPress installation wizard.
 
-## Multisite Setup
+## Multisite Modes
+
+The multisite mode is controlled by three variables in `.env`:
+
+```bash
+WP_SUBDOMAIN_INSTALL=true      # true = subdomain, false = subdirectory
+WP_DOMAIN_CURRENT_SITE=example.com
+WP_SUNRISE=false               # true only if using a SUNRISE domain mapping plugin
+```
+
+### Subdomain mode (default: matches Azure production)
+
+Sites live on separate domains. WordPress core handles domain routing natively via the `wp_blogs` table, no plugins needed. Each site can have its own domain (e.g., `example-primary.com`, `example-shop.com`) by editing the site URL in **Network Admin → Sites → Edit**.
+
+```bash
+WP_SUBDOMAIN_INSTALL=true
+WP_DOMAIN_CURRENT_SITE=example.com
+WP_SUNRISE=false
+```
+
+### Subdirectory mode
+
+Sites live under paths (e.g., `example.com/site1`). Simpler setup, no wildcard DNS needed. If you want separate domains in this mode, set `WP_SUNRISE=true` and install a domain mapping plugin (Mercator, etc.) with its `sunrise.php` in `wp-content/`.
+
+```bash
+WP_SUBDOMAIN_INSTALL=false
+WP_DOMAIN_CURRENT_SITE=example.com
+WP_SUNRISE=true
+```
 
 ### Fresh install (no existing DB)
 
 After completing the single-site WordPress install:
 
-1. Go to **Tools → Network Setup** in wp-admin (available because `WP_ALLOW_MULTISITE` is already enabled)
-2. Choose **Sub-directories** and click Install
+1. Go to **Tools → Network Setup** in wp-admin (`WP_ALLOW_MULTISITE` is already enabled)
+2. Choose **Sub-domains** or **Sub-directories** (must match your `WP_SUBDOMAIN_INSTALL` setting)
 3. Restart the WordPress container to pick up the new multisite tables:
 
 ```bash
 docker compose restart wordpress
 ```
 
-The multisite constants (`MULTISITE`, `SUBDOMAIN_INSTALL`, etc.) activate automatically when the `wp_blogs` table is detected in the database.
+The multisite constants activate automatically when the `wp_blogs` table is detected in the database.
 
 ### Synced DB from production
 
@@ -127,9 +156,11 @@ Multisite activates automatically, all sites, domain mappings, and network-activ
 
 ## Domain Mapping
 
-This setup uses WordPress `SUNRISE` for domain mapping. The `wp-content/sunrise.php` file is a placeholder, install your domain mapping plugin (e.g., Mercator, WordPress MU Domain Mapping) and it will handle the rest.
+Nginx is configured with `server_name _` (catch-all), so it accepts any hostname. WordPress routes requests to the correct site by matching the HTTP Host header against the `domain` column in the `wp_blogs` table.
 
-Nginx is configured with `server_name _` (catch-all), so it accepts any hostname. WordPress domain mapping routes requests to the correct site based on the database.
+**Subdomain mode (default):** Domain mapping is built into WordPress core. Edit a site's URL in Network Admin → Sites to point it at any domain. No plugin required, this is how the Azure production setup works.
+
+**Subdirectory mode with custom domains:** Requires `WP_SUNRISE=true` and a domain mapping plugin that provides `sunrise.php` (e.g., Mercator).
 
 ## Cloudflare Tunnels
 

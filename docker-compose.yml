@@ -105,12 +105,14 @@ services:
                     $$__ms_result = $$__ms_check->query("SHOW TABLES LIKE '" . (isset($$table_prefix) ? $$table_prefix : 'wp_') . "blogs'");
                     if ($$__ms_result && $$__ms_result->num_rows > 0) {
                         define('MULTISITE', true);
-                        define('SUBDOMAIN_INSTALL', false);
-                        define('DOMAIN_CURRENT_SITE', $$_SERVER['HTTP_HOST'] ?? 'localhost');
+                        define('SUBDOMAIN_INSTALL', ${WP_SUBDOMAIN_INSTALL});
+                        define('DOMAIN_CURRENT_SITE', '${WP_DOMAIN_CURRENT_SITE}');
                         define('PATH_CURRENT_SITE', '/');
                         define('SITE_ID_CURRENT_SITE', 1);
                         define('BLOG_ID_CURRENT_SITE', 1);
-                        define('SUNRISE', true);
+                        if ('${WP_SUNRISE}' === 'true') {
+                            define('SUNRISE', true);
+                        }
                     }
                     if ($$__ms_result) $$__ms_result->free();
                     $$__ms_check->close();
