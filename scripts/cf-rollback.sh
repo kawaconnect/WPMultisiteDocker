@@ -19,32 +19,33 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 source "$SCRIPT_DIR/cf-common.sh"
 
+# ── Step 1: Validate ─────────────────────────────────────────────────────────
+
+echo "[1/5] Checking dependencies and config..."
+check_deps
+load_config
+
+CLOUD_IP="$CF_CLOUD_IP"
+ACCOUNT_COUNT=$(get_account_count)
+
+echo ""
 echo "============================================================"
 echo "  CLOUDFLARE ROLLBACK, RESTORE REAL DOMAINS TO PRODUCTION"
 echo "============================================================"
 echo ""
 echo "  This will:"
 echo "    - Change DNS CNAME records back to A records"
-echo "    - Point real domains back at production IP ($( cfg '.cloud_ip'))"
+echo "    - Point real domains back at production IP ($CF_CLOUD_IP)"
 echo "    - Clear tunnel ingress configurations"
 echo ""
 echo "  This will NOT touch:"
-echo "    - The standby domain (*.$( cfg '.standby_domain'))"
+echo "    - The standby domain (*.$CF_STANDBY_DOMAIN)"
 echo ""
 
-# ── Step 1: First confirmation ───────────────────────────────────────────────
+# ── Step 2: First confirmation ───────────────────────────────────────────────
 
 confirm_dangerous "ROLLBACK" \
     "This will modify live DNS for real customer domains."
-
-# ── Step 2: Validate ─────────────────────────────────────────────────────────
-
-echo "[1/5] Checking dependencies and config..."
-check_deps
-load_config
-
-CLOUD_IP=$(cfg '.cloud_ip')
-ACCOUNT_COUNT=$(cfg '.accounts | length')
 
 # ── Step 3: Mandatory backup ─────────────────────────────────────────────────
 
@@ -66,13 +67,13 @@ declare -a PLAN_PROXIED=()
 declare -a PLAN_TUNNEL_IDS=()
 PLAN_COUNT=0
 
-for ((i = 0; i < ACCOUNT_COUNT; i++)); do
-    is_standby=$(cfg ".accounts[$i].is_standby")
+for ((n = 1; n <= ACCOUNT_COUNT; n++)); do
+    is_standby=$(get_account_var "$n" STANDBY)
     [ "$is_standby" = "true" ] && continue
 
-    name=$(cfg ".accounts[$i].name")
-    account_id=$(cfg ".accounts[$i].account_id")
-    api_token=$(cfg ".accounts[$i].api_token")
+    name=$(get_account_var "$n" NAME)
+    account_id=$(get_account_var "$n" ID)
+    api_token=$(get_account_var "$n" TOKEN)
     tunnel_name="wp-docker-$name"
 
     echo "  Account: $name"
@@ -87,10 +88,8 @@ for ((i = 0; i < ACCOUNT_COUNT; i++)); do
     fi
 
     # Process each domain
-    domain_count=$(cfg ".accounts[$i].domains | length")
-    for ((d = 0; d < domain_count; d++)); do
-        domain=$(get_domain_name "$i" "$d")
-
+    read -ra domains <<< "$(get_account_domains "$n")"
+    for domain in "${domains[@]}"; do
         zone_id=$(get_zone_id "$domain" "$api_token" 2>/dev/null) || continue
 
         # Find CNAME records pointing at the tunnel
@@ -118,7 +117,7 @@ for ((i = 0; i < ACCOUNT_COUNT; i++)); do
             record_proxied=$(echo "$matching" | jq -r ".[$r].proxied")
             record_content=$(echo "$matching" | jq -r ".[$r].content")
 
-            PLAN_ACCOUNTS+=("$i")
+            PLAN_ACCOUNTS+=("$n")
             PLAN_ZONE_IDS+=("$zone_id")
             PLAN_RECORD_IDS+=("$record_id")
             PLAN_NAMES+=("$record_name")
@@ -162,13 +161,13 @@ confirm_yes "You are about to modify $PLAN_COUNT live DNS record(s). Proceed?"
 echo "[4/5] Resetting tunnel ingress..."
 
 declare -A RESET_TUNNELS
-for ((i = 0; i < ACCOUNT_COUNT; i++)); do
-    is_standby=$(cfg ".accounts[$i].is_standby")
+for ((n = 1; n <= ACCOUNT_COUNT; n++)); do
+    is_standby=$(get_account_var "$n" STANDBY)
     [ "$is_standby" = "true" ] && continue
 
-    account_id=$(cfg ".accounts[$i].account_id")
-    api_token=$(cfg ".accounts[$i].api_token")
-    tunnel_name="wp-docker-$(cfg ".accounts[$i].name")"
+    account_id=$(get_account_var "$n" ID)
+    api_token=$(get_account_var "$n" TOKEN)
+    tunnel_name="wp-docker-$(get_account_var "$n" NAME)"
 
     tunnel_json=$(get_tunnel_by_name "$account_id" "$api_token" "$tunnel_name" 2>/dev/null)
     if [ -n "$tunnel_json" ]; then
@@ -192,12 +191,12 @@ echo ""
 RESTORED=()
 
 for ((p = 0; p < PLAN_COUNT; p++)); do
-    idx="${PLAN_ACCOUNTS[$p]}"
+    acct_n="${PLAN_ACCOUNTS[$p]}"
     zone_id="${PLAN_ZONE_IDS[$p]}"
     record_id="${PLAN_RECORD_IDS[$p]}"
     record_name="${PLAN_NAMES[$p]}"
     record_proxied="${PLAN_PROXIED[$p]}"
-    api_token=$(cfg ".accounts[$idx].api_token")
+    api_token=$(get_account_var "$acct_n" TOKEN)
 
     log_info "Restoring: $record_name (CNAME → A $CLOUD_IP)"
 
@@ -223,6 +222,6 @@ for h in "${RESTORED[@]}"; do
     echo "    - $h → $CLOUD_IP"
 done
 echo ""
-echo "  Standby tunnel (*.$( cfg '.standby_domain')) is unaffected."
+echo "  Standby tunnel (*.$CF_STANDBY_DOMAIN) is unaffected."
 echo "  Backups saved to: $BACKUP_DIR"
 echo ""

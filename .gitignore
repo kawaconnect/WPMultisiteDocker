@@ -1,6 +1,5 @@
 # Secrets
 .env
-accounts.json
 
 # Persistent data
 data/

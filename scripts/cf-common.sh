@@ -12,7 +12,7 @@
 
 # Resolve project root (parent of scripts/)
 PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-CONFIG_FILE="$PROJECT_DIR/accounts.json"
+ENV_FILE="$PROJECT_DIR/.env"
 BACKUP_DIR="$PROJECT_DIR/data/cloudflare/backups"
 
 # CF API base URL
@@ -49,87 +49,87 @@ check_deps() {
 }
 
 # =============================================================================
-# Config loading
+# Config loading (.env based)
 # =============================================================================
 
 load_config() {
-    if [ ! -f "$CONFIG_FILE" ]; then
-        log_error "Config file not found: $CONFIG_FILE"
-        log_error "Copy accounts.json.example to accounts.json and fill in real values."
+    if [ ! -f "$ENV_FILE" ]; then
+        log_error ".env not found. Copy .env.example to .env and fill in values."
         exit 1
     fi
 
-    # Validate JSON
-    if ! jq empty "$CONFIG_FILE" 2>/dev/null; then
-        log_error "Invalid JSON in $CONFIG_FILE"
+    set -a
+    source "$ENV_FILE"
+    set +a
+
+    # Validate required CF vars
+    if [ -z "${CF_STANDBY_DOMAIN:-}" ]; then
+        log_error "CF_STANDBY_DOMAIN not set in .env"
+        exit 1
+    fi
+    if [ -z "${CF_CLOUD_IP:-}" ]; then
+        log_error "CF_CLOUD_IP not set in .env"
         exit 1
     fi
 
-    # Validate required fields
-    local standby_domain cloud_ip account_count
-    standby_domain=$(jq -r '.standby_domain // empty' "$CONFIG_FILE")
-    cloud_ip=$(jq -r '.cloud_ip // empty' "$CONFIG_FILE")
-    account_count=$(jq '.accounts | length' "$CONFIG_FILE")
-
-    if [ -z "$standby_domain" ]; then
-        log_error "Missing 'standby_domain' in $CONFIG_FILE"
-        exit 1
-    fi
-    if [ -z "$cloud_ip" ]; then
-        log_error "Missing 'cloud_ip' in $CONFIG_FILE"
-        exit 1
-    fi
+    local account_count
+    account_count=$(get_account_count)
     if [ "$account_count" -eq 0 ]; then
-        log_error "No accounts defined in $CONFIG_FILE"
+        log_error "No CF accounts configured (CF_ACCOUNT_1_NAME not set in .env)"
         exit 1
     fi
 
     # Validate each account
-    local i name account_id api_token
-    for ((i = 0; i < account_count; i++)); do
-        name=$(jq -r ".accounts[$i].name // empty" "$CONFIG_FILE")
-        account_id=$(jq -r ".accounts[$i].account_id // empty" "$CONFIG_FILE")
-        api_token=$(jq -r ".accounts[$i].api_token // empty" "$CONFIG_FILE")
+    local n
+    for ((n = 1; n <= account_count; n++)); do
+        local name account_id api_token
+        name=$(get_account_var "$n" NAME)
+        account_id=$(get_account_var "$n" ID)
+        api_token=$(get_account_var "$n" TOKEN)
 
         if [ -z "$name" ] || [ -z "$account_id" ] || [ -z "$api_token" ]; then
-            log_error "Account $i is missing name, account_id, or api_token"
+            log_error "Account $n is missing NAME, ID, or TOKEN"
             exit 1
         fi
     done
 
-    log_ok "Config loaded: $account_count account(s), standby=$standby_domain"
+    log_ok "Config loaded: $account_count account(s), standby=$CF_STANDBY_DOMAIN"
 }
 
-# Read a config value
-cfg() {
-    jq -r "$1" "$CONFIG_FILE"
+# get_account_count, returns number of configured CF accounts
+get_account_count() {
+    local n=1
+    while true; do
+        local varname="CF_ACCOUNT_${n}_NAME"
+        if [ -z "${!varname:-}" ]; then
+            echo $((n - 1))
+            return
+        fi
+        n=$((n + 1))
+    done
 }
 
-# get_domain_name ACCOUNT_INDEX DOMAIN_INDEX, returns domain name string
-# Handles both formats: string ("example.com") and object ({"name": "example.com", ...})
-get_domain_name() {
-    local ai="$1" di="$2"
-    local val
-    val=$(jq -r ".accounts[$ai].domains[$di]" "$CONFIG_FILE")
-    if echo "$val" | jq -e '.name' &>/dev/null; then
-        echo "$val" | jq -r '.name'
-    else
-        echo "$val"
-    fi
+# get_account_var N KEY, returns value of CF_ACCOUNT_{N}_{KEY}
+get_account_var() {
+    local n="$1" key="$2"
+    local varname="CF_ACCOUNT_${n}_${key}"
+    echo "${!varname:-}"
 }
 
-# get_domain_failover ACCOUNT_INDEX DOMAIN_INDEX, returns true/false
-# true = failover only (inactive, don't touch until failover)
-# false (default) = active (managed now, gets standby subdomain)
-get_domain_failover() {
-    local ai="$1" di="$2"
-    local val
-    val=$(jq -r ".accounts[$ai].domains[$di]" "$CONFIG_FILE")
-    if echo "$val" | jq -e '.failover' &>/dev/null; then
-        echo "$val" | jq -r '.failover'
-    else
-        echo "false"
-    fi
+# get_account_domains N, prints space-separated list of domains
+get_account_domains() {
+    local n="$1"
+    local varname="CF_ACCOUNT_${n}_DOMAINS"
+    IFS=',' read -ra domains <<< "${!varname:-}"
+    echo "${domains[@]}"
+}
+
+# is_domain_failover N DOMAIN, returns 0 (true) if domain is in failover list
+is_domain_failover() {
+    local n="$1" domain="$2"
+    local varname="CF_ACCOUNT_${n}_FAILOVER"
+    local failover_list="${!varname:-}"
+    [[ ",$failover_list," == *",$domain,"* ]]
 }
 
 # =============================================================================
@@ -190,23 +190,22 @@ require_backup() {
     local backup_errors=0
 
     local account_count
-    account_count=$(cfg '.accounts | length')
+    account_count=$(get_account_count)
 
-    for ((i = 0; i < account_count; i++)); do
+    for ((n = 1; n <= account_count; n++)); do
         local name account_id api_token tunnel_name
-        name=$(cfg ".accounts[$i].name")
-        account_id=$(cfg ".accounts[$i].account_id")
-        api_token=$(cfg ".accounts[$i].api_token")
+        name=$(get_account_var "$n" NAME)
+        account_id=$(get_account_var "$n" ID)
+        api_token=$(get_account_var "$n" TOKEN)
         tunnel_name="wp-docker-$name"
 
         log_info "Backing up: $name"
 
         # Backup DNS for each domain
-        local domain_count
-        domain_count=$(cfg ".accounts[$i].domains | length")
-        for ((d = 0; d < domain_count; d++)); do
-            local domain zone_id
-            domain=$(get_domain_name "$i" "$d")
+        local domains
+        read -ra domains <<< "$(get_account_domains "$n")"
+        for domain in "${domains[@]}"; do
+            local zone_id
             zone_id=$(get_zone_id "$domain" "$api_token" 2>/dev/null)
             if [ -z "$zone_id" ]; then
                 log_error "Could not get zone ID for $domain"

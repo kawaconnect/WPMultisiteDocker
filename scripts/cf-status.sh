@@ -17,9 +17,9 @@ echo ""
 check_deps
 load_config
 
-CLOUD_IP=$(cfg '.cloud_ip')
-STANDBY_DOMAIN=$(cfg '.standby_domain')
-ACCOUNT_COUNT=$(cfg '.accounts | length')
+CLOUD_IP="$CF_CLOUD_IP"
+STANDBY_DOMAIN="$CF_STANDBY_DOMAIN"
+ACCOUNT_COUNT=$(get_account_count)
 
 # ── Tunnels ──────────────────────────────────────────────────────────────────
 
@@ -27,11 +27,11 @@ echo "── Tunnels ───────────────────�
 printf "  %-20s %-38s %-10s %s\n" "ACCOUNT" "TUNNEL ID" "STATUS" "HOSTNAMES"
 printf "  %-20s %-38s %-10s %s\n" "-------" "---------" "------" "---------"
 
-for ((i = 0; i < ACCOUNT_COUNT; i++)); do
-    name=$(cfg ".accounts[$i].name")
-    account_id=$(cfg ".accounts[$i].account_id")
-    api_token=$(cfg ".accounts[$i].api_token")
-    is_standby=$(cfg ".accounts[$i].is_standby")
+for ((n = 1; n <= ACCOUNT_COUNT; n++)); do
+    name=$(get_account_var "$n" NAME)
+    account_id=$(get_account_var "$n" ID)
+    api_token=$(get_account_var "$n" TOKEN)
+    is_standby=$(get_account_var "$n" STANDBY)
     tunnel_name="wp-docker-$name"
 
     tunnel_json=$(get_tunnel_by_name "$account_id" "$api_token" "$tunnel_name" 2>/dev/null)
@@ -66,14 +66,11 @@ echo "── DNS Records ──────────────────�
 printf "  %-35s %-8s %-45s %s\n" "NAME" "TYPE" "CONTENT" "PROXIED"
 printf "  %-35s %-8s %-45s %s\n" "----" "----" "-------" "-------"
 
-for ((i = 0; i < ACCOUNT_COUNT; i++)); do
-    name=$(cfg ".accounts[$i].name")
-    api_token=$(cfg ".accounts[$i].api_token")
-    is_standby=$(cfg ".accounts[$i].is_standby")
+for ((n = 1; n <= ACCOUNT_COUNT; n++)); do
+    api_token=$(get_account_var "$n" TOKEN)
 
-    domain_count=$(cfg ".accounts[$i].domains | length")
-    for ((d = 0; d < domain_count; d++)); do
-        domain=$(get_domain_name "$i" "$d")
+    read -ra domains <<< "$(get_account_domains "$n")"
+    for domain in "${domains[@]}"; do
         zone_id=$(get_zone_id "$domain" "$api_token" 2>/dev/null) || continue
 
         # Get A, AAAA, and CNAME records
@@ -129,14 +126,13 @@ echo "  Accounts:        $ACCOUNT_COUNT"
 
 # Check if any domain points at tunnel (failover active)
 failover_active=false
-for ((i = 0; i < ACCOUNT_COUNT; i++)); do
-    is_standby=$(cfg ".accounts[$i].is_standby")
+for ((n = 1; n <= ACCOUNT_COUNT; n++)); do
+    is_standby=$(get_account_var "$n" STANDBY)
     [ "$is_standby" = "true" ] && continue
 
-    api_token=$(cfg ".accounts[$i].api_token")
-    domain_count=$(cfg ".accounts[$i].domains | length")
-    for ((d = 0; d < domain_count; d++)); do
-        domain=$(get_domain_name "$i" "$d")
+    api_token=$(get_account_var "$n" TOKEN)
+    read -ra domains <<< "$(get_account_domains "$n")"
+    for domain in "${domains[@]}"; do
         zone_id=$(get_zone_id "$domain" "$api_token" 2>/dev/null) || continue
         cnames=$(get_dns_records "$zone_id" "$api_token" "CNAME" 2>/dev/null) || continue
         tunnel_cnames=$(echo "$cnames" | jq '[.[] | select(.content | endswith(".cfargotunnel.com"))] | length')
@@ -160,15 +156,13 @@ echo ""
 echo "── Domain Modes ──────────────────────────────────────────────"
 printf "  %-30s %-12s %s\n" "DOMAIN" "MODE" "STANDBY ACCESS"
 printf "  %-30s %-12s %s\n" "------" "----" "--------------"
-for ((i = 0; i < ACCOUNT_COUNT; i++)); do
-    is_standby=$(cfg ".accounts[$i].is_standby")
+for ((n = 1; n <= ACCOUNT_COUNT; n++)); do
+    is_standby=$(get_account_var "$n" STANDBY)
     [ "$is_standby" = "true" ] && continue
 
-    domain_count=$(cfg ".accounts[$i].domains | length")
-    for ((d = 0; d < domain_count; d++)); do
-        domain=$(get_domain_name "$i" "$d")
-        failover=$(get_domain_failover "$i" "$d")
-        if [ "$failover" = "true" ]; then
+    read -ra domains <<< "$(get_account_domains "$n")"
+    for domain in "${domains[@]}"; do
+        if is_domain_failover "$n" "$domain"; then
             printf "  %-30s %-12s %s\n" "$domain" "FAILOVER" "(inactive)"
         else
             standby_host="${domain%%.*}.$STANDBY_DOMAIN"

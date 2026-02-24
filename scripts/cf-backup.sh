@@ -26,23 +26,22 @@ echo ""
 check_deps
 load_config
 
-ACCOUNT_COUNT=$(cfg '.accounts | length')
+ACCOUNT_COUNT=$(get_account_count)
 ERRORS=0
 
 # ── Backup all accounts ─────────────────────────────────────────────────────
 
-for ((i = 0; i < ACCOUNT_COUNT; i++)); do
-    name=$(cfg ".accounts[$i].name")
-    account_id=$(cfg ".accounts[$i].account_id")
-    api_token=$(cfg ".accounts[$i].api_token")
+for ((n = 1; n <= ACCOUNT_COUNT; n++)); do
+    name=$(get_account_var "$n" NAME)
+    account_id=$(get_account_var "$n" ID)
+    api_token=$(get_account_var "$n" TOKEN)
     tunnel_name="wp-docker-$name"
 
     echo "  Account: $name"
 
     # Backup DNS for each domain
-    domain_count=$(cfg ".accounts[$i].domains | length")
-    for ((d = 0; d < domain_count; d++)); do
-        domain=$(get_domain_name "$i" "$d")
+    read -ra domains <<< "$(get_account_domains "$n")"
+    for domain in "${domains[@]}"; do
         zone_id=$(get_zone_id "$domain" "$api_token" 2>/dev/null)
         if [ -z "$zone_id" ]; then
             log_warn "Could not get zone ID for $domain, skipping"

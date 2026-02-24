@@ -20,6 +20,16 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 source "$SCRIPT_DIR/cf-common.sh"
 
+# ── Step 1: Validate ─────────────────────────────────────────────────────────
+
+echo "[1/6] Checking dependencies and config..."
+check_deps
+load_config
+
+CLOUD_IP="$CF_CLOUD_IP"
+ACCOUNT_COUNT=$(get_account_count)
+
+echo ""
 echo "============================================================"
 echo "  CLOUDFLARE FAILOVER, SWITCH REAL DOMAINS TO DOCKER"
 echo "============================================================"
@@ -30,23 +40,14 @@ echo "    - Point them at Cloudflare tunnels instead of production"
 echo "    - Modify tunnel ingress configurations"
 echo ""
 echo "  This will NOT touch:"
-echo "    - The standby domain (*.$( cfg '.standby_domain'))"
-echo "    - Any records that don't point at $(cfg '.cloud_ip')"
+echo "    - The standby domain (*.$CF_STANDBY_DOMAIN)"
+echo "    - Any records that don't point at $CF_CLOUD_IP"
 echo ""
 
-# ── Step 1: First confirmation ───────────────────────────────────────────────
+# ── Step 2: First confirmation ───────────────────────────────────────────────
 
 confirm_dangerous "FAILOVER" \
     "This will modify live DNS for real customer domains."
-
-# ── Step 2: Validate ─────────────────────────────────────────────────────────
-
-echo "[1/6] Checking dependencies and config..."
-check_deps
-load_config
-
-CLOUD_IP=$(cfg '.cloud_ip')
-ACCOUNT_COUNT=$(cfg '.accounts | length')
 
 # ── Step 3: Mandatory backup ─────────────────────────────────────────────────
 
@@ -85,7 +86,7 @@ echo "[4/6] Scanning DNS records (DRY RUN, nothing changed yet)..."
 echo ""
 
 # Collect planned changes for display and later execution
-declare -a PLAN_ACCOUNTS=()    # account index
+declare -a PLAN_ACCOUNTS=()    # account number (1-based)
 declare -a PLAN_ZONE_IDS=()    # zone id
 declare -a PLAN_RECORD_IDS=()  # record id to delete
 declare -a PLAN_NAMES=()       # hostname
@@ -93,13 +94,13 @@ declare -a PLAN_PROXIED=()     # proxied flag
 declare -a PLAN_TUNNEL_IDS=()  # tunnel id for CNAME target
 PLAN_COUNT=0
 
-for ((i = 0; i < ACCOUNT_COUNT; i++)); do
-    is_standby=$(cfg ".accounts[$i].is_standby")
+for ((n = 1; n <= ACCOUNT_COUNT; n++)); do
+    is_standby=$(get_account_var "$n" STANDBY)
     [ "$is_standby" = "true" ] && continue
 
-    name=$(cfg ".accounts[$i].name")
-    account_id=$(cfg ".accounts[$i].account_id")
-    api_token=$(cfg ".accounts[$i].api_token")
+    name=$(get_account_var "$n" NAME)
+    account_id=$(get_account_var "$n" ID)
+    api_token=$(get_account_var "$n" TOKEN)
     tunnel_name="wp-docker-$name"
 
     echo "  Account: $name"
@@ -113,10 +114,8 @@ for ((i = 0; i < ACCOUNT_COUNT; i++)); do
     tunnel_id=$(echo "$tunnel_json" | jq -r '.id')
 
     # Process each domain on this account
-    domain_count=$(cfg ".accounts[$i].domains | length")
-    for ((d = 0; d < domain_count; d++)); do
-        domain=$(get_domain_name "$i" "$d")
-
+    read -ra domains <<< "$(get_account_domains "$n")"
+    for domain in "${domains[@]}"; do
         zone_id=$(get_zone_id "$domain" "$api_token") || continue
 
         # Find A records pointing at cloud IP
@@ -134,7 +133,7 @@ for ((i = 0; i < ACCOUNT_COUNT; i++)); do
             record_name=$(echo "$matching" | jq -r ".[$r].name")
             record_proxied=$(echo "$matching" | jq -r ".[$r].proxied")
 
-            PLAN_ACCOUNTS+=("$i")
+            PLAN_ACCOUNTS+=("$n")
             PLAN_ZONE_IDS+=("$zone_id")
             PLAN_RECORD_IDS+=("$record_id")
             PLAN_NAMES+=("$record_name")
@@ -151,7 +150,7 @@ done
 if [ "$PLAN_COUNT" -eq 0 ]; then
     echo ""
     echo "No records to switch. Nothing points at $CLOUD_IP."
-    echo "Check that accounts.json has failover accounts with real domains."
+    echo "Check that .env has failover accounts with real domains."
     exit 0
 fi
 
@@ -185,13 +184,13 @@ SWITCHED=()
 declare -A INGRESS_BY_TUNNEL  # tunnel_id → space-separated hostnames
 
 for ((p = 0; p < PLAN_COUNT; p++)); do
-    idx="${PLAN_ACCOUNTS[$p]}"
+    acct_n="${PLAN_ACCOUNTS[$p]}"
     zone_id="${PLAN_ZONE_IDS[$p]}"
     record_id="${PLAN_RECORD_IDS[$p]}"
     record_name="${PLAN_NAMES[$p]}"
     record_proxied="${PLAN_PROXIED[$p]}"
     tunnel_id="${PLAN_TUNNEL_IDS[$p]}"
-    api_token=$(cfg ".accounts[$idx].api_token")
+    api_token=$(get_account_var "$acct_n" TOKEN)
     cname_target="${tunnel_id}.cfargotunnel.com"
 
     log_info "Switching: $record_name (A $CLOUD_IP → CNAME $cname_target)"
@@ -216,13 +215,13 @@ for tunnel_id in "${!INGRESS_BY_TUNNEL[@]}"; do
     hosts="${INGRESS_BY_TUNNEL[$tunnel_id]}"
 
     # Find the account for this tunnel
-    for ((i = 0; i < ACCOUNT_COUNT; i++)); do
-        is_standby=$(cfg ".accounts[$i].is_standby")
+    for ((n = 1; n <= ACCOUNT_COUNT; n++)); do
+        is_standby=$(get_account_var "$n" STANDBY)
         [ "$is_standby" = "true" ] && continue
 
-        account_id=$(cfg ".accounts[$i].account_id")
-        api_token=$(cfg ".accounts[$i].api_token")
-        tunnel_name="wp-docker-$(cfg ".accounts[$i].name")"
+        account_id=$(get_account_var "$n" ID)
+        api_token=$(get_account_var "$n" TOKEN)
+        tunnel_name="wp-docker-$(get_account_var "$n" NAME)"
         tj=$(get_tunnel_by_name "$account_id" "$api_token" "$tunnel_name" 2>/dev/null)
         [ -z "$tj" ] && continue
         tid=$(echo "$tj" | jq -r '.id')

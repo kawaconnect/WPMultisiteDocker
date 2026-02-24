@@ -13,9 +13,9 @@
 #   - Never modifies DNS on non-standby domains
 #
 # DOMAIN MODES:
-#   - Each domain in accounts.json can have "failover": true or false
-#   - failover: false (default) → ACTIVE, routed through standby tunnel now
-#   - failover: true → INACTIVE, configs ready but not touched until failover
+#   - Each domain can be in CF_ACCOUNT_{N}_FAILOVER or not
+#   - Not in failover list (default) → ACTIVE, routed through standby tunnel now
+#   - In failover list → INACTIVE, configs ready but not touched until failover
 #   - Interactive mode lists all domains and lets you toggle the flag
 # =============================================================================
 set -euo pipefail
@@ -32,14 +32,14 @@ echo "[1/7] Checking dependencies and config..."
 check_deps
 load_config
 
-STANDBY_DOMAIN=$(cfg '.standby_domain')
-ACCOUNT_COUNT=$(cfg '.accounts | length')
+STANDBY_DOMAIN="$CF_STANDBY_DOMAIN"
+ACCOUNT_COUNT=$(get_account_count)
 
 echo ""
 echo "[2/7] Validating API tokens..."
-for ((i = 0; i < ACCOUNT_COUNT; i++)); do
-    name=$(cfg ".accounts[$i].name")
-    token=$(cfg ".accounts[$i].api_token")
+for ((n = 1; n <= ACCOUNT_COUNT; n++)); do
+    name=$(get_account_var "$n" NAME)
+    token=$(get_account_var "$n" TOKEN)
     validate_token "$token" "$name"
 done
 
@@ -53,25 +53,26 @@ echo "  FAILOVER domains have configs ready but are not touched until failover."
 echo ""
 
 # Collect all non-standby domains for review
-declare -a ALL_DOMAIN_ACCOUNTS=()
-declare -a ALL_DOMAIN_INDICES=()
+declare -a ALL_DOMAIN_ACCT_N=()
 declare -a ALL_DOMAIN_NAMES=()
 declare -a ALL_DOMAIN_FAILOVER=()
+declare -a ALL_DOMAIN_ACCT_NAMES=()
 
-for ((i = 0; i < ACCOUNT_COUNT; i++)); do
-    is_standby=$(cfg ".accounts[$i].is_standby")
+for ((n = 1; n <= ACCOUNT_COUNT; n++)); do
+    is_standby=$(get_account_var "$n" STANDBY)
     [ "$is_standby" = "true" ] && continue
 
-    acct_name=$(cfg ".accounts[$i].name")
-    domain_count=$(cfg ".accounts[$i].domains | length")
-    for ((d = 0; d < domain_count; d++)); do
-        domain=$(get_domain_name "$i" "$d")
-        failover=$(get_domain_failover "$i" "$d")
-
-        ALL_DOMAIN_ACCOUNTS+=("$acct_name")
-        ALL_DOMAIN_INDICES+=("$i:$d")
+    acct_name=$(get_account_var "$n" NAME)
+    read -ra domains <<< "$(get_account_domains "$n")"
+    for domain in "${domains[@]}"; do
+        ALL_DOMAIN_ACCT_N+=("$n")
+        ALL_DOMAIN_ACCT_NAMES+=("$acct_name")
         ALL_DOMAIN_NAMES+=("$domain")
-        ALL_DOMAIN_FAILOVER+=("$failover")
+        if is_domain_failover "$n" "$domain"; then
+            ALL_DOMAIN_FAILOVER+=("true")
+        else
+            ALL_DOMAIN_FAILOVER+=("false")
+        fi
     done
 done
 
@@ -82,10 +83,10 @@ print_domain_table() {
     for ((x = 0; x < ${#ALL_DOMAIN_NAMES[@]}; x++)); do
         local num=$((x + 1))
         if [ "${ALL_DOMAIN_FAILOVER[$x]}" = "true" ]; then
-            printf "  %-4s %-15s %-30s %-12s %s\n" "$num" "${ALL_DOMAIN_ACCOUNTS[$x]}" "${ALL_DOMAIN_NAMES[$x]}" "FAILOVER" "(inactive)"
+            printf "  %-4s %-15s %-30s %-12s %s\n" "$num" "${ALL_DOMAIN_ACCT_NAMES[$x]}" "${ALL_DOMAIN_NAMES[$x]}" "FAILOVER" "(inactive)"
         else
             local standby_host="${ALL_DOMAIN_NAMES[$x]%%.*}.$STANDBY_DOMAIN"
-            printf "  %-4s %-15s %-30s %-12s %s\n" "$num" "${ALL_DOMAIN_ACCOUNTS[$x]}" "${ALL_DOMAIN_NAMES[$x]}" "ACTIVE" "$standby_host"
+            printf "  %-4s %-15s %-30s %-12s %s\n" "$num" "${ALL_DOMAIN_ACCT_NAMES[$x]}" "${ALL_DOMAIN_NAMES[$x]}" "ACTIVE" "$standby_host"
         fi
     done
 }
@@ -101,12 +102,37 @@ if [ ${#ALL_DOMAIN_NAMES[@]} -gt 0 ]; then
     while [ -n "$toggle_input" ]; do
         idx=$((toggle_input - 1))
         if [ "$idx" -ge 0 ] && [ "$idx" -lt ${#ALL_DOMAIN_NAMES[@]} ]; then
+            local_domain="${ALL_DOMAIN_NAMES[$idx]}"
+            acct_n="${ALL_DOMAIN_ACCT_N[$idx]}"
+
             if [ "${ALL_DOMAIN_FAILOVER[$idx]}" = "true" ]; then
+                # Remove domain from failover list
                 ALL_DOMAIN_FAILOVER[$idx]="false"
-                log_info "Toggled ${ALL_DOMAIN_NAMES[$idx]} → ACTIVE"
+                current=$(get_account_var "$acct_n" FAILOVER)
+                new=$(echo "$current" | sed "s/$local_domain//" | sed 's/,,/,/g' | sed 's/^,//;s/,$//')
+                if grep -q "^CF_ACCOUNT_${acct_n}_FAILOVER=" "$ENV_FILE"; then
+                    sed -i "s/^CF_ACCOUNT_${acct_n}_FAILOVER=.*/CF_ACCOUNT_${acct_n}_FAILOVER=$new/" "$ENV_FILE"
+                else
+                    echo "CF_ACCOUNT_${acct_n}_FAILOVER=$new" >> "$ENV_FILE"
+                fi
+                eval "CF_ACCOUNT_${acct_n}_FAILOVER=\"$new\""
+                log_info "Toggled $local_domain → ACTIVE"
             else
+                # Add domain to failover list
                 ALL_DOMAIN_FAILOVER[$idx]="true"
-                log_info "Toggled ${ALL_DOMAIN_NAMES[$idx]} → FAILOVER"
+                current=$(get_account_var "$acct_n" FAILOVER)
+                if [ -z "$current" ]; then
+                    new="$local_domain"
+                else
+                    new="$current,$local_domain"
+                fi
+                if grep -q "^CF_ACCOUNT_${acct_n}_FAILOVER=" "$ENV_FILE"; then
+                    sed -i "s/^CF_ACCOUNT_${acct_n}_FAILOVER=.*/CF_ACCOUNT_${acct_n}_FAILOVER=$new/" "$ENV_FILE"
+                else
+                    echo "CF_ACCOUNT_${acct_n}_FAILOVER=$new" >> "$ENV_FILE"
+                fi
+                eval "CF_ACCOUNT_${acct_n}_FAILOVER=\"$new\""
+                log_info "Toggled $local_domain → FAILOVER"
             fi
         else
             log_warn "Invalid number: $toggle_input"
@@ -117,29 +143,6 @@ if [ ${#ALL_DOMAIN_NAMES[@]} -gt 0 ]; then
         echo ""
         echo -n "  Toggle a domain? Enter number, or press Enter to continue: "
         read -r toggle_input
-    done
-
-    # Save changes back to accounts.json
-    for ((x = 0; x < ${#ALL_DOMAIN_NAMES[@]}; x++)); do
-        IFS=':' read -r ai di <<< "${ALL_DOMAIN_INDICES[$x]}"
-        current_failover=$(get_domain_failover "$ai" "$di")
-        if [ "${ALL_DOMAIN_FAILOVER[$x]}" != "$current_failover" ]; then
-            local_domain="${ALL_DOMAIN_NAMES[$x]}"
-            local_failover="${ALL_DOMAIN_FAILOVER[$x]}"
-
-            # Check if domain is stored as object or string
-            domain_type=$(jq -r ".accounts[$ai].domains[$di] | type" "$CONFIG_FILE")
-            if [ "$domain_type" = "string" ]; then
-                # Convert string to object
-                jq ".accounts[$ai].domains[$di] = {\"name\": \"$local_domain\", \"failover\": $local_failover}" \
-                    "$CONFIG_FILE" > "$CONFIG_FILE.tmp" && mv "$CONFIG_FILE.tmp" "$CONFIG_FILE"
-            else
-                # Update existing object
-                jq ".accounts[$ai].domains[$di].failover = $local_failover" \
-                    "$CONFIG_FILE" > "$CONFIG_FILE.tmp" && mv "$CONFIG_FILE.tmp" "$CONFIG_FILE"
-            fi
-            log_ok "Saved: $local_domain → failover=$local_failover"
-        fi
     done
 fi
 
@@ -157,11 +160,11 @@ echo "[5/7] Creating/reusing tunnels..."
 declare -a TUNNEL_NAMES=()
 declare -a TUNNEL_TOKENS=()
 
-for ((i = 0; i < ACCOUNT_COUNT; i++)); do
-    name=$(cfg ".accounts[$i].name")
-    account_id=$(cfg ".accounts[$i].account_id")
-    api_token=$(cfg ".accounts[$i].api_token")
-    is_standby=$(cfg ".accounts[$i].is_standby")
+for ((n = 1; n <= ACCOUNT_COUNT; n++)); do
+    name=$(get_account_var "$n" NAME)
+    account_id=$(get_account_var "$n" ID)
+    api_token=$(get_account_var "$n" TOKEN)
+    is_standby=$(get_account_var "$n" STANDBY)
     tunnel_name="wp-docker-$name"
 
     echo ""
@@ -200,7 +203,8 @@ for ((i = 0; i < ACCOUNT_COUNT; i++)); do
         log_ok "Standby ingress configured"
 
         # Create wildcard DNS CNAME on standby domain only
-        domain=$(get_domain_name "$i" "0")
+        read -ra standby_domains <<< "$(get_account_domains "$n")"
+        domain="${standby_domains[0]}"
         zone_id=$(get_zone_id "$domain" "$api_token")
         cname_target="${tunnel_id}.cfargotunnel.com"
 
@@ -275,7 +279,6 @@ log_ok "Generated: docker-compose.tunnels.yml (${#TUNNEL_NAMES[@]} tunnel servic
 echo ""
 echo "[7/7] Updating .env..."
 
-ENV_FILE="$PROJECT_DIR/.env"
 COMPOSE_LINE="COMPOSE_FILE=docker-compose.yml:docker-compose.tunnels.yml"
 
 if [ -f "$ENV_FILE" ]; then
