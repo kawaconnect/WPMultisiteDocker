@@ -9,8 +9,8 @@ Docker-based WordPress Multisite with Nginx reverse proxy, MariaDB, Redis object
                     │              frontend network               │
                     │                 (bridge)                    │
                     │                                             │
-   :8080 ──────────┤► nginx ◄──── cloudflared-standby.example.net       │
-                    │    │         cloudflared-account2 ...       │
+   :8080 ──────────┤► nginx ◄──── cloudflared-standby            │
+                    │    │         cloudflared-{account} ...     │
                     │    │         (profiles: tunnels)            │
                     │    │                                        │
                     │  wordpress (PHP-FPM)                        │
@@ -84,13 +84,13 @@ Visit `http://your-server:8080` and complete the WordPress installation wizard.
 
 ## Cloudflare Tunnels
 
-This server has **no public IP**, all traffic comes through Cloudflare Tunnels. Each Cloudflare account needs its own tunnel and its own `cloudflared` container. One tunnel handles **all** domains on that account.
+This server has **no public IP**, all traffic comes through Cloudflare Tunnels. Tunnels, DNS, and failover are fully automated via scripts. You fill in one config file (`accounts.json`), then scripts handle everything via the CF API.
 
 ### How It Works
 
 ```
 User's browser
-    → main.standby.example.net (DNS points to Cloudflare)
+    → mysite.standby-domain.com (DNS points to Cloudflare)
     → Cloudflare edge (matches hostname to tunnel)
     → cloudflared container (tunnel connector running in Docker)
     → nginx:80 (reverse proxy)
@@ -101,78 +101,111 @@ User's browser
 ### Two Modes
 
 **Standby (normal operation):**
-- One tunnel on the `standby.example.net` Cloudflare account
-- Wildcard `*.standby.example.net` points to `http://nginx:80`
-- Sites accessible as: `main.standby.example.net`, `example-shop.standby.example.net`, etc.
-- Real domains stay on Azure, untouched
+- One tunnel on the standby Cloudflare account
+- Wildcard `*.your-standby-domain.com` points to `http://nginx:80`
+- Sites accessible as standby subdomains (e.g. `mysite.standby-domain.com`)
+- Real domains stay on production, untouched
+- Per-domain control: set `"failover": true` in `accounts.json` to mark domains as failover-only (inactive until needed)
 
-**Failover (Azure is down):**
-- Real domains like `example-primary.com` need to reach this server instead of Azure
+**Failover (production is down):**
+- Scripts automatically switch real domains from production A records to tunnel CNAMEs
 - Each real domain lives on a specific Cloudflare account
-- You need a tunnel on **each** of those accounts
-- Add the real domains as public hostnames on the correct account's tunnel
-- Cloudflare automatically updates DNS, traffic flows to Docker
+- One tunnel per account handles all domains on that account
+- DNS backup taken before any changes, rollback available
+- Requires typing `FAILOVER` + second confirmation before anything is modified
 
-### Setup: Standby Tunnel
+### API Token Permissions
 
-1. Log into the Cloudflare account that owns `standby.example.net`
-2. Go to **Zero Trust → Networks → Tunnels → Create a tunnel**
-3. Name it (e.g., `wp-standby`), copy the connector token
-4. Paste in `.env`:
+Each Cloudflare account in `accounts.json` needs an API token with these minimum permissions:
+
+| Permission | Level | Why |
+|------------|-------|-----|
+| **Zone : Zone : Read** | Zone | Look up zone IDs by domain name |
+| **Zone : DNS : Edit** | Zone | Read, create, and delete DNS records |
+| **Account : Cloudflare Tunnel : Edit** | Account | Create/list tunnels, get tokens, update ingress config |
+
+Create the token in Cloudflare dashboard: **My Profile > API Tokens > Create Token > Custom Token**.
+
+Set **Zone Resources** to the specific zones (domains) the token should access, and **Account Resources** to the specific account. Never grant broader access than needed.
+
+### Setup
+
+1. Create the config file:
+   ```bash
+   cp accounts.json.example accounts.json
+   vi accounts.json
    ```
-   CF_TUNNEL_STANDBY=eyJhIjoiYWJj...
+   Fill in your `standby_domain`, `cloud_ip`, CF account IDs, and API tokens. Mark your standby account as `is_standby: true`. Set `"failover": true` on domains that should only be touched during failover.
+
+2. Run setup (creates tunnels, configures DNS, generates compose file):
+   ```bash
+   ./scripts/cf-setup.sh
    ```
-5. In the tunnel's **Public Hostname** tab, add:
-   - Subdomain: `*` | Domain: `standby.example.net` | Service: `http://nginx:80`
-6. Start the tunnel:
+
+3. Start tunnels:
    ```bash
    docker compose --profile tunnels up -d
    ```
 
-All 16 sites are now accessible at `*.standby.example.net` subdomains.
-
-### Setup: Failover Tunnels
-
-For each Cloudflare account that has real domains you want to fail over:
-
-1. Log into that Cloudflare account
-2. Create a tunnel, copy the token
-3. Add token to `.env`:
-   ```
-   CF_TUNNEL_ACCOUNT2=eyJhIjoiZGVm...
-   ```
-4. Uncomment the matching service in `docker-compose.yml`:
-   ```yaml
-   cloudflared-account2:
-     image: cloudflare/cloudflared:latest
-     restart: unless-stopped
-     profiles:
-       - tunnels
-     networks:
-       - frontend
-     command: tunnel --no-autoupdate run
-     environment:
-       TUNNEL_TOKEN: ${CF_TUNNEL_ACCOUNT2}
-     deploy:
-       resources:
-         limits:
-           memory: 128M
-   ```
-5. Restart tunnels:
+4. Verify:
    ```bash
-   docker compose --profile tunnels up -d
+   ./scripts/cf-status.sh
    ```
-6. When failover is needed, go to that account's tunnel **Public Hostname** tab and add the real domains → `http://nginx:80`
 
-Repeat for each Cloudflare account. The containers are lightweight (128MB each) and just sit idle until you add hostnames.
+### Automation Scripts
 
-### Reverting Failover
+| Script | Purpose |
+|--------|---------|
+| `scripts/cf-setup.sh` | Create tunnels, configure standby, generate `docker-compose.tunnels.yml` |
+| `scripts/cf-failover.sh` | Back up DNS, switch real domains from production to Docker tunnels |
+| `scripts/cf-rollback.sh` | Restore DNS, switch real domains back to production |
+| `scripts/cf-status.sh` | Show current state of all tunnels + DNS |
+| `scripts/cf-backup.sh` | Scheduled backup of DNS records + tunnel configs with rotation |
 
-1. Remove the real domains from the tunnel's Public Hostname tab
-2. Re-create the original A records pointing at Azure's IP
-3. Traffic goes back to Azure
+### Safety Guarantees
 
-The standby tunnel (`*.standby.example.net`) keeps running, it's unaffected.
+Every script enforces these rules:
+
+1. **Backup before mutation**: `cf-setup.sh`, `cf-failover.sh`, and `cf-rollback.sh` all run a mandatory full backup of every account's DNS records and tunnel configs before touching anything. If the backup fails, the script aborts.
+
+2. **Standby-only in normal mode**: `cf-setup.sh` only creates DNS records and configures ingress for the standby domain (`*.your-standby-domain.com`). Failover account tunnels are created but left idle with catch-all 404. Real domains are never touched.
+
+3. **Double confirmation for dangerous ops**: `cf-failover.sh` and `cf-rollback.sh` both require:
+   - Typing the exact word `FAILOVER` or `ROLLBACK` to proceed
+   - Reviewing a dry-run preview showing every DNS record that will change
+   - A second `y/N` confirmation after seeing the change list
+
+4. **Precise targeting**: Failover only switches A records matching your `cloud_ip` exactly. Rollback only switches CNAMEs ending in `.cfargotunnel.com`. No other records are touched.
+
+5. **Read-only scripts**: `cf-status.sh` and `cf-backup.sh` only use GET requests and never modify anything.
+
+### Failover
+
+When production goes down:
+```bash
+./scripts/cf-failover.sh
+```
+This backs up DNS, switches A records to tunnel CNAMEs, and configures tunnel ingress, all automatically.
+
+### Rollback
+
+To restore domains to production:
+```bash
+./scripts/cf-rollback.sh
+```
+The standby tunnel is unaffected by failover/rollback.
+
+### Backups
+
+Run manually or add to cron for daily backups:
+```bash
+./scripts/cf-backup.sh
+
+# Cron: daily at 2am
+0 2 * * * /opt/docker/wordpressmultisite/scripts/cf-backup.sh
+```
+
+Retention: 7 daily, 4 weekly (Sunday), 6 monthly (1st), 5 yearly (Jan 1st). Backups stored in `data/cloudflare/backups/`.
 
 ## Multisite Modes
 
@@ -184,7 +217,7 @@ WP_DOMAIN_CURRENT_SITE=example.com
 WP_SUNRISE=false               # true only if using a SUNRISE domain mapping plugin
 ```
 
-### Subdomain mode (default: matches Azure production)
+### Subdomain mode (default: matches production)
 
 Sites live on separate domains. WordPress core handles domain routing natively via the `wp_blogs` table, no plugins needed. Each site can have its own domain (e.g., `example-primary.com`, `example-shop.com`) by editing the site URL in **Network Admin → Sites → Edit**.
 
@@ -222,8 +255,11 @@ Nginx is configured with `server_name _` (catch-all), so it accepts any hostname
 ```
 wordpressmultisite/
 ├── docker-compose.yml
+├── docker-compose.tunnels.yml  # Auto-generated by cf-setup.sh (gitignored)
 ├── .env                        # Secrets (gitignored)
 ├── .env.example                # Template
+├── accounts.json               # CF account config (gitignored)
+├── accounts.json.example       # Template
 ├── .gitignore
 ├── config/
 │   ├── nginx/
@@ -238,11 +274,21 @@ wordpressmultisite/
 ├── data/                       # Persistent volumes (gitignored)
 │   ├── mysql/
 │   ├── redis/
-│   └── wordpress/
+│   ├── wordpress/
+│   └── cloudflare/
+│       └── backups/
+│           ├── dns/{domain}/{timestamp}.json
+│           └── tunnels/{name}/{timestamp}.json
 ├── logs/                       # Log files (gitignored)
 │   └── nginx/
 └── scripts/
-    └── failover-activate.sh
+    ├── cf-common.sh            # Shared functions (sourced by all cf-* scripts)
+    ├── cf-setup.sh             # Create tunnels + generate compose
+    ├── cf-failover.sh          # Switch domains to Docker
+    ├── cf-rollback.sh          # Restore domains to production
+    ├── cf-status.sh            # Show current state
+    ├── cf-backup.sh            # Backup DNS + tunnel configs
+    └── failover-activate.sh    # Wrapper for cf-failover.sh
 ```
 
 ## Network Isolation
@@ -296,6 +342,12 @@ docker compose logs -f nginx
 docker compose --profile tunnels up -d
 docker compose --profile tunnels stop
 
+# Cloudflare status
+./scripts/cf-status.sh
+
+# Backup DNS + tunnel configs
+./scripts/cf-backup.sh
+
 # Run WP-CLI command
 docker compose exec wordpress wp plugin list --allow-root
 
@@ -315,9 +367,9 @@ docker compose down && docker compose up -d --force-recreate
 ## Failover Flow
 
 1. Sync database from production to this instance's MariaDB
-2. Run `./scripts/failover-activate.sh`
-3. In each CF account's tunnel, add real domains as public hostnames → `http://nginx:80`
-4. Cloudflare updates DNS automatically, all sites come up instantly
+2. Run `./scripts/cf-failover.sh`, backs up DNS, switches domains, configures tunnels
+3. All sites come up instantly on Docker
+4. To rollback: `./scripts/cf-rollback.sh`
 
 ## Updating Cloudflare IP Ranges
 

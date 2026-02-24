@@ -208,60 +208,12 @@ services:
           memory: 256M
 
   # ---------------------------------------------------------------------------
-  # Cloudflare Tunnels, one per CF account
+  # Cloudflare Tunnels
   # ---------------------------------------------------------------------------
-  # Each Cloudflare account needs its own tunnel + container. A single tunnel
-  # handles ALL domains on that account. Add hostnames in each account's
-  # Zero Trust dashboard → Tunnels → Public Hostname → http://nginx:80
+  # Tunnel services are auto-generated in docker-compose.tunnels.yml
+  # by ./scripts/cf-setup.sh. Do not add cloudflared services here.
   #
-  # Start all tunnels:  docker compose --profile tunnels up -d
+  # Setup:   ./scripts/cf-setup.sh
+  # Start:   docker compose --profile tunnels up -d
+  # Status:  ./scripts/cf-status.sh
   # ---------------------------------------------------------------------------
-
-  # Standby tunnel, standby.example.net account (*.standby.example.net)
-  cloudflared-standby.example.net:
-    image: cloudflare/cloudflared:latest
-    restart: unless-stopped
-    profiles:
-      - tunnels
-    networks:
-      - frontend
-    command: tunnel --no-autoupdate run
-    environment:
-      TUNNEL_TOKEN: ${CF_TUNNEL_STANDBY}
-    deploy:
-      resources:
-        limits:
-          memory: 128M
-
-  # Failover tunnels, one per CF account with real domains
-  # Create a tunnel in each account, paste token in .env, uncomment below.
-
-  # cloudflared-account2:
-  #   image: cloudflare/cloudflared:latest
-  #   restart: unless-stopped
-  #   profiles:
-  #     - tunnels
-  #   networks:
-  #     - frontend
-  #   command: tunnel --no-autoupdate run
-  #   environment:
-  #     TUNNEL_TOKEN: ${CF_TUNNEL_ACCOUNT2}
-  #   deploy:
-  #     resources:
-  #       limits:
-  #         memory: 128M
-
-  # cloudflared-account3:
-  #   image: cloudflare/cloudflared:latest
-  #   restart: unless-stopped
-  #   profiles:
-  #     - tunnels
-  #   networks:
-  #     - frontend
-  #   command: tunnel --no-autoupdate run
-  #   environment:
-  #     TUNNEL_TOKEN: ${CF_TUNNEL_ACCOUNT3}
-  #   deploy:
-  #     resources:
-  #       limits:
-  #         memory: 128M
