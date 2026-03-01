@@ -23,6 +23,17 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 source "$SCRIPT_DIR/cf-common.sh"
 
+# Trap handler: warn about partial .env modifications on unexpected exit
+cleanup_setup() {
+    local exit_code=$?
+    if [ "$exit_code" -ne 0 ]; then
+        echo "" >&2
+        log_error "Setup interrupted (exit $exit_code). Your .env may have been partially modified."
+        log_error "Review .env and re-run cf-setup.sh to complete configuration."
+    fi
+}
+trap cleanup_setup EXIT
+
 echo "=== Cloudflare Tunnel Setup ==="
 echo ""
 
@@ -105,17 +116,20 @@ if [ ${#ALL_DOMAIN_NAMES[@]} -gt 0 ]; then
             local_domain="${ALL_DOMAIN_NAMES[$idx]}"
             acct_n="${ALL_DOMAIN_ACCT_N[$idx]}"
 
+            # Escape dots in domain for use in sed patterns
+            local_domain_escaped="${local_domain//./\\.}"
+
             if [ "${ALL_DOMAIN_FAILOVER[$idx]}" = "true" ]; then
                 # Remove domain from failover list
                 ALL_DOMAIN_FAILOVER[$idx]="false"
                 current=$(get_account_var "$acct_n" FAILOVER)
-                new=$(echo "$current" | sed "s/$local_domain//" | sed 's/,,/,/g' | sed 's/^,//;s/,$//')
+                new=$(echo "$current" | sed "s/$local_domain_escaped//" | sed 's/,,/,/g' | sed 's/^,//;s/,$//')
                 if grep -q "^CF_ACCOUNT_${acct_n}_FAILOVER=" "$ENV_FILE"; then
                     sed -i "s/^CF_ACCOUNT_${acct_n}_FAILOVER=.*/CF_ACCOUNT_${acct_n}_FAILOVER=$new/" "$ENV_FILE"
                 else
                     echo "CF_ACCOUNT_${acct_n}_FAILOVER=$new" >> "$ENV_FILE"
                 fi
-                eval "CF_ACCOUNT_${acct_n}_FAILOVER=\"$new\""
+                declare -g "CF_ACCOUNT_${acct_n}_FAILOVER=$new"
                 log_info "Toggled $local_domain → ACTIVE"
             else
                 # Add domain to failover list
@@ -131,7 +145,7 @@ if [ ${#ALL_DOMAIN_NAMES[@]} -gt 0 ]; then
                 else
                     echo "CF_ACCOUNT_${acct_n}_FAILOVER=$new" >> "$ENV_FILE"
                 fi
-                eval "CF_ACCOUNT_${acct_n}_FAILOVER=\"$new\""
+                declare -g "CF_ACCOUNT_${acct_n}_FAILOVER=$new"
                 log_info "Toggled $local_domain → FAILOVER"
             fi
         else
@@ -203,8 +217,7 @@ for ((n = 1; n <= ACCOUNT_COUNT; n++)); do
         log_ok "Standby ingress configured"
 
         # Create wildcard DNS CNAME on standby domain only
-        read -ra standby_domains <<< "$(get_account_domains "$n")"
-        domain="${standby_domains[0]}"
+        domain="$STANDBY_DOMAIN"
         zone_id=$(get_zone_id "$domain" "$api_token")
         cname_target="${tunnel_id}.cfargotunnel.com"
 

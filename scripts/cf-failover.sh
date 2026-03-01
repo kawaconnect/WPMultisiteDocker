@@ -20,6 +20,22 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 source "$SCRIPT_DIR/cf-common.sh"
 
+# Track partially-switched records for trap handler
+declare -a PARTIALLY_SWITCHED=()
+
+cleanup_failover() {
+    local exit_code=$?
+    if [ "$exit_code" -ne 0 ] && [ ${#PARTIALLY_SWITCHED[@]} -gt 0 ]; then
+        echo "" >&2
+        log_error "Failover interrupted (exit $exit_code). The following records were already switched:"
+        for rec in "${PARTIALLY_SWITCHED[@]}"; do
+            log_error "  - $rec"
+        done
+        log_error "Run ./scripts/cf-rollback.sh to restore, or re-run cf-failover.sh to continue."
+    fi
+}
+trap cleanup_failover EXIT
+
 # ── Step 1: Validate ─────────────────────────────────────────────────────────
 
 echo "[1/6] Checking dependencies and config..."
@@ -198,10 +214,19 @@ for ((p = 0; p < PLAN_COUNT; p++)); do
     # Delete the A record
     delete_dns_record "$zone_id" "$api_token" "$record_id"
 
-    # Create CNAME pointing to tunnel
-    create_dns_cname "$zone_id" "$api_token" "$record_name" "$cname_target" "$record_proxied" >/dev/null
+    # Create CNAME pointing to tunnel; if this fails, attempt to restore original A record
+    if ! create_dns_cname "$zone_id" "$api_token" "$record_name" "$cname_target" "$record_proxied" >/dev/null; then
+        log_error "Failed to create CNAME for $record_name, attempting to restore original A record"
+        if create_dns_a "$zone_id" "$api_token" "$record_name" "$CLOUD_IP" "$record_proxied" >/dev/null; then
+            log_ok "Restored original A record for $record_name"
+        else
+            log_error "CRITICAL: Could not restore A record for $record_name, manual intervention required!"
+        fi
+        continue
+    fi
 
     SWITCHED+=("$record_name")
+    PARTIALLY_SWITCHED+=("$record_name")
     INGRESS_BY_TUNNEL[$tunnel_id]+="$record_name "
     log_ok "Switched: $record_name"
 done

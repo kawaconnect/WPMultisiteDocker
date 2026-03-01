@@ -19,6 +19,22 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 source "$SCRIPT_DIR/cf-common.sh"
 
+# Track partially-restored records for trap handler
+declare -a PARTIALLY_RESTORED=()
+
+cleanup_rollback() {
+    local exit_code=$?
+    if [ "$exit_code" -ne 0 ] && [ ${#PARTIALLY_RESTORED[@]} -gt 0 ]; then
+        echo "" >&2
+        log_error "Rollback interrupted (exit $exit_code). The following records were already restored:"
+        for rec in "${PARTIALLY_RESTORED[@]}"; do
+            log_error "  - $rec"
+        done
+        log_error "Re-run ./scripts/cf-rollback.sh to continue restoring remaining records."
+    fi
+}
+trap cleanup_rollback EXIT
+
 # ── Step 1: Validate ─────────────────────────────────────────────────────────
 
 echo "[1/5] Checking dependencies and config..."
@@ -203,10 +219,21 @@ for ((p = 0; p < PLAN_COUNT; p++)); do
     # Delete the CNAME
     delete_dns_record "$zone_id" "$api_token" "$record_id"
 
-    # Create A record pointing at cloud IP
-    create_dns_a "$zone_id" "$api_token" "$record_name" "$CLOUD_IP" "$record_proxied" >/dev/null
+    # Create A record; if this fails, attempt to restore original CNAME
+    if ! create_dns_a "$zone_id" "$api_token" "$record_name" "$CLOUD_IP" "$record_proxied" >/dev/null; then
+        log_error "Failed to create A record for $record_name, attempting to restore original CNAME"
+        local tunnel_id_for_restore="${PLAN_TUNNEL_IDS[$p]}"
+        local cname_target_restore="${tunnel_id_for_restore}.cfargotunnel.com"
+        if create_dns_cname "$zone_id" "$api_token" "$record_name" "$cname_target_restore" "$record_proxied" >/dev/null; then
+            log_ok "Restored original CNAME for $record_name"
+        else
+            log_error "CRITICAL: Could not restore CNAME for $record_name, manual intervention required!"
+        fi
+        continue
+    fi
 
     RESTORED+=("$record_name")
+    PARTIALLY_RESTORED+=("$record_name")
     log_ok "Restored: $record_name → $CLOUD_IP"
 done
 

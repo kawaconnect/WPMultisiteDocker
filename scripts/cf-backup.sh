@@ -18,6 +18,15 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 source "$SCRIPT_DIR/cf-common.sh"
 
+cleanup_backup() {
+    local exit_code=$?
+    if [ "$exit_code" -ne 0 ]; then
+        echo "" >&2
+        log_error "Backup interrupted (exit $exit_code). Some backups may be incomplete."
+    fi
+}
+trap cleanup_backup EXIT
+
 echo "=== Cloudflare Backup ==="
 echo ""
 

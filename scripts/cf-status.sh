@@ -9,6 +9,15 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 source "$SCRIPT_DIR/cf-common.sh"
 
+cleanup_status() {
+    local exit_code=$?
+    if [ "$exit_code" -ne 0 ]; then
+        echo "" >&2
+        log_error "Status check interrupted (exit $exit_code)."
+    fi
+}
+trap cleanup_status EXIT
+
 echo "=== Cloudflare Status ==="
 echo ""
 

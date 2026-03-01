@@ -14,6 +14,7 @@
 PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 ENV_FILE="$PROJECT_DIR/.env"
 BACKUP_DIR="$PROJECT_DIR/data/cloudflare/backups"
+_CF_RUNTIME_CACHE="/tmp/.cf-runtime-cache-$$"
 
 # CF API base URL
 CF_API="https://api.cloudflare.com/client/v4"
@@ -91,6 +92,13 @@ load_config() {
             log_error "Account $n is missing NAME, ID, or TOKEN"
             exit 1
         fi
+
+        local domains_var="CF_ACCOUNT_${n}_DOMAINS"
+        if [ -n "${!domains_var:-}" ]; then
+            log_info "Account $n ($name): using explicit domains from .env"
+        else
+            log_info "Account $n ($name): will auto-discover zones from API"
+        fi
     done
 
     log_ok "Config loaded: $account_count account(s), standby=$CF_STANDBY_DOMAIN"
@@ -117,11 +125,62 @@ get_account_var() {
 }
 
 # get_account_domains N, prints space-separated list of domains
+# Uses CF_ACCOUNT_N_DOMAINS from .env if set, otherwise auto-discovers from API
 get_account_domains() {
     local n="$1"
     local varname="CF_ACCOUNT_${n}_DOMAINS"
-    IFS=',' read -ra domains <<< "${!varname:-}"
-    echo "${domains[@]}"
+    local domains_csv="${!varname:-}"
+
+    if [ -n "$domains_csv" ]; then
+        # Explicit domains in .env, use them (comma → space)
+        IFS=',' read -ra domains <<< "$domains_csv"
+        echo "${domains[@]}"
+    else
+        # Auto-discover from CF API
+        local account_id api_token
+        account_id=$(get_account_var "$n" ID)
+        api_token=$(get_account_var "$n" TOKEN)
+        discover_account_zones "$account_id" "$api_token"
+    fi
+}
+
+# discover_account_zones ACCOUNT_ID TOKEN, returns space-separated zone names
+# Results are cached per PID in temp files to avoid repeated API calls
+discover_account_zones() {
+    local account_id="$1" token="$2"
+    local cache_file="$_CF_RUNTIME_CACHE/zones_${account_id}"
+
+    # Return cached result if available
+    if [ -f "$cache_file" ]; then
+        cat "$cache_file"
+        return
+    fi
+
+    local all_zones="" page=1
+    while true; do
+        local response
+        response=$(cf_api GET "/zones?account.id=$account_id&status=active&per_page=50&page=$page" "$token") || {
+            log_error "Failed to discover zones for account $account_id"
+            return 1
+        }
+        local page_zones
+        page_zones=$(echo "$response" | jq -r '.result[].name' 2>/dev/null | tr '\n' ' ' | sed 's/ $//')
+        if [ -n "$page_zones" ]; then
+            all_zones="${all_zones:+$all_zones }$page_zones"
+        fi
+
+        local total_pages
+        total_pages=$(echo "$response" | jq '.result_info.total_pages // 1')
+        if [ "$page" -ge "$total_pages" ]; then
+            break
+        fi
+        ((page++))
+    done
+
+    # Cache result
+    mkdir -p "$_CF_RUNTIME_CACHE"
+    echo "$all_zones" > "$cache_file"
+    echo "$all_zones"
 }
 
 # is_domain_failover N DOMAIN, returns 0 (true) if domain is in failover list
@@ -450,50 +509,111 @@ get_tunnel_config() {
 validate_token() {
     local token="$1" label="$2"
     local response
-    if ! response=$(cf_api GET "/user/tokens/verify" "$token" 2>/dev/null); then
-        log_error "API token for '$label' is invalid or expired"
-        return 1
+
+    # Try /user/tokens/verify first (requires User:API Tokens:Read permission)
+    if response=$(cf_api GET "/user/tokens/verify" "$token" 2>/dev/null); then
+        local status
+        status=$(echo "$response" | jq -r '.result.status // "unknown"')
+        if [ "$status" = "active" ]; then
+            log_ok "Token valid: $label"
+            return 0
+        elif [ "$status" != "unknown" ]; then
+            log_error "API token for '$label' status: $status (expected: active)"
+            return 1
+        fi
     fi
-    local status
-    status=$(echo "$response" | jq -r '.result.status // "unknown"')
-    if [ "$status" != "active" ]; then
-        log_error "API token for '$label' status: $status (expected: active)"
-        return 1
+
+    # Fallback: try listing zones (works with Zone:Read permission)
+    if cf_api GET "/zones?per_page=1" "$token" &>/dev/null; then
+        log_ok "Token valid: $label"
+        return 0
     fi
-    log_ok "Token valid: $label"
+
+    log_error "API token for '$label' is invalid or expired"
+    return 1
 }
 
 # =============================================================================
 # Backup helpers
 # =============================================================================
 
+# normalize_dns_records JSON, extract stable fields and sort deterministically
+normalize_dns_records() {
+    echo "$1" | jq -S '[.[] | {type, name, content, proxied}] | sort_by([.name, .type])'
+}
+
+# normalize_tunnel_config JSON, extract ingress rules only
+normalize_tunnel_config() {
+    echo "$1" | jq -S '.config.ingress // empty'
+}
+
 # backup_dns_zone DOMAIN ZONE_ID TOKEN
 # Saves all DNS records to data/cloudflare/backups/dns/{domain}/{timestamp}.json
+# Skips write if DNS is unchanged since last backup
 backup_dns_zone() {
     local domain="$1" zone_id="$2" token="$3"
     local dir="$BACKUP_DIR/dns/$domain"
     local timestamp
     timestamp=$(date +%Y-%m-%d_%H%M%S)
     mkdir -p "$dir"
+    chmod 700 "$dir"
 
     local records
     records=$(get_dns_records "$zone_id" "$token") || return 1
-    echo "$records" | jq '.' > "$dir/$timestamp.json"
+
+    # Change detection: compare against last backup
+    local prev
+    prev=$(get_latest_backup "$dir")
+    if [ -n "$prev" ]; then
+        local current_norm prev_norm
+        current_norm=$(normalize_dns_records "$records")
+        prev_norm=$(normalize_dns_records "$(cat "$prev")")
+        if [ "$current_norm" = "$prev_norm" ]; then
+            log_info "DNS unchanged: $domain (skipped)"
+            return 0
+        fi
+    fi
+
+    if ! echo "$records" | jq '.' > "$dir/$timestamp.json"; then
+        log_error "Failed to write DNS backup for $domain"
+        return 1
+    fi
+    chmod 600 "$dir/$timestamp.json"
     log_ok "DNS backup: $domain → $dir/$timestamp.json ($(echo "$records" | jq 'length') records)"
 }
 
 # backup_tunnel_config ACCOUNT_NAME ACCOUNT_ID TOKEN TUNNEL_ID
 # Saves tunnel config to data/cloudflare/backups/tunnels/{name}/{timestamp}.json
+# Skips write if config is unchanged since last backup
 backup_tunnel_config() {
     local name="$1" account_id="$2" token="$3" tunnel_id="$4"
     local dir="$BACKUP_DIR/tunnels/$name"
     local timestamp
     timestamp=$(date +%Y-%m-%d_%H%M%S)
     mkdir -p "$dir"
+    chmod 700 "$dir"
 
     local config
     config=$(get_tunnel_config "$account_id" "$token" "$tunnel_id") || return 1
-    echo "$config" | jq '.' > "$dir/$timestamp.json"
+
+    # Change detection: compare against last backup
+    local prev
+    prev=$(get_latest_backup "$dir")
+    if [ -n "$prev" ]; then
+        local current_norm prev_norm
+        current_norm=$(normalize_tunnel_config "$config")
+        prev_norm=$(normalize_tunnel_config "$(cat "$prev")")
+        if [ -n "$current_norm" ] && [ "$current_norm" = "$prev_norm" ]; then
+            log_info "Tunnel config unchanged: $name (skipped)"
+            return 0
+        fi
+    fi
+
+    if ! echo "$config" | jq '.' > "$dir/$timestamp.json"; then
+        log_error "Failed to write tunnel backup for $name"
+        return 1
+    fi
+    chmod 600 "$dir/$timestamp.json"
     log_ok "Tunnel backup: $name → $dir/$timestamp.json"
 }
 
