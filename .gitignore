@@ -22,6 +22,13 @@ Thumbs.db
 # Plugin development (separate repo)
 plugindev/
 
+# Media files (screenshots, recordings)
+*.mp4
+*.webp
+*.png
+*.jpg
+*.jpeg
+
 # Temp files
 *.tmp
 *.bak
