@@ -281,6 +281,42 @@ services:
           memory: 256M
 
   # ---------------------------------------------------------------------------
+  # Cloudflare DNS Backup, runs every 6 hours, saves on change
+  # ---------------------------------------------------------------------------
+  cf-backup:
+    image: alpine:3.21
+    restart: unless-stopped
+    networks:
+      - frontend
+    volumes:
+      - ./scripts:/app/scripts:ro
+      - ./data/cloudflare/backups:/app/data/cloudflare/backups
+      - ./.env:/app/.env:ro
+    entrypoint: /bin/sh
+    command:
+      - -c
+      - |
+        apk add --no-cache bash curl jq openssl >/dev/null 2>&1
+        ln -sf /bin/true /usr/local/bin/docker
+        while true; do
+          bash /app/scripts/cf-backup.sh 2>&1 || true
+          sleep 21600
+        done
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    deploy:
+      resources:
+        limits:
+          memory: 128M
+
+  # ---------------------------------------------------------------------------
   # Cloudflare Tunnels
   # ---------------------------------------------------------------------------
   # Tunnel services are auto-generated in docker-compose.tunnels.yml
