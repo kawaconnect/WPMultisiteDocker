@@ -92,7 +92,7 @@ services:
   # ---------------------------------------------------------------------------
   # NOTE: $$ is docker-compose YAML escaping for a literal $ in the container
   wordpress:
-    image: wordpress:6.7-fpm
+    image: wordpress:6.9.1-fpm
     restart: unless-stopped
     networks:
       - frontend
@@ -242,7 +242,7 @@ services:
   # WP-Cron, runs every 5 minutes via WP-CLI
   # ---------------------------------------------------------------------------
   wp-cron:
-    image: wordpress:cli-2.11
+    image: wordpress:cli-2.12
     restart: unless-stopped
     user: "33:33"
     networks:
