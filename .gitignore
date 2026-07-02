@@ -24,10 +24,26 @@ plugindev/
 
 # Media files (screenshots, recordings)
 *.mp4
+*.webm
 *.webp
 *.png
 *.jpg
 *.jpeg
+
+# Node / Playwright dependencies (regenerate with `npm install`)
+node_modules/
+
+# Generated site-audit output (regenerate by re-running the audit harness)
+sites/_audit/screenshots/
+sites/_audit/reports/
+
+# Local safety copies and backup bundles, may contain real site data / DB dumps.
+# NEVER commit: these leak user data (password hashes, PII) to the remote.
+safety-backups/
+*.sql
+*.sql.gz
+docs/*.zip
+sgbackup_bundle_*.zip
 
 # Temp files
 *.tmp
