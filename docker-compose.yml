@@ -92,7 +92,7 @@ services:
   # ---------------------------------------------------------------------------
   # NOTE: $$ is docker-compose YAML escaping for a literal $ in the container
   wordpress:
-    image: wordpress:6.9.1-fpm
+    image: wordpress:6.9.4-fpm
     restart: unless-stopped
     networks:
       - frontend
