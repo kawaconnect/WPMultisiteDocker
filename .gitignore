@@ -49,3 +49,6 @@ sgbackup_bundle_*.zip
 *.tmp
 *.bak
 
+
+# Isolated dev/test instances (scripts/instance.sh), contain DBs and secrets
+instances/
