@@ -97,6 +97,12 @@ cmd_create() {
 	done
 	local dir; dir="$(instance_dir "$name")"
 	case "$mode" in single|multisite) ;; *) die "--mode single|multisite is required" ;; esac
+
+	# Allocate port and subnet and write .env under one lock, so concurrent
+	# creates cannot pick the same port or subnet.
+	mkdir -p "$INSTANCES_DIR"
+	exec 8>"$INSTANCES_DIR/.alloc.lock"
+	flock -w 60 8 || die "could not lock $INSTANCES_DIR/.alloc.lock"
 	[ -e "$dir" ] && die "instance $name already exists"
 	[ -n "$port" ] || port="$(free_port)"
 	[[ "$port" =~ ^[0-9]+$ ]] || die "invalid port $port"
@@ -121,6 +127,7 @@ WP_ADMIN_USER=admin
 WP_ADMIN_PASSWORD=$admin_pass
 EOF
 	chmod 600 "$dir/.env"
+	flock -u 8; exec 8>&-
 
 	compose "$name" up -d --quiet-pull
 	wait_for "wp-config.php" 60 test -f "$dir/data/wordpress/wp-config.php"
