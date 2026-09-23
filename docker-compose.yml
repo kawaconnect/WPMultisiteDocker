@@ -196,7 +196,7 @@ services:
   # Nginx 1.27, Reverse Proxy + Static Files
   # ---------------------------------------------------------------------------
   nginx:
-    image: nginx:1.27.3-alpine
+    image: nginx:1.29.8-alpine
     restart: unless-stopped
     networks:
       - frontend
