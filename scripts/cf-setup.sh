@@ -261,7 +261,7 @@ HEADER
         svc_token="${TUNNEL_TOKENS[$j]}"
         cat <<EOF
   cloudflared-${svc_name}:
-    image: cloudflare/cloudflared:latest
+    image: cloudflare/cloudflared:2026.10.0
     restart: unless-stopped
     profiles: [tunnels]
     networks: [frontend]

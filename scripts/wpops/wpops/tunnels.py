@@ -72,7 +72,7 @@ def ensure(start: bool = True, log=print) -> dict[str, Any]:
     for name, token in tokens:
         lines += [
             f"  cloudflared-{name}:",
-            "    image: cloudflare/cloudflared:latest",
+            "    image: cloudflare/cloudflared:2026.10.0",
             "    restart: unless-stopped",
             "    profiles: [tunnels]",
             "    networks: [frontend]",

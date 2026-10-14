@@ -27,7 +27,7 @@ Docker-based WordPress Multisite with Nginx reverse proxy, MariaDB, Redis object
 
 | Service | Image | Purpose |
 |---------|-------|---------|
-| **mariadb** | mariadb:11.4 | Database (LTS) |
+| **mariadb** | mariadb:11.8 | Database (LTS) |
 | **redis** | redis:7-alpine | Object cache (384MB, LRU) |
 | **wordpress** | wordpress:6-fpm | PHP-FPM application |
 | **nginx** | nginx:1.27-alpine | Reverse proxy, static files, security |

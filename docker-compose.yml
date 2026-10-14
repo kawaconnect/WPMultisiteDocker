@@ -14,10 +14,10 @@ networks:
 
 services:
   # ---------------------------------------------------------------------------
-  # MariaDB 11.4 LTS
+  # MariaDB 11.8 LTS
   # ---------------------------------------------------------------------------
   mariadb:
-    image: mariadb:11.4.4
+    image: mariadb:11.8.9
     restart: unless-stopped
     networks:
       - backend
@@ -28,6 +28,8 @@ services:
       MYSQL_DATABASE: ${MYSQL_DATABASE}
       MYSQL_USER: ${MYSQL_USER}
       MYSQL_PASSWORD: ${MYSQL_PASSWORD}
+      # Run mariadb-upgrade automatically after an image bump (11.4 -> 11.8 etc.)
+      MARIADB_AUTO_UPGRADE: "1"
     healthcheck:
       test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
       interval: 30s
@@ -53,10 +55,10 @@ services:
           memory: 1G
 
   # ---------------------------------------------------------------------------
-  # Redis 7, Object Cache
+  # Redis 8, Object Cache
   # ---------------------------------------------------------------------------
   redis:
-    image: redis:7.4-alpine
+    image: redis:8.10-alpine
     restart: unless-stopped
     networks:
       - backend
@@ -88,11 +90,11 @@ services:
           memory: 512M
 
   # ---------------------------------------------------------------------------
-  # WordPress 6, PHP-FPM
+  # WordPress 7, PHP-FPM (PHP 8.3, matching the primary)
   # ---------------------------------------------------------------------------
   # NOTE: $$ is docker-compose YAML escaping for a literal $ in the container
   wordpress:
-    image: wordpress:6.9.4-fpm
+    image: wordpress:7.1.3-php8.3-fpm
     restart: unless-stopped
     networks:
       - frontend
@@ -193,10 +195,10 @@ services:
           memory: 1G
 
   # ---------------------------------------------------------------------------
-  # Nginx 1.27, Reverse Proxy + Static Files
+  # Nginx 1.31, Reverse Proxy + Static Files
   # ---------------------------------------------------------------------------
   nginx:
-    image: nginx:1.29.8-alpine
+    image: nginx:1.31.6-alpine
     restart: unless-stopped
     networks:
       - frontend
