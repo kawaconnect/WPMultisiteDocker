@@ -28,10 +28,10 @@ Docker-based WordPress Multisite with Nginx reverse proxy, MariaDB, Redis object
 | Service | Image | Purpose |
 |---------|-------|---------|
 | **mariadb** | mariadb:11.8 | Database (LTS) |
-| **redis** | redis:7-alpine | Object cache (384MB, LRU) |
-| **wordpress** | wordpress:6-fpm | PHP-FPM application |
-| **nginx** | nginx:1.27-alpine | Reverse proxy, static files, security |
-| **wp-cron** | wordpress:cli | Runs WP cron every 5 minutes via WP-CLI |
+| **redis** | redis:8-alpine | Object cache (384MB, LRU) |
+| **wordpress** | wordpress:7-php8.3-fpm | PHP-FPM application |
+| **nginx** | nginx:1.31-alpine | Reverse proxy, static files, security |
+| **wp-cron** | wordpress:cli | Runs WP cron every minute via WP-CLI |
 | **cloudflared-\*** | cloudflare/cloudflared | Tunnel connectors (only start with `--profile tunnels`) |
 
 ## Quick Start
