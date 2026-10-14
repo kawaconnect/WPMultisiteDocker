@@ -49,3 +49,8 @@ sgbackup_bundle_*.zip
 *.tmp
 *.bak
 
+
+# wpops (node agent): per-node state, pulled backup sets, per-node config
+state/
+backups/
+config/wpops.json

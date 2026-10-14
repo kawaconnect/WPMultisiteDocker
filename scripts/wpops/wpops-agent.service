@@ -1,0 +1,22 @@
+# wpops agent, install with: scripts/wpops/install-agent.sh
+[Unit]
+Description=wpops WordPress node agent
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/docker/wordpressmultisite
+Environment=WPOPS_REPO_DIR=/opt/docker/wordpressmultisite
+EnvironmentFile=-/etc/default/wpops-agent
+ExecStart=/opt/docker/wordpressmultisite/scripts/wpops/bin/wpops serve $WPOPS_BIND_ARGS
+Restart=always
+RestartSec=5
+# The agent drives docker compose and writes under the repo; it runs as root like compose itself.
+NoNewPrivileges=true
+ProtectSystem=full
+ProtectHome=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

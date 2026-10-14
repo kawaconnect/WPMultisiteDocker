@@ -1,0 +1,120 @@
+"""Docker stacks on this node: compose wrappers, WP-CLI, disk checks, plugin install."""
+
+from __future__ import annotations
+
+import os
+import shutil
+import subprocess
+from pathlib import Path
+from typing import Any
+
+from .config import REPO_DIR, Origin
+
+PLUGIN_SRC = REPO_DIR / "plugin" / "kc-host-alias"
+
+
+class StackError(Exception):
+    pass
+
+
+def stack_path(origin: Origin, name: str) -> Path:
+    try:
+        return Path(origin.stacks[name]["path"])
+    except KeyError:
+        raise StackError(f"stack '{name}' is not defined on node '{origin.name}'") from None
+
+
+def compose(origin: Origin, name: str, *args: str, timeout: int = 3600, check: bool = True,
+            capture: bool = True) -> subprocess.CompletedProcess:
+    path = stack_path(origin, name)
+    cmd = ["docker", "compose", *args]
+    env = dict(os.environ)
+    env.setdefault("COMPOSE_INTERACTIVE_NO_CLI", "1")
+    return subprocess.run(cmd, cwd=path, env=env, text=True, timeout=timeout, check=check,
+                          capture_output=capture)
+
+
+def wp(origin: Origin, name: str, *args: str, timeout: int = 3600, url: str | None = None) -> subprocess.CompletedProcess:
+    """Run WP-CLI inside the stack's CLI container (service 'wp-cron' here, 'cli' for instances)."""
+    mode = origin.stacks[name].get("cli_service") or "wp-cron"
+    cmd = ["exec", "-T", mode, "wp", *args, "--allow-root"]
+    if url:
+        cmd.insert(-1, f"--url={url}")
+    return compose(origin, name, *cmd, timeout=timeout, check=False)
+
+
+def ps(origin: Origin, name: str) -> list[dict[str, Any]]:
+    import json
+    r = compose(origin, name, "ps", "--format", "json", check=False)
+    out: list[dict[str, Any]] = []
+    for line in (r.stdout or "").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            obj = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(obj, list):
+            out.extend(obj)
+        else:
+            out.append(obj)
+    return [{"name": c.get("Name"), "service": c.get("Service"), "state": c.get("State"),
+             "health": c.get("Health", ""), "status": c.get("Status")} for c in out]
+
+
+def disk_free(path: Path) -> dict[str, int]:
+    st = shutil.disk_usage(path)
+    return {"total": st.total, "used": st.used, "free": st.free}
+
+
+def require_free(path: Path, needed: int, label: str) -> None:
+    free = disk_free(path)["free"]
+    if free < needed:
+        raise StackError(f"not enough disk for {label}: need {needed // 2**20} MB, free {free // 2**20} MB on {path}")
+
+
+def wp_content(origin: Origin, name: str) -> Path:
+    return stack_path(origin, name) / "data" / "wordpress" / "wp-content"
+
+
+def install_host_alias(origin: Origin, name: str, log=print) -> dict[str, Any]:
+    """Copy the host-alias mu-plugin (and sunrise.php for multisite) into the stack."""
+    wc = wp_content(origin, name)
+    if not wc.exists():
+        raise StackError(f"{wc} does not exist (stack not initialised?)")
+    mu = wc / "mu-plugins"
+    mu.mkdir(exist_ok=True)
+    changed = []
+    src = PLUGIN_SRC / "kc-host-alias.php"
+    dst = mu / "kc-host-alias.php"
+    if not dst.exists() or dst.read_bytes() != src.read_bytes():
+        shutil.copyfile(src, dst)
+        changed.append(str(dst))
+    mode = origin.stacks[name].get("mode", "multisite")
+    if mode == "multisite":
+        src = PLUGIN_SRC / "sunrise.php"
+        dst = wc / "sunrise.php"
+        if dst.exists() and dst.read_bytes() != src.read_bytes() and b"KC Host Alias" not in dst.read_bytes():
+            raise StackError(f"{dst} exists and is not ours; refusing to overwrite (merge by hand)")
+        if not dst.exists() or dst.read_bytes() != src.read_bytes():
+            shutil.copyfile(src, dst)
+            changed.append(str(dst))
+    for p in changed:
+        try:
+            os.chmod(p, 0o644)
+        except OSError:
+            pass
+        log(f"installed {p}")
+    aliases = wc / "wpops-host-aliases.json"
+    if not aliases.exists():
+        aliases.write_text('{"generated": 0, "aliases": {}}\n', encoding="utf-8")
+        changed.append(str(aliases))
+    return {"changed": changed, "sunrise_required": mode == "multisite"}
+
+
+def env_flag(path: Path, key: str) -> str:
+    for line in (path / ".env").read_text(encoding="utf-8").splitlines() if (path / ".env").exists() else []:
+        if line.startswith(key + "="):
+            return line.split("=", 1)[1].strip().strip("'\"")
+    return ""

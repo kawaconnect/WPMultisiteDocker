@@ -1,0 +1,8 @@
+{
+  "node": "node2",
+  "agent": {"bind": ["127.0.0.1"], "port": 8787, "public_url": "https://ops.standby.example.net", "rate_limit_per_min": 120},
+  "backup": {"schedule": "weekly:sun:03:30", "retain_sets": 4, "sources": [], "pull_timeout_min": 180, "auto_apply": false},
+  "restore": {"cleanup_imported": true},
+  "notify": {"email_to": [], "email_from": "", "webhook_url": ""},
+  "failover": {"default_to": "", "tunnel_service": "http://nginx:80"}
+}

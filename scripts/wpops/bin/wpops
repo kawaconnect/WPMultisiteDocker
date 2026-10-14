@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+# Launcher: runs the wpops package from this checkout; repo root resolved automatically.
+set -euo pipefail
+HERE="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
+export WPOPS_REPO_DIR="${WPOPS_REPO_DIR:-$(cd "$HERE/../../.." && pwd)}"
+export PYTHONDONTWRITEBYTECODE=1
+cd "$HERE/.." && exec python3 -m wpops "$@"

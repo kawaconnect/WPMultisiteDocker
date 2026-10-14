@@ -1,0 +1,79 @@
+{
+  "_doc": "Origins and sites shared by every wpops node and the Discord bot. No secrets. See docs/wpops-design.md.",
+  "origins": {
+    "azure": {
+      "kind": "external",
+      "targets": [
+        {
+          "type": "A",
+          "content": "203.0.113.10"
+        },
+        {
+          "type": "CNAME",
+          "content": "primary-app.azurewebsites.net"
+        },
+        {
+          "type": "CNAME",
+          "content": "primary-app-multisitewp.azurewebsites.net"
+        }
+      ],
+      "sync_api": "https://example-primary.com"
+    },
+    "node2": {
+      "kind": "node",
+      "agent": "https://ops.standby.example.net",
+      "standby_domain": "standby.example.net",
+      "stacks": {
+        "main": {
+          "path": "/opt/docker/wordpressmultisite",
+          "mode": "multisite",
+          "service": "http://nginx:80"
+        }
+      },
+      "tunnels": {
+        "example-shop": "00000000-0000-0000-0000-000000000000"
+      },
+      "sync_api": "https://standby.example.net"
+    }
+  },
+  "sites": [
+    {
+      "slug": "example-shop",
+      "name": "Example Shop",
+      "primary": "azure",
+      "cf_account": "example-shop",
+      "domains": [
+        "example-shop.com",
+        "www.example-shop.com"
+      ],
+      "hosts": {
+        "azure": {
+          "host": "example-shop.com"
+        },
+        "node2": {
+          "stack": "main",
+          "blog_id": 2,
+          "host": "example-shop.standby.example.net"
+        }
+      }
+    },
+    {
+      "slug": "single-site-demo",
+      "name": "Single-site stack example",
+      "primary": "azure",
+      "cf_account": "example-shop",
+      "domains": [
+        "single-site-demo.com"
+      ],
+      "hosts": {
+        "azure": {
+          "host": "single-site-demo.com"
+        },
+        "node2": {
+          "stack": "single-site-demo",
+          "host": "single-site-demo.standby.example.net"
+        }
+      }
+    }
+  ]
+}

@@ -1,0 +1,338 @@
+"""HTTP API for the node (stdlib ThreadingHTTPServer), published through the node's tunnel.
+
+Auth: `Authorization: Bearer <token>`; the SHA-256 of the token is kept in
+state/agent-token.sha256 (`wpops token rotate` prints a new token once).
+TLS is terminated by Cloudflare (tunnel) or by the LAN caller's own trust in
+the plain port; the agent itself speaks HTTP on the configured bind addresses.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import hmac
+import json
+import re
+import secrets
+import threading
+import time
+import urllib.parse
+from collections import defaultdict, deque
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from typing import Any, Callable
+
+from . import __version__, backup as bk, failover, jobs, notify, restore, state
+from .config import ConfigError, load_inventory, node_config, public_inventory
+from .ops import node_status
+
+TOKEN_FILE = state.STATE_DIR / "agent-token.sha256"
+_ACTOR_RE = re.compile(r"^[A-Za-z0-9 _.@#:/-]{1,80}$")
+
+
+class ApiError(Exception):
+    def __init__(self, status: int, message: str):
+        super().__init__(message)
+        self.status = status
+
+
+def token_hash() -> str:
+    return TOKEN_FILE.read_text(encoding="utf-8").strip() if TOKEN_FILE.exists() else ""
+
+
+def rotate_token() -> str:
+    state.ensure_dirs()
+    tok = secrets.token_urlsafe(36)
+    TOKEN_FILE.write_text(hashlib.sha256(tok.encode()).hexdigest() + "\n", encoding="utf-8")
+    TOKEN_FILE.chmod(0o600)
+    state.audit("local", "token.rotate")
+    return tok
+
+
+class RateLimiter:
+    def __init__(self, per_min: int):
+        self.per_min = per_min
+        self.hits: dict[str, deque] = defaultdict(deque)
+        self.failed: dict[str, deque] = defaultdict(deque)
+        self.lock = threading.Lock()
+
+    def check(self, ip: str) -> bool:
+        now = time.time()
+        with self.lock:
+            q = self.hits[ip]
+            while q and q[0] < now - 60:
+                q.popleft()
+            if len(q) >= self.per_min:
+                return False
+            q.append(now)
+            return True
+
+    def auth_failed(self, ip: str) -> None:
+        with self.lock:
+            self.failed[ip].append(time.time())
+
+    def auth_blocked(self, ip: str) -> bool:
+        now = time.time()
+        with self.lock:
+            q = self.failed[ip]
+            while q and q[0] < now - 600:
+                q.popleft()
+            return len(q) >= 10
+
+
+class Agent:
+    def __init__(self) -> None:
+        self.cfg = node_config()
+        self.inv = load_inventory()
+        self.limiter = RateLimiter(int(self.cfg["agent"].get("rate_limit_per_min", 120)))
+        self.started = int(time.time())
+        self._stop = threading.Event()
+
+    # ---------------------------------------------------------------- helpers
+    def reload(self) -> None:
+        self.cfg = node_config()
+        self.inv = load_inventory()
+
+    def node(self) -> str:
+        return self.cfg["node"]
+
+    # ---------------------------------------------------------------- routes
+    def route(self, method: str, path: str, query: dict[str, list[str]], body: dict[str, Any], actor: str) -> Any:
+        self.reload()
+        parts = [p for p in path.split("/") if p]
+        q1 = {k: v[0] for k, v in query.items()}
+        if parts[:1] != ["v1"]:
+            raise ApiError(404, "not found")
+        p = parts[1:]
+        if method == "GET":
+            if p == ["status"]:
+                return node_status(self.inv, self.cfg, live=q1.get("live") == "1")
+            if p == ["inventory"]:
+                return public_inventory(self.inv)
+            if p == ["sites"]:
+                if q1.get("live") == "1":
+                    return {"sites": failover.live_status(self.inv)}
+                return {"sites": public_inventory(self.inv)["sites"], "overrides": state.overrides()}
+            if p == ["overrides"]:
+                return {"overrides": state.overrides()}
+            if p == ["backups"]:
+                return {"sets": bk.list_sets(q1.get("source"))}
+            if p == ["backups", "schedule"]:
+                return bk.schedule_info()
+            if p == ["jobs"]:
+                return {"jobs": jobs.list_jobs(int(q1.get("limit", "30")), q1.get("kind"))}
+            if len(p) == 2 and p[0] == "jobs":
+                j = jobs.get(p[1])
+                if not j:
+                    raise ApiError(404, "no such job")
+                return j
+            if len(p) == 3 and p[0] == "jobs" and p[2] == "log":
+                return {"log": jobs.tail(p[1], int(q1.get("lines", "80")))}
+            if p == ["events"]:
+                return {"events": notify.recent_events(int(q1.get("since", "0")), int(q1.get("limit", "100")))}
+            raise ApiError(404, "not found")
+        if method == "POST":
+            if p == ["failover", "plan"]:
+                return self._plan(body).as_dict()
+            if p == ["failover", "apply"]:
+                plan = self._plan(body)
+                if not plan.changes:
+                    return {"job": None, "plan": plan.as_dict(), "message": "nothing to switch"}
+                job = jobs.Job("failover.apply", {"to": plan.to_origin, "domains": [c.domain for c in plan.changes]}, actor)
+                jobs.start_background(job, lambda j: failover.apply(self.inv, plan, actor, self.node(), log=j.log))
+                return {"job": job.id, "plan": plan.as_dict()}
+            if p == ["failover", "rollback"]:
+                sel = self._selection(body)
+                job = jobs.Job("failover.rollback", {k: v for k, v in sel.items() if v}, actor)
+                jobs.start_background(job, lambda j: failover.rollback(
+                    self.inv, actor, self.node(), sites=sel["sites"], all_sites=sel["all"],
+                    domains=body.get("domains"), log=j.log))
+                return {"job": job.id}
+            if p == ["backups", "pull"]:
+                source = body.get("source") or ""
+                if source not in self.inv.origins:
+                    raise ApiError(400, "unknown source")
+                if jobs.active("backup.pull"):
+                    raise ApiError(409, "a pull is already running")
+                job = jobs.Job("backup.pull", {"source": source, "label": body.get("label", "")}, actor)
+                jobs.start_background(job, lambda j: bk.pull(j, self.inv, source, body.get("label", ""),
+                                                             fresh=body.get("fresh", True), nonce=body.get("nonce")))
+                return {"job": job.id}
+            if p == ["backups", "prune"]:
+                return {"removed": bk.prune(body.get("source"), body.get("retain"), body.get("dry_run", False), log=lambda s: None)}
+            if p == ["backups", "schedule"]:
+                return bk.set_schedule(body.get("schedule"), body.get("retain"), body.get("sources"))
+            if p == ["backups", "keep"]:
+                return {"manifest": bk.mark_keep(body["set"], bool(body.get("keep", True)))}
+            if p == ["backups", "delete"]:
+                ref = body["set"]
+                bk.delete_set(ref)
+                state.audit(actor, "backup.delete", {"set": ref})
+                return {"deleted": ref}
+            if p == ["restore", "apply"]:
+                set_ref = body.get("set") or ""
+                stack = body.get("stack") or ""
+                if not set_ref or not stack:
+                    raise ApiError(400, "set and stack are required")
+                sel = self._selection(body)
+                if jobs.active("restore.apply"):
+                    raise ApiError(409, "a restore is already running")
+                job = jobs.Job("restore.apply", {"set": set_ref, "stack": stack, **{k: v for k, v in sel.items() if v}}, actor)
+                jobs.start_background(job, lambda j: restore.apply(
+                    j, self.inv, self.node(), set_ref, stack, sites=sel["sites"], all_sites=sel["all"],
+                    entities=body.get("entities")))
+                return {"job": job.id}
+            if p == ["notify", "test"]:
+                return notify.notify("test", "[wpops] test notification", "This is a test from the wpops agent.", {})
+            raise ApiError(404, "not found")
+        raise ApiError(405, "method not allowed")
+
+    def _selection(self, body: dict[str, Any]) -> dict[str, Any]:
+        sites = body.get("sites") or []
+        if isinstance(sites, str):
+            sites = [s.strip() for s in sites.split(",") if s.strip()]
+        return {"sites": sites, "all": bool(body.get("all"))}
+
+    def _plan(self, body: dict[str, Any]) -> failover.Plan:
+        sel = self._selection(body)
+        try:
+            sites = failover.resolve_selection(self.inv, sel["sites"], sel["all"])
+            return failover.plan(self.inv, sites, to=body.get("to") or None, stack=body.get("stack") or None, cfg=self.cfg)
+        except (failover.FailoverError, ConfigError) as exc:
+            raise ApiError(400, str(exc)) from None
+
+    # ------------------------------------------------------------- scheduler
+    def scheduler(self) -> None:
+        last_housekeeping = 0.0
+        while not self._stop.wait(60):
+            try:
+                self.reload()
+                if bk.due() and not jobs.active("backup.pull"):
+                    results = {}
+                    for src in bk.sources_to_pull(self.inv):
+                        job = jobs.Job("backup.pull", {"source": src, "label": "scheduled", "scheduled": True}, "scheduler")
+                        job.run(lambda j, s=src: bk.pull(j, self.inv, s, "scheduled " + time.strftime("%Y-%m-%d")))
+                        results[src] = {"status": job.status, "error": job.error, "result": job.result}
+                        if job.status != "succeeded":
+                            notify.notify("backup.failed", f"[wpops] scheduled backup from {src} FAILED",
+                                          f"Job {job.id}: {job.error}\n\n{jobs.tail(job.id, 40)}", {"source": src, "job": job.id})
+                    bk.mark_run(results)
+                if time.time() - last_housekeeping > 86400:
+                    jobs.prune_jobs()
+                    last_housekeeping = time.time()
+            except Exception as exc:  # noqa: BLE001
+                notify.record_event("scheduler.error", {"error": str(exc)})
+
+    def stop(self) -> None:
+        self._stop.set()
+
+
+def make_handler(agent: Agent) -> type[BaseHTTPRequestHandler]:
+    expected = token_hash()
+
+    class Handler(BaseHTTPRequestHandler):
+        server_version = f"wpops/{__version__}"
+        protocol_version = "HTTP/1.1"
+
+        def log_message(self, fmt: str, *args: Any) -> None:  # quiet; audit log covers mutations
+            pass
+
+        def _send(self, status: int, payload: Any) -> None:
+            data = json.dumps(payload, default=str).encode()
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(data)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(data)
+
+        def _client_ip(self) -> str:
+            cf = self.headers.get("CF-Connecting-IP")
+            return cf.strip() if cf else self.client_address[0]
+
+        def _auth(self) -> bool:
+            auth = self.headers.get("Authorization", "")
+            if not auth.startswith("Bearer ") or not expected:
+                return False
+            given = hashlib.sha256(auth[7:].strip().encode()).hexdigest()
+            return hmac.compare_digest(given, expected)
+
+        def _handle(self, method: str) -> None:
+            url = urllib.parse.urlsplit(self.path)
+            if url.path == "/healthz":
+                self._send(200, {"ok": True, "version": __version__, "node": agent.node(), "uptime": int(time.time()) - agent.started})
+                return
+            ip = self._client_ip()
+            if not agent.limiter.check(ip):
+                self._send(429, {"error": "rate limited"})
+                return
+            if agent.limiter.auth_blocked(ip):
+                self._send(429, {"error": "too many failed authentications"})
+                return
+            if not self._auth():
+                agent.limiter.auth_failed(ip)
+                self._send(401, {"error": "unauthorized"})
+                return
+            actor = self.headers.get("X-Actor", "").strip() or "api"
+            if not _ACTOR_RE.match(actor):
+                actor = "api"
+            body: dict[str, Any] = {}
+            if method == "POST":
+                length = int(self.headers.get("Content-Length") or 0)
+                if length > 1_000_000:
+                    self._send(413, {"error": "body too large"})
+                    return
+                raw = self.rfile.read(length) if length else b""
+                try:
+                    body = json.loads(raw.decode() or "{}")
+                except json.JSONDecodeError:
+                    self._send(400, {"error": "invalid JSON"})
+                    return
+                if not isinstance(body, dict):
+                    self._send(400, {"error": "body must be an object"})
+                    return
+            try:
+                result = agent.route(method, url.path, urllib.parse.parse_qs(url.query), body, f"{actor}@{ip}")
+                if method == "POST":
+                    state.audit(f"{actor}@{ip}", f"api {url.path}", {k: v for k, v in body.items() if k != "token"})
+                self._send(200, result)
+            except ApiError as exc:
+                self._send(exc.status, {"error": str(exc)})
+            except (ConfigError, bk.SyncError, restore.RestoreError, failover.FailoverError) as exc:
+                self._send(400, {"error": str(exc)})
+            except Exception as exc:  # noqa: BLE001
+                notify.record_event("api.error", {"path": url.path, "error": str(exc)})
+                self._send(500, {"error": f"internal error: {exc}"})
+
+        def do_GET(self) -> None:  # noqa: N802
+            self._handle("GET")
+
+        def do_POST(self) -> None:  # noqa: N802
+            self._handle("POST")
+
+    return Handler
+
+
+def serve(extra_binds: list[str] | None = None) -> None:
+    agent = Agent()
+    if not token_hash():
+        raise ConfigError("no agent token; run `wpops token rotate` first")
+    port = int(agent.cfg["agent"].get("port", 8787))
+    binds = list(dict.fromkeys((agent.cfg["agent"].get("bind") or ["127.0.0.1"]) + (extra_binds or [])))
+    handler = make_handler(agent)
+    servers = []
+    for b in binds:
+        srv = ThreadingHTTPServer((b, port), handler)
+        srv.daemon_threads = True
+        servers.append(srv)
+        threading.Thread(target=srv.serve_forever, name=f"http-{b}", daemon=True).start()
+        print(f"wpops agent {__version__} listening on {b}:{port}", flush=True)
+    threading.Thread(target=agent.scheduler, name="scheduler", daemon=True).start()
+    state.audit("local", "agent.start", {"binds": binds, "port": port})
+    try:
+        while True:
+            time.sleep(3600)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        agent.stop()
+        for srv in servers:
+            srv.shutdown()

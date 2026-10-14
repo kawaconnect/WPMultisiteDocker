@@ -252,6 +252,8 @@ services:
         condition: service_healthy
     volumes:
       - ./data/wordpress:/var/www/html
+      # Pulled backup sets (wpops), read-only; `wp siteguardbackup import /backups/<source>/<set>/`
+      - ./backups:/backups:ro
     environment:
       WORDPRESS_DB_HOST: ${WORDPRESS_DB_HOST}
       WORDPRESS_DB_NAME: ${WORDPRESS_DB_NAME}
