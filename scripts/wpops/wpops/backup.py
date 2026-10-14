@@ -109,8 +109,32 @@ class SyncClient:
         return self._req("GET", f"/jobs/{urllib.parse.quote(nonce)}")
 
     def sets(self) -> dict[str, Any]:
-        """{'sets': [...], 'sites': [...], 'mode': ..., 'site_url': ...} with per-file sha256."""
-        return self._req("GET", "/sets?hash=1")
+        """{'sets': [...], 'sites': [...], 'mode': ..., 'site_url': ...} (sizes only, fast)."""
+        return self._req("GET", "/sets")
+
+    def hashes(self, nonce: str, log, attempts: int = 8) -> dict[str, str]:
+        """sha256 per file of one set. The source hashes on demand and caches per
+        file, so a big set may need several long calls before all are present."""
+        saved = self.timeout
+        self.timeout = 600
+        try:
+            for i in range(1, attempts + 1):
+                try:
+                    listing = self._req("GET", "/sets?hash=1")
+                except SyncError as exc:
+                    log(f"  hash listing attempt {i}: {exc}")
+                else:
+                    for s in listing.get("sets", []):
+                        if str(s.get("nonce")) == nonce:
+                            got = {f["name"]: f["sha256"] for f in s.get("files", []) if f.get("sha256")}
+                            if got and len(got) == len(s.get("files", [])):
+                                return got
+                            log(f"  hash listing attempt {i}: {len(got)}/{len(s.get('files', []))} hashed so far")
+                            break
+                time.sleep(min(120, 15 * i))
+            return {}
+        finally:
+            self.timeout = saved
 
     def download(self, nonce: str, name: str, dest: Path, expected_size: int, log) -> None:
         """Resumable download with Range; verifies the final size."""
@@ -361,17 +385,23 @@ def pull(job: Job, inv: Inventory, source: str, label: str = "", fresh: bool = T
             name, size = f["name"], int(f["size"])
             log(f"  {name} ({size // 2**20} MB)")
             cli.download(chosen["nonce"], name, dest / name, size, log)
-            if not f.get("sha256"):
-                raise SyncError(f"{name}: source sent no sha256 (needs SiteGuard Backup >= 1.6.0)")
-            if f.get("sha256"):
-                h = hashlib.sha256()
-                with open(dest / name, "rb") as fh:
-                    for chunk in iter(lambda: fh.read(4 * 2**20), b""):
-                        h.update(chunk)
-                if h.hexdigest() != f["sha256"]:
-                    raise SyncError(f"{name}: checksum mismatch")
             done += size
             job.set_progress(done_bytes=done)
+        # Integrity: sizes were enforced during download; now compare sha256 with
+        # what the source computes for its own copies (needs SiteGuard >= 1.6.0).
+        job.set_progress(phase="verify")
+        expected = cli.hashes(str(chosen["nonce"]), log)
+        if len(expected) != len(files):
+            raise SyncError(f"source could not provide sha256 for every file ({len(expected)}/{len(files)}); set kept but not marked complete")
+        for f in files:
+            h = hashlib.sha256()
+            with open(dest / f["name"], "rb") as fh:
+                for chunk in iter(lambda: fh.read(4 * 2**20), b""):
+                    h.update(chunk)
+            if h.hexdigest() != expected[f["name"]]:
+                raise SyncError(f"{f['name']}: checksum mismatch")
+            f["sha256"] = expected[f["name"]]
+        log(f"verified sha256 of {len(files)} files")
         man["pulled_at"] = int(time.time())
         save_manifest(dest, man)
         log(f"pulled {source}/{set_id}: {len(files)} files, {total // 2**20} MB")
