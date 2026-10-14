@@ -223,8 +223,8 @@ for ((p = 0; p < PLAN_COUNT; p++)); do
     # Create A record; if this fails, attempt to restore original CNAME
     if ! create_dns_a "$zone_id" "$api_token" "$record_name" "$CLOUD_IP" "$record_proxied" >/dev/null; then
         log_error "Failed to create A record for $record_name, attempting to restore original CNAME"
-        local tunnel_id_for_restore="${PLAN_TUNNEL_IDS[$p]}"
-        local cname_target_restore="${tunnel_id_for_restore}.cfargotunnel.com"
+        tunnel_id_for_restore="${PLAN_TUNNEL_IDS[$p]}"
+        cname_target_restore="${tunnel_id_for_restore}.cfargotunnel.com"
         if create_dns_cname "$zone_id" "$api_token" "$record_name" "$cname_target_restore" "$record_proxied" >/dev/null; then
             log_ok "Restored original CNAME for $record_name"
         else
