@@ -54,3 +54,5 @@ sgbackup_bundle_*.zip
 state/
 backups/
 config/wpops.json
+__pycache__/
+*.pyc

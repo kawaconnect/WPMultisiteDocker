@@ -35,9 +35,15 @@ def ensure(start: bool = True, log=print) -> dict[str, Any]:
         cf = Cloudflare(acct.token, acct.account_id, acct.name)
         name = f"wp-docker-{acct.name}"
         try:
-            v = cf.verify_token()
-            if v.get("status") not in ("active", None):
-                raise CfError(f"token status {v.get('status')}")
+            # /user/tokens/verify needs the "User API Tokens: Read" permission, which
+            # most zone/tunnel tokens do not carry; a failure here is not a verdict.
+            try:
+                v = cf.verify_token()
+                if v.get("status") not in ("active", None):
+                    raise CfError(f"token status {v.get('status')}")
+            except CfError as exc:
+                if "401" not in str(exc) and "403" not in str(exc):
+                    raise
             t = cf.tunnel_by_name(name)
             if not t:
                 t = cf.create_tunnel(name)
