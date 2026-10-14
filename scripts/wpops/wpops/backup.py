@@ -243,6 +243,7 @@ def save_manifest(d: Path, man: dict[str, Any]) -> None:
     tmp = d / "manifest.json.tmp"
     tmp.write_text(json.dumps(man, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     os.replace(tmp, d / "manifest.json")
+    (d / "manifest.json").chmod(0o644)
 
 
 def mark_keep(set_ref: str, keep: bool) -> dict[str, Any]:
@@ -385,6 +386,11 @@ def _pull_locked(job: Job, inv: Inventory, source: str, label: str, fresh: bool,
             raise SyncError(f"set is {total // 2**30} GB, above backup.max_set_gb={cfg.get('max_set_gb', 50)}")
         dest = set_dir(source, set_id)
         dest.mkdir(parents=True, exist_ok=True)
+        # Pulled sets are consumed by the stack's WP-CLI container (www-data), so
+        # they must stay world-readable despite the agent's private umask.
+        for d in (BACKUPS_DIR, dest.parent, dest):
+            if d.exists():
+                d.chmod(0o755)
         where = BACKUPS_DIR if BACKUPS_DIR.exists() else dest.parent
         try:
             disk.require(where, int(total * 1.1), f"pull of {source} ({total // 2**20} MB)")
@@ -413,6 +419,7 @@ def _pull_locked(job: Job, inv: Inventory, source: str, label: str, fresh: bool,
             name, size = f["name"], int(f["size"])
             log(f"  {name} ({size // 2**20} MB)")
             cli.download(chosen["nonce"], name, dest / name, size, log)
+            (dest / name).chmod(0o644)
             done += size
             job.set_progress(done_bytes=done)
         # Integrity: sizes were enforced during download; now compare sha256 with
