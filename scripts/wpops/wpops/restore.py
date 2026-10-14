@@ -95,7 +95,7 @@ def apply(job: Job, inv: Inventory, node: str, set_ref: str, stack: str, sites: 
     stack_path = Path(origin.stacks[stack].get("path") or REPO_DIR)
     try:
         disk.require(stack_path if stack_path.exists() else REPO_DIR, set_bytes * 2, f"restore of {set_ref} ({set_bytes // 2**20} MB set, extracted twice)")
-    except state.StateError as exc:
+    except disk.DiskError as exc:
         raise RestoreError(str(exc)) from None
     if entities:
         bad = [e for e in entities if e not in ENTITIES]

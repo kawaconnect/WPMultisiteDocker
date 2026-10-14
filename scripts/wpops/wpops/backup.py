@@ -335,7 +335,7 @@ def pull(job: Job, inv: Inventory, source: str, label: str = "", fresh: bool = T
         dest.mkdir(parents=True, exist_ok=True)
         try:
             disk.require(BACKUPS_DIR if BACKUPS_DIR.exists() else dest.parent, int(total * 1.1), f"pull of {source} ({total // 2**20} MB)")
-        except state.StateError as exc:
+        except disk.DiskError as exc:
             raise SyncError(str(exc)) from None
         man = {
             "source": source, "nonce": chosen["nonce"], "timestamp": ts, "label": chosen.get("label", ""),

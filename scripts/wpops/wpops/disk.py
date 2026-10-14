@@ -15,6 +15,10 @@ from . import notify, state
 from .config import BACKUPS_DIR, REPO_DIR, Inventory, node_config
 from .stacks import disk_free
 
+class DiskError(RuntimeError):
+    """Not enough free space for an operation (reserve included)."""
+
+
 STATE_FILE = state.STATE_DIR / "disk.json"
 REPEAT_SECONDS = 24 * 3600
 
@@ -70,7 +74,7 @@ def require(path: Path, needed: int, label: str) -> None:
     d = disk_free(path)
     keep = max(min_free, int(d["total"] * min_pct / 100))
     if d["free"] - needed < keep:
-        raise state.StateError(
+        raise DiskError(
             f"not enough disk for {label}: needs {needed // 2**20} MB plus a {keep // 2**30} GB reserve, "
             f"free {d['free'] // 2**20} MB on {path}")
 
