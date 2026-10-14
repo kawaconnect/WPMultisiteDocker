@@ -2,6 +2,9 @@
 # Install/refresh the wpops agent systemd unit on this node.
 #   scripts/wpops/install-agent.sh [--bind 172.19.0.1]
 # --bind adds an address (e.g. the docker frontend gateway so cloudflared can reach it).
+# If ufw is active, allow the docker networks to reach that port:
+#   ufw allow from 172.16.0.0/12 to any port 8787 proto tcp
+# and set agent.trusted_proxies (config/wpops.json) to the docker subnet(s).
 set -euo pipefail
 HERE="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
 REPO="$(cd "$HERE/../.." && pwd)"

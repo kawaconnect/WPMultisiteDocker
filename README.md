@@ -242,6 +242,15 @@ wpops restore apply --set azure/<set> --stack main --all | --sites a,b --yes   #
   URLs and a failover still answers `https://<production-domain>` with the
   production canonical, media and REST URLs. Responses carry
   `X-KC-Host-Alias: <site>` while an alias is active.
+- Network: the agent listens on loopback plus the docker frontend gateway
+  (`install-agent.sh --bind 172.19.0.1`) so cloudflared can publish it. With a
+  host firewall, allow that gateway port from the docker networks only
+  (`ufw allow from 172.16.0.0/12 to any port 8787 proto tcp`) and keep nginx on
+  `127.0.0.1:8080`. Set `agent.trusted_proxies` in `config/wpops.json` to the
+  docker subnet(s) so `CF-Connecting-IP` is believed only from cloudflared.
+- Disk: `disk.min_free_gb` / `disk.min_free_pct` (defaults 10 / 10) are enforced
+  before every pull and restore; the agent e-mails/webhooks `disk.low` (daily
+  while it lasts) and `disk.ok`, and the Discord bot relays both.
 - Secrets stay in `.env`: `CF_ACCOUNT_n_*`, `WPOPS_SYNC_KEY_<SOURCE>`
   (SiteGuard sync key of each source), optional `SMTP_*`.
 - Pulled sets live under `backups/<source>/<set>/` (retention per source);
