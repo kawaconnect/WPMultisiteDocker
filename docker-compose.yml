@@ -207,7 +207,8 @@ services:
       wordpress:
         condition: service_healthy
     ports:
-      - "8080:80"
+      # Loopback only: the tunnels reach nginx over the docker network, nothing on the LAN needs it
+      - "127.0.0.1:8080:80"
     volumes:
       - ./data/wordpress:/var/www/html:ro
       - ./config/nginx/nginx.conf:/etc/nginx/nginx.conf:ro
