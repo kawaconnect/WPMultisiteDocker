@@ -105,6 +105,10 @@ NODE_DEFAULTS: dict[str, Any] = {
         "retain_sets": 4,                 # per source, plus any set marked keep
         "sources": [],                    # names of origins with sync_api to pull from; [] = all
         "pull_timeout_min": 180,
+        # File entities every pull asks the source for (plus the database) so the
+        # set is complete regardless of the source's own SiteGuard settings.
+        # Subset of plugins, themes, uploads, others, wpcore; [] = source defaults.
+        "entities": ["plugins", "themes", "uploads", "others"],
         "auto_apply": False,              # never applied automatically unless true (per design)
     },
     "notify": {

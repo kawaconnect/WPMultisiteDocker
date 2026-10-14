@@ -259,6 +259,9 @@ def pull(job: Job, inv: Inventory, source: str, label: str = "", fresh: bool = T
     with state.locked(f"pull-{source}", timeout=5):
         if fresh and not nonce:
             label = label or f"wpops {time.strftime('%Y-%m-%d')}"
+            if entities is None:
+                entities = [str(e) for e in (cfg.get("entities") or [])] or None
+            log(f"requesting db={db} entities={','.join(entities) if entities else 'source defaults'}")
             started = cli.start_backup(label, entities=entities, db=db)
             nonce = started.get("nonce")
             if not nonce:
