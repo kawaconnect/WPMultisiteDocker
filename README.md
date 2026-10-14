@@ -248,6 +248,7 @@ wpops restore apply --set azure/<set> --stack main --all | --sites a,b --yes   #
   (`ufw allow from 172.16.0.0/12 to any port 8787 proto tcp`) and keep nginx on
   `127.0.0.1:8080`. Set `agent.trusted_proxies` in `config/wpops.json` to the
   docker subnet(s) so `CF-Connecting-IP` is believed only from cloudflared.
+- Source cleanup: a set the pull created on the source is deleted there once the copy is verified here, and also if the pull fails (`backup.delete_on_source`, default true), so the primary never accumulates backup archives.
 - Disk: `disk.min_free_gb` / `disk.min_free_pct` (defaults 10 / 10) are enforced
   before every pull and restore; the agent e-mails/webhooks `disk.low` (daily
   while it lasts) and `disk.ok`, and the Discord bot relays both.

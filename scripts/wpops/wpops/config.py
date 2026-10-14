@@ -109,7 +109,8 @@ NODE_DEFAULTS: dict[str, Any] = {
         "retain_sets": 4,                 # per source, plus any set marked keep
         "sources": [],                    # names of origins with sync_api to pull from; [] = all
         "pull_timeout_min": 180,
-        "max_set_gb": 50,                 # refuse to pull a set larger than this, whatever the source claims
+        "max_set_gb": 50,
+        "delete_on_source": True,         # remove a set we created on the source once verified here (or if the pull fails)                 # refuse to pull a set larger than this, whatever the source claims
         # File entities every pull asks the source for (plus the database) so the
         # set is complete regardless of the source's own SiteGuard settings.
         # Subset of plugins, themes, uploads, others, wpcore; [] = source defaults.

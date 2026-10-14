@@ -112,6 +112,10 @@ class SyncClient:
         """{'sets': [...], 'sites': [...], 'mode': ..., 'site_url': ...} (sizes only, fast)."""
         return self._req("GET", "/sets")
 
+    def delete_remote(self, nonce: str) -> dict[str, Any]:
+        """Remove a backup set on the source (frees the primary's storage)."""
+        return self._req("DELETE", f"/sets/{urllib.parse.quote(nonce)}")
+
     def hashes(self, nonce: str, log, attempts: int = 8) -> dict[str, str]:
         """sha256 per file of one set. The source hashes on demand and caches per
         file, so a big set may need several long calls before all are present."""
@@ -308,6 +312,29 @@ def pull(job: Job, inv: Inventory, source: str, label: str = "", fresh: bool = T
     cli = client_for(inv, source)
     info = cli.ping()
     log(f"source {source}: SiteGuard {info.get('version')} at {info.get('site_url')} ({info.get('mode')})")
+    try:
+        return _pull_locked(job, inv, source, label, fresh, nonce, entities, db, cfg, cli, log,
+                            lambda n: _note_created(job, n))
+    except Exception:
+        # A fresh backup we created on the source but could not pull would sit
+        # there forever, eating the primary's storage. Remove it (best effort).
+        created_nonce = job.progress.get("created_nonce")
+        if created_nonce and cfg.get("delete_on_source", True):
+            try:
+                cli.delete_remote(created_nonce)
+                log(f"removed unfinished set {created_nonce} from the source")
+            except Exception as exc:  # noqa: BLE001
+                log(f"could not remove set {created_nonce} from the source: {exc}")
+        raise
+
+
+def _note_created(job: Job, nonce: str) -> None:
+    job.set_progress(created_nonce=nonce)
+
+
+def _pull_locked(job: Job, inv: Inventory, source: str, label: str, fresh: bool, nonce: str | None,
+                 entities: list[str] | None, db: bool, cfg: dict[str, Any], cli: "SyncClient", log,
+                 note_created) -> dict[str, Any]:
     with state.locked(f"pull-{source}", timeout=5):
         if fresh and not nonce:
             label = label or f"wpops {time.strftime('%Y-%m-%d')}"
@@ -318,6 +345,7 @@ def pull(job: Job, inv: Inventory, source: str, label: str = "", fresh: bool = T
             nonce = started.get("nonce")
             if not nonce:
                 raise SyncError(f"source did not return a job nonce: {started}")
+            note_created(str(nonce))
             log(f"backup started on source, nonce {nonce}")
             job.set_progress(phase="source-backup", nonce=nonce)
             deadline = time.time() + int(cfg.get("pull_timeout_min", 180)) * 60
@@ -405,6 +433,13 @@ def pull(job: Job, inv: Inventory, source: str, label: str = "", fresh: bool = T
         man["pulled_at"] = int(time.time())
         save_manifest(dest, man)
         log(f"pulled {source}/{set_id}: {len(files)} files, {total // 2**20} MB")
+        if cfg.get("delete_on_source", True) and (fresh or cfg.get("delete_on_source") == "always"):
+            # The verified copy lives here now; free the primary's storage.
+            try:
+                cli.delete_remote(str(chosen["nonce"]))
+                log(f"removed set {chosen['nonce']} from the source (copy verified here)")
+            except SyncError as exc:
+                log(f"warning: could not remove set from the source: {exc}")
         removed = prune(source, log=log)
         result = {"set": f"{source}/{set_id}", "files": len(files), "bytes": total, "sites": len(man["sites"]),
                   "pruned": removed, "label": man["label"]}
