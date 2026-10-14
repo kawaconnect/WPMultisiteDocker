@@ -21,6 +21,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import json
+import os
 import re
 import time
 from typing import Any
@@ -91,6 +92,7 @@ def apply(job: Job, inv: Inventory, node: str, set_ref: str, stack: str, sites: 
     missing = [f["name"] for f in man["files"] if not (set_dir / f["name"]).exists()]
     if missing:
         raise RestoreError(f"{set_ref} is missing files: {', '.join(missing[:5])}")
+    _fix_content_ownership(Path(origin.stacks[stack].get("path") or REPO_DIR) / "data" / "wordpress" / "wp-content", log)
     set_bytes = sum(int(f.get("size", 0)) for f in man["files"])
     stack_dir = Path(origin.stacks[stack].get("path") or REPO_DIR)
     try:
@@ -160,3 +162,25 @@ def apply(job: Job, inv: Inventory, node: str, set_ref: str, stack: str, sites: 
                   f"Set {set_ref} was restored onto stack '{stack}' on node {node} "
                   f"({'all sites' if all_sites or not sites else ', '.join(sites)}). Job {job.id}.\n", result)
     return result
+
+
+def _fix_content_ownership(wp_content: Path, log, uid: int = 33, gid: int = 33) -> None:
+    """SiteGuard restores run as www-data inside the container; any file under
+    wp-content owned by someone else (a manual root copy) cannot be replaced and
+    fails the restore. Hand such files to www-data first."""
+    if not wp_content.is_dir():
+        return
+    fixed = 0
+    for p in wp_content.rglob("*"):
+        try:
+            st = p.lstat()
+        except OSError:
+            continue
+        if st.st_uid != uid or st.st_gid != gid:
+            try:
+                os.lchown(p, uid, gid)
+                fixed += 1
+            except OSError as exc:
+                log(f"  could not chown {p}: {exc}")
+    if fixed:
+        log(f"  ownership: handed {fixed} wp-content entries to www-data before restore")
