@@ -136,6 +136,8 @@ def get(job_id: str) -> dict[str, Any] | None:
 
 
 def tail(job_id: str, lines: int = 60) -> str:
+    if not job_id or not job_id.replace("-", "").isalnum():
+        return ""
     p = JOBS_DIR / f"{job_id}.log"
     if not p.exists():
         return ""

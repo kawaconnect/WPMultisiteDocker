@@ -70,6 +70,9 @@ def send_email(subject: str, body: str, to: list[str] | None = None) -> dict[str
             if s.has_extn("starttls"):
                 s.starttls(context=ctx)
                 s.ehlo()
+            elif user:
+                raise RuntimeError(f"SMTP {host}:{port} offers no STARTTLS; refusing to send credentials in clear (use SMTP_SECURE or a TLS port)")
+                s.ehlo()
             if user:
                 s.login(user, password)
             s.send_message(msg)

@@ -98,3 +98,13 @@ def audit(actor: str, action: str, detail: dict[str, Any] | None = None) -> None
         os.chmod(AUDIT_LOG, 0o600)
     except OSError:
         pass
+
+
+def write_private_text(path: Path, text: str) -> None:
+    """Create/replace a file that is 0600 from its first byte (no world-readable window)."""
+    tmp = path.with_name(path.name + ".tmp")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        fh.write(text)
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, path)

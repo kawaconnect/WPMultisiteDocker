@@ -18,6 +18,8 @@ CLI container; `wpops setup` adds that.
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import json
 import re
 import time
@@ -25,7 +27,8 @@ from typing import Any
 
 from . import backup as bk
 from . import notify, state
-from .config import Inventory, node_config
+from . import disk
+from .config import REPO_DIR, Inventory, node_config
 from .jobs import Job
 from .stacks import StackError, require_free, stack_path, wp
 
@@ -88,6 +91,12 @@ def apply(job: Job, inv: Inventory, node: str, set_ref: str, stack: str, sites: 
     missing = [f["name"] for f in man["files"] if not (set_dir / f["name"]).exists()]
     if missing:
         raise RestoreError(f"{set_ref} is missing files: {', '.join(missing[:5])}")
+    set_bytes = sum(int(f.get("size", 0)) for f in man["files"])
+    stack_path = Path(origin.stacks[stack].get("path") or REPO_DIR)
+    try:
+        disk.require(stack_path if stack_path.exists() else REPO_DIR, set_bytes * 2, f"restore of {set_ref} ({set_bytes // 2**20} MB set, extracted twice)")
+    except state.StateError as exc:
+        raise RestoreError(str(exc)) from None
     if entities:
         bad = [e for e in entities if e not in ENTITIES]
         if bad:

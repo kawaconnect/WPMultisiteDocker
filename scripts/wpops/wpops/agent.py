@@ -9,8 +9,10 @@ the plain port; the agent itself speaks HTTP on the configured bind addresses.
 from __future__ import annotations
 
 import hashlib
+import ipaddress
 import hmac
 import json
+import os
 import re
 import secrets
 import threading
@@ -20,8 +22,8 @@ from collections import defaultdict, deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Callable
 
-from . import __version__, backup as bk, failover, jobs, notify, restore, state
-from .config import ConfigError, load_inventory, node_config, public_inventory
+from . import __version__, backup as bk, failover, jobs, notify, restore, state, disk
+from .config import _HOST_RE, ConfigError, load_inventory, node_config, public_inventory
 from .ops import node_status
 
 TOKEN_FILE = state.STATE_DIR / "agent-token.sha256"
@@ -57,13 +59,22 @@ class RateLimiter:
     def check(self, ip: str) -> bool:
         now = time.time()
         with self.lock:
+            self._sweep(self.hits, now - 60)
             q = self.hits[ip]
-            while q and q[0] < now - 60:
-                q.popleft()
             if len(q) >= self.per_min:
                 return False
             q.append(now)
             return True
+
+    @staticmethod
+    def _sweep(table: dict[str, deque], cutoff: float) -> None:
+        """Drop expired timestamps and forget keys with none left (bounded memory)."""
+        for key in list(table):
+            q = table[key]
+            while q and q[0] < cutoff:
+                q.popleft()
+            if not q:
+                del table[key]
 
     def auth_failed(self, ip: str) -> None:
         with self.lock:
@@ -72,10 +83,8 @@ class RateLimiter:
     def auth_blocked(self, ip: str) -> bool:
         now = time.time()
         with self.lock:
-            q = self.failed[ip]
-            while q and q[0] < now - 600:
-                q.popleft()
-            return len(q) >= 10
+            self._sweep(self.failed, now - 600)
+            return len(self.failed.get(ip, ())) >= 10
 
 
 class Agent:
@@ -84,6 +93,19 @@ class Agent:
         self.inv = load_inventory()
         self.limiter = RateLimiter(int(self.cfg["agent"].get("rate_limit_per_min", 120)))
         self.started = int(time.time())
+        self.trusted: list[ipaddress.IPv4Network | ipaddress.IPv6Network] = []
+        for cidr in self.cfg["agent"].get("trusted_proxies") or []:
+            try:
+                self.trusted.append(ipaddress.ip_network(str(cidr), strict=False))
+            except ValueError as exc:
+                raise ConfigError(f"agent.trusted_proxies: bad CIDR {cidr!r}") from exc
+
+    def trusts_proxy(self, peer: str) -> bool:
+        try:
+            ip = ipaddress.ip_address(peer)
+        except ValueError:
+            return False
+        return any(ip in net for net in self.trusted)
         self._stop = threading.Event()
 
     # ---------------------------------------------------------------- helpers
@@ -125,7 +147,9 @@ class Agent:
                     raise ApiError(404, "no such job")
                 return j
             if len(p) == 3 and p[0] == "jobs" and p[2] == "log":
-                return {"log": jobs.tail(p[1], int(q1.get("lines", "80")))}
+                if not p[1].replace("-", "").isalnum():
+                    raise ApiError(400, "bad job id")
+                return {"log": jobs.tail(p[1], max(1, min(int(q1.get("lines", "80")), 2000)))}
             if p == ["events"]:
                 return {"events": notify.recent_events(int(q1.get("since", "0")), int(q1.get("limit", "100")))}
             raise ApiError(404, "not found")
@@ -142,9 +166,14 @@ class Agent:
             if p == ["failover", "rollback"]:
                 sel = self._selection(body)
                 job = jobs.Job("failover.rollback", {k: v for k, v in sel.items() if v}, actor)
+                domains = body.get("domains")
+                if domains is not None:
+                    if not isinstance(domains, list) or not all(isinstance(d, str) and _HOST_RE.match(d.lower()) for d in domains):
+                        raise ApiError(400, "domains must be a list of hostnames")
+                    domains = [d.lower() for d in domains]
                 jobs.start_background(job, lambda j: failover.rollback(
                     self.inv, actor, self.node(), sites=sel["sites"], all_sites=sel["all"],
-                    domains=body.get("domains"), log=j.log))
+                    domains=domains, log=j.log))
                 return {"job": job.id}
             if p == ["backups", "pull"]:
                 source = body.get("source") or ""
@@ -160,7 +189,20 @@ class Agent:
             if p == ["backups", "prune"]:
                 return {"removed": bk.prune(body.get("source"), body.get("retain"), body.get("dry_run", False), log=lambda s: None)}
             if p == ["backups", "schedule"]:
-                return bk.set_schedule(body.get("schedule"), body.get("retain"), body.get("sources"))
+                schedule = body.get("schedule")
+                if schedule is not None and not isinstance(schedule, str):
+                    raise ApiError(400, "schedule must be a string")
+                retain = body.get("retain")
+                if retain is not None and (not isinstance(retain, int) or isinstance(retain, bool) or retain < 1 or retain > 365):
+                    raise ApiError(400, "retain must be an integer 1-365")
+                sources = body.get("sources")
+                if sources is not None:
+                    if not isinstance(sources, list) or not all(isinstance(s, str) for s in sources):
+                        raise ApiError(400, "sources must be a list of origin names")
+                    unknown = [s for s in sources if s not in self.inv.origins]
+                    if unknown:
+                        raise ApiError(400, f"unknown sources: {', '.join(unknown)}")
+                return bk.set_schedule(schedule, retain, sources)
             if p == ["backups", "keep"]:
                 return {"manifest": bk.mark_keep(body["set"], bool(body.get("keep", True)))}
             if p == ["backups", "delete"]:
@@ -206,6 +248,7 @@ class Agent:
         while not self._stop.wait(60):
             try:
                 self.reload()
+                disk.watch_tick(self.inv, self.node())
                 if bk.due() and not jobs.active("backup.pull"):
                     results = {}
                     for src in bk.sources_to_pull(self.inv):
@@ -245,9 +288,17 @@ def make_handler(agent: Agent) -> type[BaseHTTPRequestHandler]:
             self.end_headers()
             self.wfile.write(data)
 
+        timeout = 30  # per-connection socket timeout (slowloris)
+
         def _client_ip(self) -> str:
-            cf = self.headers.get("CF-Connecting-IP")
-            return cf.strip() if cf else self.client_address[0]
+            peer = self.client_address[0]
+            cf = (self.headers.get("CF-Connecting-IP") or "").strip()
+            if cf and agent.trusts_proxy(peer):
+                try:
+                    return str(ipaddress.ip_address(cf))
+                except ValueError:
+                    return peer
+            return peer
 
         def _auth(self) -> bool:
             auth = self.headers.get("Authorization", "")
@@ -277,7 +328,16 @@ def make_handler(agent: Agent) -> type[BaseHTTPRequestHandler]:
                 actor = "api"
             body: dict[str, Any] = {}
             if method == "POST":
-                length = int(self.headers.get("Content-Length") or 0)
+                if self.headers.get("Transfer-Encoding"):
+                    self._send(411, {"error": "Content-Length required"})
+                    return
+                try:
+                    length = int(self.headers.get("Content-Length") or 0)
+                except ValueError:
+                    length = -1
+                if length < 0:
+                    self._send(400, {"error": "bad Content-Length"})
+                    return
                 if length > 1_000_000:
                     self._send(413, {"error": "body too large"})
                     return
@@ -318,6 +378,7 @@ def serve(extra_binds: list[str] | None = None) -> None:
         raise ConfigError("no agent token; run `wpops token rotate` first")
     port = int(agent.cfg["agent"].get("port", 8787))
     binds = list(dict.fromkeys((agent.cfg["agent"].get("bind") or ["127.0.0.1"]) + (extra_binds or [])))
+    os.umask(0o077)  # every file the agent creates starts private
     handler = make_handler(agent)
     servers = []
     for b in binds:

@@ -7,6 +7,7 @@ from typing import Any
 
 from . import __version__, backup as bk, failover, jobs, state
 from .config import BACKUPS_DIR, Inventory, REPO_DIR, load_env, cf_accounts
+from . import disk
 from .stacks import disk_free, ps
 
 
@@ -46,6 +47,7 @@ def node_status(inv: Inventory, cfg: dict[str, Any], live: bool = False) -> dict
         "tunnels": tunnel_status(inv, node),
         "backups": {"sets": len(sets), "latest": latest, "schedule": bk.schedule_info(),
                     "disk": disk_free(BACKUPS_DIR if BACKUPS_DIR.exists() else REPO_DIR)},
+        "disk": disk.report(inv, node),
         "jobs": {"active": jobs.active(), "recent": jobs.list_jobs(5)},
         "sites": len(inv.sites),
     }

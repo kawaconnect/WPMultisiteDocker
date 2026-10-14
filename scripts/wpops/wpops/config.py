@@ -15,6 +15,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import urllib.parse
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -99,17 +100,26 @@ NODE_DEFAULTS: dict[str, Any] = {
         "port": 8787,
         "public_url": "",            # e.g. https://ops.standby.example.net (informational)
         "rate_limit_per_min": 120,
+        # CF-Connecting-IP is believed only from these peers (CIDRs), e.g. the
+        # docker network cloudflared sits on. Empty = always use the TCP peer.
+        "trusted_proxies": [],
     },
     "backup": {
         "schedule": "weekly:sun:03:30",   # weekly:<day>:<HH:MM> | daily:<HH:MM> | off
         "retain_sets": 4,                 # per source, plus any set marked keep
         "sources": [],                    # names of origins with sync_api to pull from; [] = all
         "pull_timeout_min": 180,
+        "max_set_gb": 50,                 # refuse to pull a set larger than this, whatever the source claims
         # File entities every pull asks the source for (plus the database) so the
         # set is complete regardless of the source's own SiteGuard settings.
         # Subset of plugins, themes, uploads, others, wpcore; [] = source defaults.
         "entities": ["plugins", "themes", "uploads", "others"],
         "auto_apply": False,              # never applied automatically unless true (per design)
+    },
+    "disk": {
+        "min_free_gb": 10,                # alert + refuse pulls/restores below this much free space
+        "min_free_pct": 10,               # ... or below this percent free
+        "paths": [],                      # extra paths to watch besides backups/ and each stack's data/
     },
     "notify": {
         "email_to": [],                   # [] = e-mail disabled on the node (the bot still e-mails)
@@ -223,6 +233,16 @@ class Inventory:
         return [o for o in self.origins.values() if o.kind == "node"]
 
 
+def _checked_sync_api(origin: str, url: str) -> str:
+    url = (url or "").strip().rstrip("/")
+    if not url:
+        return ""
+    u = urllib.parse.urlsplit(url)
+    if u.scheme != "https" and u.hostname not in ("127.0.0.1", "localhost", "::1"):
+        raise ConfigError(f"origin {origin}: sync_api must be https:// (got {url}); the sync key travels in a header")
+    return url
+
+
 def _validate_inventory(inv: Inventory) -> None:
     seen: set[str] = set()
     for s in inv.sites:
@@ -262,7 +282,7 @@ def load_inventory(path: Path = INVENTORY_FILE) -> Inventory:
             name=name,
             kind=o.get("kind", "external"),
             targets=o.get("targets", []),
-            sync_api=o.get("sync_api", "").rstrip("/"),
+            sync_api=_checked_sync_api(name, o.get("sync_api", "")),
             agent=o.get("agent", "").rstrip("/"),
             standby_domain=o.get("standby_domain", ""),
             stacks=o.get("stacks", {}),

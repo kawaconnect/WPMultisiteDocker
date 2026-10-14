@@ -15,6 +15,7 @@ import urllib.request
 from pathlib import Path
 from typing import Any
 
+from . import state
 from .config import CF_API, REPO_DIR
 
 CF_BACKUP_DIR = REPO_DIR / "data" / "cloudflare" / "backups"
@@ -192,14 +193,12 @@ class Cloudflare:
         except OSError:
             pass
         path = d / (time.strftime("%Y-%m-%d_%H%M%S") + ".json")
-        path.write_text(json.dumps(self.dns_records(zone_id), indent=2) + "\n", encoding="utf-8")
-        path.chmod(0o600)
+        state.write_private_text(path, json.dumps(self.dns_records(zone_id), indent=2) + "\n")
         return path
 
     def backup_tunnel(self, tunnel_id: str) -> Path:
         d = CF_BACKUP_DIR / "tunnels" / (self.account_name or self.account_id)
         d.mkdir(parents=True, exist_ok=True)
         path = d / (time.strftime("%Y-%m-%d_%H%M%S") + ".json")
-        path.write_text(json.dumps(self.tunnel_config(tunnel_id), indent=2) + "\n", encoding="utf-8")
-        path.chmod(0o600)
+        state.write_private_text(path, json.dumps(self.tunnel_config(tunnel_id), indent=2) + "\n")
         return path

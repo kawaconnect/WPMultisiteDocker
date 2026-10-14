@@ -206,12 +206,25 @@ final class KC_Host_Alias {
     }
 }
 
-// Honour the proxy/tunnel scheme before anything builds URLs.
-if (isset($_SERVER['HTTP_X_FORWARDED_PROTO']) && strtolower((string) $_SERVER['HTTP_X_FORWARDED_PROTO']) === 'https') {
-    $_SERVER['HTTPS'] = 'on';
+// Honour the proxy/tunnel scheme before anything builds URLs, but only when
+// the request came from the private network (nginx / cloudflared containers),
+// so a direct plain-HTTP client cannot claim HTTPS.
+if (kc_host_alias_private_peer()) {
+    if (isset($_SERVER['HTTP_X_FORWARDED_PROTO']) && strtolower((string) $_SERVER['HTTP_X_FORWARDED_PROTO']) === 'https') {
+        $_SERVER['HTTPS'] = 'on';
+    }
+    if (isset($_SERVER['HTTP_CF_VISITOR']) && strpos((string) $_SERVER['HTTP_CF_VISITOR'], 'https') !== false) {
+        $_SERVER['HTTPS'] = 'on';
+    }
 }
-if (isset($_SERVER['HTTP_CF_VISITOR']) && strpos((string) $_SERVER['HTTP_CF_VISITOR'], 'https') !== false) {
-    $_SERVER['HTTPS'] = 'on';
+
+function kc_host_alias_private_peer(): bool {
+    $ip = isset($_SERVER['REMOTE_ADDR']) ? (string) $_SERVER['REMOTE_ADDR'] : '';
+    if ($ip === '' || !filter_var($ip, FILTER_VALIDATE_IP)) {
+        return false;
+    }
+    // Private/loopback only (FILTER_FLAG_NO_PRIV_RANGE|NO_RES_RANGE rejects exactly those).
+    return filter_var($ip, FILTER_VALIDATE_IP, FILTER_FLAG_NO_PRIV_RANGE | FILTER_FLAG_NO_RES_RANGE) === false;
 }
 
 KC_Host_Alias::boot();

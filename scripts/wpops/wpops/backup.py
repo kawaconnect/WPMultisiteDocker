@@ -27,12 +27,33 @@ from typing import Any
 from . import notify, state
 from .config import BACKUPS_DIR, ConfigError, Inventory, load_env, node_config, save_node_config
 from .jobs import Job
+from . import disk
 from .stacks import disk_free
 
 SCHEDULE_STATE = state.STATE_DIR / "schedule.json"
 _SET_ID_RE = re.compile(r"^[0-9]{8}-[0-9]{4}-[A-Za-z0-9]{4,32}$")
 _FILE_RE = re.compile(r"^backup_[A-Za-z0-9._-]+\.(zip|gz|sql|crypt|json|txt)$")
 DAYS = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"]
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):  # noqa: D401
+        return None
+
+
+_OPENER = urllib.request.build_opener(_NoRedirect())
+
+
+def _declared_total(resp, offset: int) -> int | None:
+    """Total size the source declares for this file (Content-Range or Content-Length + offset)."""
+    cr = resp.headers.get("Content-Range", "")
+    m = re.match(r"bytes \d+-\d+/(\d+)$", cr)
+    if m:
+        return int(m.group(1))
+    cl = resp.headers.get("Content-Length")
+    if cl and cl.isdigit():
+        return int(cl) + (offset if resp.status == 206 else 0)
+    return None
 
 
 class SyncError(Exception):
@@ -58,7 +79,9 @@ class SyncClient:
             h.update(headers)
         req = urllib.request.Request(url, data=data, method=method, headers=h)
         try:
-            resp = urllib.request.urlopen(req, timeout=self.timeout)
+            # Never follow redirects: the Authorization header must not be
+            # re-sent to another host or scheme the source points us at.
+            resp = _OPENER.open(req, timeout=self.timeout)
         except urllib.error.HTTPError as exc:
             text = exc.read().decode(errors="replace")[:300]
             raise SyncError(f"{method} {path} -> HTTP {exc.code}: {text}") from None
@@ -86,8 +109,8 @@ class SyncClient:
         return self._req("GET", f"/jobs/{urllib.parse.quote(nonce)}")
 
     def sets(self) -> dict[str, Any]:
-        """{'sets': [...], 'sites': [...], 'mode': ..., 'site_url': ...}"""
-        return self._req("GET", "/sets")
+        """{'sets': [...], 'sites': [...], 'mode': ..., 'site_url': ...} with per-file sha256."""
+        return self._req("GET", "/sets?hash=1")
 
     def download(self, nonce: str, name: str, dest: Path, expected_size: int, log) -> None:
         """Resumable download with Range; verifies the final size."""
@@ -114,10 +137,15 @@ class SyncClient:
                     mode = "wb"
                 else:
                     mode = "ab" if have else "wb"
+                # The source's headers must agree with the size it advertised in
+                # the listing; a stream is never read past that size.
+                declared = _declared_total(resp, have)
+                if declared is not None and declared != expected_size:
+                    raise SyncError(f"{name}: source now reports {declared} bytes, listing said {expected_size}")
                 with open(part, mode) as fh:
-                    while True:
+                    while have < expected_size:
                         try:
-                            chunk = resp.read(1024 * 1024)
+                            chunk = resp.read(min(1024 * 1024, expected_size - have))
                         except (TimeoutError, ConnectionError, OSError) as exc:
                             log(f"  stream interrupted at {have} bytes: {exc}")
                             chunk = b""
@@ -300,11 +328,15 @@ def pull(job: Job, inv: Inventory, source: str, label: str = "", fresh: bool = T
         if not files:
             raise SyncError("set has no downloadable files")
         total = sum(int(f["size"]) for f in files)
+        ceiling = int(float(cfg.get("max_set_gb", 50)) * 2**30)
+        if total > ceiling:
+            raise SyncError(f"set is {total // 2**30} GB, above backup.max_set_gb={cfg.get('max_set_gb', 50)}")
         dest = set_dir(source, set_id)
         dest.mkdir(parents=True, exist_ok=True)
-        free = disk_free(BACKUPS_DIR if BACKUPS_DIR.exists() else dest.parent)["free"]
-        if free < total * 1.1 + 2 * 2**30:
-            raise SyncError(f"not enough disk: set is {total // 2**20} MB, free {free // 2**20} MB (need headroom)")
+        try:
+            disk.require(BACKUPS_DIR if BACKUPS_DIR.exists() else dest.parent, int(total * 1.1), f"pull of {source} ({total // 2**20} MB)")
+        except state.StateError as exc:
+            raise SyncError(str(exc)) from None
         man = {
             "source": source, "nonce": chosen["nonce"], "timestamp": ts, "label": chosen.get("label", ""),
             "mode": listing.get("mode", ""), "site_url": listing.get("site_url", ""), "sites": listing.get("sites", []),
@@ -318,6 +350,8 @@ def pull(job: Job, inv: Inventory, source: str, label: str = "", fresh: bool = T
             name, size = f["name"], int(f["size"])
             log(f"  {name} ({size // 2**20} MB)")
             cli.download(chosen["nonce"], name, dest / name, size, log)
+            if not f.get("sha256"):
+                raise SyncError(f"{name}: source sent no sha256 (needs SiteGuard Backup >= 1.6.0)")
             if f.get("sha256"):
                 h = hashlib.sha256()
                 with open(dest / name, "rb") as fh:

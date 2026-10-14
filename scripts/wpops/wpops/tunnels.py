@@ -86,8 +86,7 @@ def ensure(start: bool = True, log=print) -> dict[str, Any]:
         ]
     lines += ["networks:", "  frontend:", "    external: true", f"    name: {project}_frontend", ""]
     compose = stack_path / "docker-compose.tunnels.yml"
-    compose.write_text("\n".join(lines), encoding="utf-8")
-    compose.chmod(0o600)
+    state.write_private_text(compose, "\n".join(lines))
     log(f"wrote {compose} ({len(tokens)} connector(s))")
     if start and tokens:
         r = subprocess.run(["docker", "compose", "--profile", "tunnels", "up", "-d", "--quiet-pull"], cwd=stack_path,
