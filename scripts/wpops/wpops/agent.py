@@ -94,11 +94,17 @@ class Agent:
         self.limiter = RateLimiter(int(self.cfg["agent"].get("rate_limit_per_min", 120)))
         self.started = int(time.time())
         self.trusted: list[ipaddress.IPv4Network | ipaddress.IPv6Network] = []
+        self._load_trusted()
+        self._stop = threading.Event()
+
+    def _load_trusted(self) -> None:
+        nets = []
         for cidr in self.cfg["agent"].get("trusted_proxies") or []:
             try:
-                self.trusted.append(ipaddress.ip_network(str(cidr), strict=False))
+                nets.append(ipaddress.ip_network(str(cidr), strict=False))
             except ValueError as exc:
                 raise ConfigError(f"agent.trusted_proxies: bad CIDR {cidr!r}") from exc
+        self.trusted = nets
 
     def trusts_proxy(self, peer: str) -> bool:
         try:
@@ -106,12 +112,12 @@ class Agent:
         except ValueError:
             return False
         return any(ip in net for net in self.trusted)
-        self._stop = threading.Event()
 
     # ---------------------------------------------------------------- helpers
     def reload(self) -> None:
         self.cfg = node_config()
         self.inv = load_inventory()
+        self._load_trusted()
 
     def node(self) -> str:
         return self.cfg["node"]
