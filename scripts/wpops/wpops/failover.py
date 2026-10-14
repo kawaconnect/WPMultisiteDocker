@@ -148,6 +148,10 @@ def plan(inv: Inventory, sites: list[Site], to: str | None = None, stack: str | 
                     p.refused.append({"site": site.slug, "domain": domain, "reason": str(exc)})
                     continue
                 current = _record_origin(inv, recs)
+                sibling = [r for r in recs if r.get("type") == "CNAME" and r.get("content", "").lower().rstrip(".") in site.domains]
+                if sibling and len(sibling) == len(recs):
+                    p.noop.append({"site": site.slug, "domain": domain, "reason": f"CNAME to {sibling[0]['content']} (follows that record)"})
+                    continue
                 if current == target:
                     p.noop.append({"site": site.slug, "domain": domain, "reason": f"already on {target}"})
                     continue
@@ -356,11 +360,13 @@ def live_status(inv: Inventory, accounts: dict | None = None) -> list[dict[str, 
                 zone_id = cf.zone_id(d)
                 recs = [r for r in cf.dns_records(zone_id, name=d) if r.get("type") in SWITCHABLE_TYPES]
                 cur = _record_origin(inv, recs)
+                if not cur and recs and all(r.get("type") == "CNAME" and r.get("content", "").lower().rstrip(".") in site.domains for r in recs):
+                    cur = "follows:" + recs[0]["content"]
                 out.append({
                     "site": site.slug, "domain": d, "primary": site.primary, "current": cur or "other",
                     "records": [f"{r['type']} {r['content']}" for r in recs],
                     "override": ovs.get(d, {}).get("status"),
-                    "ok": (cur == site.primary) if cur else False,
+                    "ok": (cur == site.primary or cur.startswith("follows:")) if cur else False,
                 })
             except CfError as exc:
                 out.append({"site": site.slug, "domain": d, "error": str(exc)})

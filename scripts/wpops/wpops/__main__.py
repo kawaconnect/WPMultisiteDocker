@@ -223,6 +223,17 @@ def cmd_notify(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_tunnels(args: argparse.Namespace) -> int:
+    from . import tunnels
+    if args.action == "ensure":
+        r = tunnels.ensure(start=not args.no_start)
+        _out(args, r, None if args.json else json.dumps(r, indent=2))
+        return 0 if all(v.get("ok") for k, v in r.items() if not k.startswith("_")) else 1
+    rows = tunnels.status()
+    _out(args, rows, "\n".join(f"{r['account']:<32} {r.get('tunnel') or 'MISSING':<40} {r.get('status', r.get('error', ''))} conns={r.get('connections', '-')}" for r in rows))
+    return 0
+
+
 def cmd_setup(args: argparse.Namespace) -> int:
     """Write config skeletons, install the host-alias plugin into every stack, add the backups mount."""
     CONFIG_DIR.mkdir(exist_ok=True)
@@ -302,6 +313,7 @@ def build_parser() -> argparse.ArgumentParser:
     s = sub.add_parser("token", help="rotate the agent token"); s.add_argument("action", choices=["rotate"]); s.set_defaults(fn=cmd_token)
     s = sub.add_parser("serve", help="run the HTTP agent"); s.add_argument("--bind", action="append", help="extra bind address"); s.set_defaults(fn=cmd_serve)
     s = sub.add_parser("notify", help="send a test notification"); s.add_argument("action", choices=["test"]); s.set_defaults(fn=cmd_notify)
+    s = sub.add_parser("tunnels", help="per-account Cloudflare tunnels on this node"); s.add_argument("action", choices=["status", "ensure"]); s.add_argument("--no-start", action="store_true"); s.set_defaults(fn=cmd_tunnels)
     s = sub.add_parser("setup", help="first-time setup on this node"); s.add_argument("--node"); s.set_defaults(fn=cmd_setup)
     return p
 

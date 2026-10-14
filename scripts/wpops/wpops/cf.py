@@ -138,6 +138,17 @@ class Cloudflare:
                 return t
         return None
 
+    def create_tunnel(self, name: str) -> dict[str, Any]:
+        import secrets as _s
+        body = {"name": name, "config_src": "cloudflare", "tunnel_secret": _s.token_urlsafe(32)}
+        return self.request("POST", f"/accounts/{self.account_id}/cfd_tunnel", body)["result"]
+
+    def tunnel_token(self, tunnel_id: str) -> str:
+        return str(self.request("GET", f"/accounts/{self.account_id}/cfd_tunnel/{tunnel_id}/token")["result"])
+
+    def verify_token(self) -> dict[str, Any]:
+        return self.request("GET", "/user/tokens/verify").get("result") or {}
+
     def tunnel_config(self, tunnel_id: str) -> dict[str, Any]:
         return self.request("GET", f"/accounts/{self.account_id}/cfd_tunnel/{tunnel_id}/configurations")["result"]
 
