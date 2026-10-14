@@ -23,7 +23,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
-from . import state
+from . import notify, state
 from .cf import CfError, Cloudflare
 from .config import ConfigError, Inventory, Origin, Site, cf_accounts, load_env, node_config
 
@@ -281,6 +281,16 @@ def apply(inv: Inventory, p: Plan, actor: str, this_node: str, accounts: dict | 
         except Exception as exc:  # noqa: BLE001
             failed.append({"aliases": this_node, "error": str(exc)})
     state.audit(actor, "failover.apply", {"to": p.to_origin, "done": done, "failed": failed})
+    switched = [d["domain"] for d in done if d.get("status") == "switched"]
+    if switched or failed:
+        notify.notify(
+            "failover.applied",
+            f"[wpops] FAILOVER to {p.to_origin}: {len(switched)} domain(s) switched" + (f", {len(failed)} failed" if failed else ""),
+            "Domains now served by the backup node:\n  " + "\n  ".join(switched or ["none"]) +
+            ("\nFailures:\n  " + "\n  ".join(json.dumps(f) for f in failed) if failed else "") +
+            f"\nActor: {actor}\nRoll back with: wpops failover rollback --sites ...\n",
+            {"to": p.to_origin, "domains": switched, "failed": failed, "actor": actor},
+        )
     return {"done": done, "failed": failed, "overrides": state.overrides()}
 
 
@@ -339,6 +349,15 @@ def rollback(inv: Inventory, actor: str, this_node: str, sites: list[str] | None
         except Exception as exc:  # noqa: BLE001
             failed.append({"aliases": this_node, "error": str(exc)})
     state.audit(actor, "failover.rollback", {"done": done, "failed": failed})
+    restored = [d["domain"] for d in done if d.get("status") == "restored"]
+    if restored or failed:
+        notify.notify(
+            "failover.rolledback",
+            f"[wpops] ROLLBACK: {len(restored)} domain(s) back on primary" + (f", {len(failed)} failed" if failed else ""),
+            "Domains restored to their primary:\n  " + "\n  ".join(restored or ["none"]) +
+            ("\nFailures:\n  " + "\n  ".join(json.dumps(f) for f in failed) if failed else "") + f"\nActor: {actor}\n",
+            {"domains": restored, "failed": failed, "actor": actor},
+        )
     return {"done": done, "failed": failed, "overrides": state.overrides()}
 
 
