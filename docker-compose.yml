@@ -283,7 +283,7 @@ services:
     deploy:
       resources:
         limits:
-          memory: 256M
+          memory: 1G  # restores copy/extract multi-hundred-MB archives through WP-CLI
 
   # ---------------------------------------------------------------------------
   # Cloudflare DNS Backup, runs every 6 hours, saves on change
