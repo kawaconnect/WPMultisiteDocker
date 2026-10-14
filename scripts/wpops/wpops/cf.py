@@ -139,8 +139,8 @@ class Cloudflare:
         return None
 
     def create_tunnel(self, name: str) -> dict[str, Any]:
-        import secrets as _s
-        body = {"name": name, "config_src": "cloudflare", "tunnel_secret": _s.token_urlsafe(32)}
+        import base64, os
+        body = {"name": name, "config_src": "cloudflare", "tunnel_secret": base64.b64encode(os.urandom(32)).decode()}
         return self.request("POST", f"/accounts/{self.account_id}/cfd_tunnel", body)["result"]
 
     def tunnel_token(self, tunnel_id: str) -> str:
