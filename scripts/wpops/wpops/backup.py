@@ -333,10 +333,21 @@ def pull(job: Job, inv: Inventory, source: str, label: str = "", fresh: bool = T
             raise SyncError(f"set is {total // 2**30} GB, above backup.max_set_gb={cfg.get('max_set_gb', 50)}")
         dest = set_dir(source, set_id)
         dest.mkdir(parents=True, exist_ok=True)
+        where = BACKUPS_DIR if BACKUPS_DIR.exists() else dest.parent
         try:
-            disk.require(BACKUPS_DIR if BACKUPS_DIR.exists() else dest.parent, int(total * 1.1), f"pull of {source} ({total // 2**20} MB)")
-        except disk.DiskError as exc:
-            raise SyncError(str(exc)) from None
+            disk.require(where, int(total * 1.1), f"pull of {source} ({total // 2**20} MB)")
+        except disk.DiskError as first:
+            # Make room first: the new set counts toward retain_sets, so drop the
+            # oldest unkept sets of this source down to retain_sets - 1, then re-check.
+            keep_n = max(1, int(cfg.get("retain_sets", 4)) - 1)
+            dropped = prune(source, keep_n, log=log)
+            if dropped:
+                log(f"pruned to make room: {', '.join(dropped)}")
+            try:
+                disk.require(where, int(total * 1.1), f"pull of {source} ({total // 2**20} MB)")
+            except disk.DiskError as exc:
+                dest.rmdir() if not any(dest.iterdir()) else None
+                raise SyncError(str(exc)) from None
         man = {
             "source": source, "nonce": chosen["nonce"], "timestamp": ts, "label": chosen.get("label", ""),
             "mode": listing.get("mode", ""), "site_url": listing.get("site_url", ""), "sites": listing.get("sites", []),
