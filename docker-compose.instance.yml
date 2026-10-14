@@ -1,0 +1,183 @@
+# =============================================================================
+# Isolated WordPress instance (single site OR multisite), Docker Compose
+# =============================================================================
+# Not used directly. scripts/instance.sh renders an .env per instance and runs:
+#   docker compose -p wpi-<name> -f docker-compose.instance.yml \
+#       --env-file instances/<name>/.env up -d
+#
+# Each instance is fully separate from the main standby stack: its own
+# project, networks, database and files under instances/<name>/data. No
+# tunnels, no Cloudflare credentials, no Redis, and nginx only listens on
+# 127.0.0.1. Meant for development and plugin testing (e.g. SiteGuard).
+# =============================================================================
+
+# wp-config.php evals WORDPRESS_CONFIG_EXTRA at runtime, so WP-CLI needs the same
+# value as PHP-FPM or it will not see the multisite constants.
+x-wp-config-extra: &wp_config_extra |
+  define('DISABLE_WP_CRON', true);
+  /* No background auto-updates in test instances. (WP_HTTP_BLOCK_EXTERNAL is not
+     used: its *.test wildcard does not match hyphenated hosts like dst-single.test.) */
+  define('AUTOMATIC_UPDATER_DISABLED', true);
+  /* WP_DEBUG itself comes from WORDPRESS_DEBUG */
+  if (!defined('WP_DEBUG_LOG')) define('WP_DEBUG_LOG', true);
+  if (!defined('WP_DEBUG_DISPLAY')) define('WP_DEBUG_DISPLAY', false);
+  /* Multisite: only for WP_MODE=multisite, and only once the network tables exist */
+  if ('${WP_MODE}' === 'multisite') {
+      define('WP_ALLOW_MULTISITE', true);
+      $$__ms = @new mysqli('mariadb', DB_USER, DB_PASSWORD, DB_NAME);
+      if ($$__ms && !$$__ms->connect_error) {
+          $$__r = $$__ms->query("SHOW TABLES LIKE 'wp\\_blogs'");
+          if ($$__r && $$__r->num_rows > 0) {
+              define('MULTISITE', true);
+              define('SUBDOMAIN_INSTALL', false);
+              define('DOMAIN_CURRENT_SITE', '${WP_DOMAIN}');
+              define('PATH_CURRENT_SITE', '/');
+              define('SITE_ID_CURRENT_SITE', 1);
+              define('BLOG_ID_CURRENT_SITE', 1);
+          }
+          $$__ms->close();
+      }
+  }
+
+# Explicit small subnets (from INSTANCE_NET, assigned by instance.sh) so many
+# instances can exist at once without exhausting Docker's default address pools.
+networks:
+  frontend:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 10.213.${INSTANCE_NET}.0/25
+  backend:
+    driver: bridge
+    internal: true
+    ipam:
+      config:
+        - subnet: 10.213.${INSTANCE_NET}.128/25
+  # Shared by all instances (never by the main stack) so one instance can reach
+  # another as http://<name>.test/, e.g. for SiteGuard site-to-site transfers.
+  # Internal: no route to the internet. Created by instance.sh.
+  mesh:
+    external: true
+    name: wpi-mesh
+
+services:
+  mariadb:
+    image: mariadb:11.4.4
+    restart: "no"
+    networks: [backend]
+    volumes:
+      - ${INSTANCE_DIR}/data/mysql:/var/lib/mysql
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD}
+      MYSQL_DATABASE: wordpress
+      MYSQL_USER: wordpress
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD}
+    healthcheck:
+      test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
+      interval: 10s
+      timeout: 10s
+      retries: 10
+      start_period: 30s
+    security_opt: [no-new-privileges:true]
+    cap_drop: [ALL]
+    cap_add: [SETUID, SETGID, DAC_OVERRIDE]
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+
+  wordpress:
+    image: wordpress:6.9.4-fpm
+    restart: "no"
+    networks: [frontend, backend, mesh]
+    depends_on:
+      mariadb:
+        condition: service_healthy
+    volumes:
+      - ${INSTANCE_DIR}/data/wordpress:/var/www/html
+      - ./config/php/uploads.ini:/usr/local/etc/php/conf.d/uploads.ini:ro
+    tmpfs:
+      - /tmp:noexec,nosuid,size=256m
+    environment:
+      WORDPRESS_DB_HOST: mariadb:3306
+      WORDPRESS_DB_NAME: wordpress
+      WORDPRESS_DB_USER: wordpress
+      WORDPRESS_DB_PASSWORD: ${MYSQL_PASSWORD}
+      WORDPRESS_TABLE_PREFIX: wp_
+      WORDPRESS_DEBUG: "1"
+      WORDPRESS_CONFIG_EXTRA: *wp_config_extra
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c 'echo > /dev/tcp/127.0.0.1/9000'"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+    security_opt: [no-new-privileges:true]
+    cap_drop: [ALL]
+    cap_add: [SETUID, SETGID, DAC_OVERRIDE, CHOWN, FOWNER]
+    deploy:
+      resources:
+        limits:
+          memory: 768M
+
+  nginx:
+    image: nginx:1.29.8-alpine
+    restart: "no"
+    networks:
+      frontend: {}
+      backend: {}
+      mesh:
+        aliases: ["${WP_DOMAIN}"]
+    depends_on:
+      wordpress:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:${HTTP_PORT}:80"
+    volumes:
+      - ${INSTANCE_DIR}/data/wordpress:/var/www/html:ro
+      - ./config/nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./config/nginx/conf.d:/etc/nginx/conf.d:ro
+    tmpfs:
+      - /tmp:noexec,nosuid,size=64m
+      - /var/log/nginx:size=32m
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO /dev/null http://127.0.0.1/nginx-health"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    security_opt: [no-new-privileges:true]
+    cap_drop: [ALL]
+    cap_add: [NET_BIND_SERVICE, SETUID, SETGID, CHOWN]
+    deploy:
+      resources:
+        limits:
+          memory: 128M
+
+  # WP-CLI, always as www-data (uid 33), never root. Idles; use `instance.sh wp`.
+  cli:
+    image: wordpress:cli-2.12
+    restart: "no"
+    user: "33:33"
+    networks: [backend, mesh]
+    depends_on:
+      wordpress:
+        condition: service_healthy
+    volumes:
+      - ${INSTANCE_DIR}/data/wordpress:/var/www/html
+    tmpfs:
+      - /tmp:size=256m,uid=33,gid=33
+    environment:
+      WORDPRESS_DB_HOST: mariadb:3306
+      WORDPRESS_DB_NAME: wordpress
+      WORDPRESS_DB_USER: wordpress
+      WORDPRESS_DB_PASSWORD: ${MYSQL_PASSWORD}
+      WORDPRESS_TABLE_PREFIX: wp_
+      WORDPRESS_DEBUG: "1"
+      WORDPRESS_CONFIG_EXTRA: *wp_config_extra
+    entrypoint: ["/bin/sh", "-c", "trap 'exit 0' TERM; while :; do sleep 3600 & wait $$!; done"]
+    security_opt: [no-new-privileges:true]
+    cap_drop: [ALL]
+    deploy:
+      resources:
+        limits:
+          memory: 512M

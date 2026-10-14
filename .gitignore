@@ -56,3 +56,5 @@ backups/
 config/wpops.json
 __pycache__/
 *.pyc
+# Isolated dev/test instances (scripts/instance.sh), contain DBs and secrets
+instances/
