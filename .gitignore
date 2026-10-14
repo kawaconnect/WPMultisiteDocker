@@ -54,7 +54,8 @@ sgbackup_bundle_*.zip
 state/
 backups/
 config/wpops.json
-config/inventory.json   # real sites/domains/tunnel ids stay on the node (see inventory.example.json)
+# real sites/domains/tunnel ids stay on the node (see inventory.example.json)
+config/inventory.json
 __pycache__/
 *.pyc
 # Isolated dev/test instances (scripts/instance.sh), contain DBs and secrets
