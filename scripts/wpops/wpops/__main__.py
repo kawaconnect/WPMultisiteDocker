@@ -140,7 +140,9 @@ def cmd_backup(args: argparse.Namespace) -> int:
             print("--source is required", file=sys.stderr)
             return 2
         job = _run_inline("backup.pull", {"source": args.source, "label": args.label or ""},
-                          lambda j: bk.pull(j, inv, args.source, args.label or "", fresh=not args.latest, nonce=args.nonce))
+                          lambda j: bk.pull(j, inv, args.source, args.label or "", fresh=not args.latest, nonce=args.nonce,
+                                            entities=[e for e in (args.entities or "").split(",") if e] or None,
+                                            db=not args.no_db))
         _out(args, job.as_dict(), None if args.json else f"{job.status}: {json.dumps(job.result or job.error, default=str)}")
         return 0 if job.status == "succeeded" else 1
     if args.action == "prune":
@@ -285,6 +287,8 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--nonce", help="pull a specific existing set"); s.add_argument("--retain", type=int); s.add_argument("--dry-run", action="store_true")
     s.add_argument("--set", help="schedule spec (weekly:sun:03:30|daily:03:30|off) or set ref for keep/delete")
     s.add_argument("--sources", help="comma-separated sources for the schedule"); s.add_argument("--unkeep", action="store_true"); s.add_argument("--yes", action="store_true")
+    s.add_argument("--entities", help="pull: limit the source backup to these file entities (plugins,themes,uploads,others,wpcore)")
+    s.add_argument("--no-db", action="store_true", help="pull: skip the database (test runs)")
     s.set_defaults(fn=cmd_backup)
 
     s = sub.add_parser("restore", help="apply a pulled set to a stack")

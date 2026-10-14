@@ -154,7 +154,8 @@ class Agent:
                     raise ApiError(409, "a pull is already running")
                 job = jobs.Job("backup.pull", {"source": source, "label": body.get("label", "")}, actor)
                 jobs.start_background(job, lambda j: bk.pull(j, self.inv, source, body.get("label", ""),
-                                                             fresh=body.get("fresh", True), nonce=body.get("nonce")))
+                                                             fresh=body.get("fresh", True), nonce=body.get("nonce"),
+                                                             entities=body.get("entities"), db=body.get("db", True)))
                 return {"job": job.id}
             if p == ["backups", "prune"]:
                 return {"removed": bk.prune(body.get("source"), body.get("retain"), body.get("dry_run", False), log=lambda s: None)}

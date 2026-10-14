@@ -76,8 +76,8 @@ class SyncClient:
     def ping(self) -> dict[str, Any]:
         return self._req("GET", "/ping")
 
-    def start_backup(self, label: str, entities: list[str] | None = None) -> dict[str, Any]:
-        body: dict[str, Any] = {"label": label}
+    def start_backup(self, label: str, entities: list[str] | None = None, db: bool = True) -> dict[str, Any]:
+        body: dict[str, Any] = {"label": label, "db": db}
         if entities:
             body["entities"] = entities
         return self._req("POST", "/backup", body)
@@ -248,7 +248,7 @@ def client_for(inv: Inventory, source: str) -> SyncClient:
 
 
 def pull(job: Job, inv: Inventory, source: str, label: str = "", fresh: bool = True,
-         nonce: str | None = None) -> dict[str, Any]:
+         nonce: str | None = None, entities: list[str] | None = None, db: bool = True) -> dict[str, Any]:
     """Create (or reuse) a backup on the source and copy it here."""
     cfg = node_config()["backup"]
     log = job.log
@@ -258,7 +258,7 @@ def pull(job: Job, inv: Inventory, source: str, label: str = "", fresh: bool = T
     with state.locked(f"pull-{source}", timeout=5):
         if fresh and not nonce:
             label = label or f"wpops {time.strftime('%Y-%m-%d')}"
-            started = cli.start_backup(label)
+            started = cli.start_backup(label, entities=entities, db=db)
             nonce = started.get("nonce")
             if not nonce:
                 raise SyncError(f"source did not return a job nonce: {started}")
