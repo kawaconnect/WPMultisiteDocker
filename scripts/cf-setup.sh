@@ -70,12 +70,12 @@ declare -a ALL_DOMAIN_FAILOVER=()
 declare -a ALL_DOMAIN_ACCT_NAMES=()
 
 for ((n = 1; n <= ACCOUNT_COUNT; n++)); do
-    is_standby=$(get_account_var "$n" STANDBY)
-    [ "$is_standby" = "true" ] && continue
-
     acct_name=$(get_account_var "$n" NAME)
     read -ra domains <<< "$(get_account_domains "$n")"
     for domain in "${domains[@]}"; do
+        # The standby domain itself is infrastructure, not a production
+        # site to review/fail over, skip just this one entry.
+        [ "$domain" = "$STANDBY_DOMAIN" ] && continue
         ALL_DOMAIN_ACCT_N+=("$n")
         ALL_DOMAIN_ACCT_NAMES+=("$acct_name")
         ALL_DOMAIN_NAMES+=("$domain")
@@ -205,15 +205,14 @@ for ((n = 1; n <= ACCOUNT_COUNT; n++)); do
 
     # ── Configure ingress: ONLY for standby ──────────────────────────────
     if [ "$is_standby" = "true" ]; then
-        # Standby: *.standby_domain → nginx + catch-all 404
+        # Standby: *.standby_domain → nginx. Merge (not replace) so any
+        # domain-specific rules this account already carries (e.g. its own
+        # production domains that are mid-failover) aren't wiped out.
         ingress=$(jq -n \
             --arg host "*.$STANDBY_DOMAIN" \
-            '[
-                {hostname: $host, service: "http://nginx:80"},
-                {service: "http_status:404"}
-            ]')
+            '[{hostname: $host, service: "http://nginx:80"}]')
         log_info "Configuring standby ingress: *.$STANDBY_DOMAIN → http://nginx:80"
-        configure_tunnel_ingress "$account_id" "$api_token" "$tunnel_id" "$ingress" >/dev/null
+        merge_tunnel_ingress "$account_id" "$api_token" "$tunnel_id" "$ingress" >/dev/null
         log_ok "Standby ingress configured"
 
         # Create wildcard DNS CNAME on standby domain only

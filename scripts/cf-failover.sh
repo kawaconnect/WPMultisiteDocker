@@ -111,9 +111,6 @@ declare -a PLAN_TUNNEL_IDS=()  # tunnel id for CNAME target
 PLAN_COUNT=0
 
 for ((n = 1; n <= ACCOUNT_COUNT; n++)); do
-    is_standby=$(get_account_var "$n" STANDBY)
-    [ "$is_standby" = "true" ] && continue
-
     name=$(get_account_var "$n" NAME)
     account_id=$(get_account_var "$n" ID)
     api_token=$(get_account_var "$n" TOKEN)
@@ -132,6 +129,10 @@ for ((n = 1; n <= ACCOUNT_COUNT; n++)); do
     # Process each domain on this account
     read -ra domains <<< "$(get_account_domains "$n")"
     for domain in "${domains[@]}"; do
+        # The standby domain itself is infrastructure, not a production
+        # site to fail over, skip just this one entry (the account may
+        # still own other real production domains worth processing).
+        [ "$domain" = "$STANDBY_DOMAIN" ] && continue
         zone_id=$(get_zone_id "$domain" "$api_token") || continue
 
         # Find A records pointing at cloud IP
@@ -241,9 +242,6 @@ for tunnel_id in "${!INGRESS_BY_TUNNEL[@]}"; do
 
     # Find the account for this tunnel
     for ((n = 1; n <= ACCOUNT_COUNT; n++)); do
-        is_standby=$(get_account_var "$n" STANDBY)
-        [ "$is_standby" = "true" ] && continue
-
         account_id=$(get_account_var "$n" ID)
         api_token=$(get_account_var "$n" TOKEN)
         tunnel_name="wp-docker-$(get_account_var "$n" NAME)"
@@ -251,16 +249,18 @@ for tunnel_id in "${!INGRESS_BY_TUNNEL[@]}"; do
         [ -z "$tj" ] && continue
         tid=$(echo "$tj" | jq -r '.id')
         if [ "$tid" = "$tunnel_id" ]; then
-            # Build ingress JSON
+            # Build ingress JSON (named-host rules only, merge preserves
+            # any unrelated rules already on the tunnel, e.g. the standby
+            # wildcard if this is the standby account's own tunnel)
             ingress="["
             for host in $hosts; do
                 ingress+="{\"hostname\": \"$host\", \"service\": \"http://nginx:80\"},"
             done
-            ingress+="{\"service\": \"http_status:404\"}]"
+            ingress="${ingress%,}]"
 
             host_count=$(echo "$hosts" | wc -w)
             log_info "Configuring tunnel ingress ($host_count hostname(s))"
-            configure_tunnel_ingress "$account_id" "$api_token" "$tunnel_id" "$ingress" >/dev/null
+            merge_tunnel_ingress "$account_id" "$api_token" "$tunnel_id" "$ingress" >/dev/null
             log_ok "Tunnel ingress updated"
             break
         fi

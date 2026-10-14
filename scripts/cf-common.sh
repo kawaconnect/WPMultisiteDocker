@@ -494,6 +494,49 @@ configure_tunnel_ingress() {
     cf_api PUT "/accounts/$account_id/cfd_tunnel/$tunnel_id/configurations" "$token" "$body"
 }
 
+# merge_tunnel_ingress ACCOUNT_ID TOKEN TUNNEL_ID NEW_RULES_JSON
+# NEW_RULES_JSON is a JSON array of {hostname, service} rules (no catch-all).
+# Adds/updates only these hostnames in the tunnel's existing ingress config
+# unrelated rules (e.g. the standby wildcard) are preserved. Use this instead
+# of configure_tunnel_ingress whenever a tunnel may already carry other rules.
+merge_tunnel_ingress() {
+    local account_id="$1" token="$2" tunnel_id="$3" new_rules_json="$4"
+    local current existing merged
+    current=$(get_tunnel_config "$account_id" "$token" "$tunnel_id") || return 1
+    existing=$(echo "$current" | jq -c '.config.ingress // []')
+    merged=$(jq -n -c \
+        --argjson existing "$existing" \
+        --argjson new "$new_rules_json" '
+        ($new | map(.hostname)) as $newhosts
+        | ($existing | map(select(.hostname != null and ((.hostname as $h | $newhosts | index($h)) | not)))) as $keep_named
+        | ($existing | map(select(.hostname == null))) as $catchall
+        | (if ($catchall | length) == 0 then [{"service":"http_status:404"}] else $catchall end) as $tail
+        | ($keep_named + $new + $tail)
+    ')
+    configure_tunnel_ingress "$account_id" "$token" "$tunnel_id" "$merged"
+}
+
+# remove_tunnel_ingress_hosts ACCOUNT_ID TOKEN TUNNEL_ID HOSTS
+# HOSTS is a space-separated list of hostnames to remove from the tunnel's
+# ingress config. Everything else (e.g. the standby wildcard) is preserved.
+remove_tunnel_ingress_hosts() {
+    local account_id="$1" token="$2" tunnel_id="$3" hosts="$4"
+    local current existing hosts_json remaining has_catchall
+    current=$(get_tunnel_config "$account_id" "$token" "$tunnel_id") || return 1
+    existing=$(echo "$current" | jq -c '.config.ingress // []')
+    hosts_json=$(printf '%s\n' $hosts | jq -R . | jq -s -c .)
+    remaining=$(jq -n -c \
+        --argjson existing "$existing" \
+        --argjson rm "$hosts_json" '
+        $existing | map(select(.hostname == null or ((.hostname as $h | $rm | index($h)) | not)))
+    ')
+    has_catchall=$(echo "$remaining" | jq '[.[] | select(.hostname == null)] | length')
+    if [ "$has_catchall" -eq 0 ]; then
+        remaining=$(echo "$remaining" | jq -c '. + [{"service":"http_status:404"}]')
+    fi
+    configure_tunnel_ingress "$account_id" "$token" "$tunnel_id" "$remaining"
+}
+
 # get_tunnel_config ACCOUNT_ID TOKEN TUNNEL_ID, returns tunnel config JSON
 get_tunnel_config() {
     local account_id="$1" token="$2" tunnel_id="$3"

@@ -84,9 +84,6 @@ declare -a PLAN_TUNNEL_IDS=()
 PLAN_COUNT=0
 
 for ((n = 1; n <= ACCOUNT_COUNT; n++)); do
-    is_standby=$(get_account_var "$n" STANDBY)
-    [ "$is_standby" = "true" ] && continue
-
     name=$(get_account_var "$n" NAME)
     account_id=$(get_account_var "$n" ID)
     api_token=$(get_account_var "$n" TOKEN)
@@ -106,6 +103,8 @@ for ((n = 1; n <= ACCOUNT_COUNT; n++)); do
     # Process each domain
     read -ra domains <<< "$(get_account_domains "$n")"
     for domain in "${domains[@]}"; do
+        # The standby domain itself is infrastructure, never touch it here.
+        [ "$domain" = "$CF_STANDBY_DOMAIN" ] && continue
         zone_id=$(get_zone_id "$domain" "$api_token" 2>/dev/null) || continue
 
         # Find CNAME records pointing at the tunnel
@@ -176,26 +175,28 @@ confirm_yes "You are about to modify $PLAN_COUNT live DNS record(s). Proceed?"
 
 echo "[4/5] Resetting tunnel ingress..."
 
-declare -A RESET_TUNNELS
-for ((n = 1; n <= ACCOUNT_COUNT; n++)); do
-    is_standby=$(get_account_var "$n" STANDBY)
-    [ "$is_standby" = "true" ] && continue
+# Clear ingress only for the hostnames actually being rolled back on each
+# tunnel, NOT a blind wipe. A tunnel may carry unrelated standing rules
+# (e.g. the standby account's own *.STANDBY_DOMAIN wildcard) that must
+# survive a rollback of one of its other (production-domain) hosts.
+declare -A HOSTS_BY_TUNNEL
+declare -A ACCOUNT_BY_TUNNEL
+for ((p = 0; p < PLAN_COUNT; p++)); do
+    tid="${PLAN_TUNNEL_IDS[$p]}"
+    [ "$tid" = "unknown" ] && continue
+    HOSTS_BY_TUNNEL[$tid]+="${PLAN_NAMES[$p]} "
+    ACCOUNT_BY_TUNNEL[$tid]="${PLAN_ACCOUNTS[$p]}"
+done
 
-    account_id=$(get_account_var "$n" ID)
-    api_token=$(get_account_var "$n" TOKEN)
-    tunnel_name="wp-docker-$(get_account_var "$n" NAME)"
-
-    tunnel_json=$(get_tunnel_by_name "$account_id" "$api_token" "$tunnel_name" 2>/dev/null)
-    if [ -n "$tunnel_json" ]; then
-        tunnel_id=$(echo "$tunnel_json" | jq -r '.id')
-        if [ -z "${RESET_TUNNELS[$tunnel_id]:-}" ]; then
-            ingress='[{"service": "http_status:404"}]'
-            log_info "Resetting tunnel ingress to catch-all 404"
-            configure_tunnel_ingress "$account_id" "$api_token" "$tunnel_id" "$ingress" >/dev/null
-            log_ok "Tunnel ingress cleared"
-            RESET_TUNNELS[$tunnel_id]=1
-        fi
-    fi
+for tunnel_id in "${!HOSTS_BY_TUNNEL[@]}"; do
+    acct_n="${ACCOUNT_BY_TUNNEL[$tunnel_id]}"
+    account_id=$(get_account_var "$acct_n" ID)
+    api_token=$(get_account_var "$acct_n" TOKEN)
+    hosts="${HOSTS_BY_TUNNEL[$tunnel_id]}"
+    host_count=$(echo "$hosts" | wc -w)
+    log_info "Clearing ingress for $host_count hostname(s) (unrelated rules preserved)"
+    remove_tunnel_ingress_hosts "$account_id" "$api_token" "$tunnel_id" "$hosts" >/dev/null
+    log_ok "Tunnel ingress updated"
 done
 
 # ── Step 7: Execute DNS changes ──────────────────────────────────────────────
