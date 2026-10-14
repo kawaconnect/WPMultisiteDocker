@@ -209,6 +209,45 @@ Run manually or add to cron for daily backups:
 
 Retention: 7 daily, 4 weekly (Sunday), 6 monthly (1st), 5 yearly (Jan 1st). Backups stored in `data/cloudflare/backups/`.
 
+
+## wpops: failover, backup pulls and restores (node agent)
+
+`scripts/wpops/` is the control plane the Discord bot drives (design and
+scenarios: [docs/wpops-design.md](docs/wpops-design.md)). It is stdlib
+Python, runs on every docker node, and does the same work from the CLI and
+from its HTTP API (`wpops serve`, published through the node's own tunnel as
+`ops.<standby-domain>`).
+
+```bash
+scripts/wpops/bin/wpops setup --node node2        # config skeletons, host-alias plugin into every stack
+scripts/wpops/bin/wpops token rotate                # agent bearer token (give it to the bot: /wp node add)
+scripts/wpops/install-agent.sh --bind 172.19.0.1   # systemd unit; bind the docker gateway so cloudflared reaches it
+wpops tunnels ensure                                # idle tunnel per Cloudflare account + docker-compose.tunnels.yml
+wpops status [--live]  /  wpops sites --live       # node health, overrides, tunnels, backups / where DNS points
+wpops failover plan --sites a,b | --all [--to NODE] # dry run, shows refusals (no tunnel, foreign record, ...)
+wpops failover apply ... --yes                      # DNS -> tunnel CNAME, originals saved in state/overrides.json
+wpops failover rollback --sites a | --all --yes     # exact original records restored, ingress cleaned
+wpops backup pull --source azure                    # SiteGuard sync API: fresh full backup, resumable download
+wpops backup list | prune | schedule --set weekly:sun:03:30 --retain 4
+wpops restore apply --set azure/<set> --stack main --all | --sites a,b --yes   # never automatic
+```
+
+- `config/inventory.json` (committed): origins (external like Azure, or
+  nodes), sites (slug, primary, Cloudflare account, production domains, how
+  each origin serves it). `config/wpops.json` (per node): agent bind/port,
+  schedule, retention, notification e-mail/webhook.
+- Production hostnames are served by the **host-alias layer**
+  (`plugin/kc-host-alias`: `sunrise.php` + mu-plugin, map in
+  `wp-content/wpops-host-aliases.json`), so a restore keeps the stack's own
+  URLs and a failover still answers `https://<production-domain>` with the
+  production canonical, media and REST URLs. Responses carry
+  `X-KC-Host-Alias: <site>` while an alias is active.
+- Secrets stay in `.env`: `CF_ACCOUNT_n_*`, `WPOPS_SYNC_KEY_<SOURCE>`
+  (SiteGuard sync key of each source), optional `SMTP_*`.
+- Pulled sets live under `backups/<source>/<set>/` (retention per source);
+  the `wp-cron` service mounts `./backups` read-only at `/backups` for
+  `wp siteguardbackup import`.
+
 ## Isolated Instances (single site or multisite)
 
 Besides the main standby stack, `scripts/instance.sh` runs any number of
