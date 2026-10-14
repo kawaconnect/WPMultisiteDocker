@@ -5,7 +5,7 @@ docker-compose.yml):
 
   .env                     secrets: CF_ACCOUNT_n_*, SMTP_*, WPOPS_* (never returned by the API)
   config/wpops.json        this node: name, agent bind/port, backup schedule, retention, notify
-  config/inventory.json    origins and sites (shared with the bot and other nodes)
+  config/inventory.json    origins and sites (per node, gitignored; same file on every node)
   state/                   overrides.json, jobs/, audit.log, token hash, schedule state
   backups/<source>/<set>/  pulled backup sets
 """

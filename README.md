@@ -232,7 +232,7 @@ wpops backup list | prune | schedule --set weekly:sun:03:30 --retain 4
 wpops restore apply --set azure/<set> --stack main --all | --sites a,b --yes   # never automatic
 ```
 
-- `config/inventory.json` (committed): origins (external like Azure, or
+- `config/inventory.json` (per node, **not committed**; copy from `inventory.example.json`): origins (external like Azure, or
   nodes), sites (slug, primary, Cloudflare account, production domains, how
   each origin serves it). `config/wpops.json` (per node): agent bind/port,
   schedule, retention, notification e-mail/webhook.
