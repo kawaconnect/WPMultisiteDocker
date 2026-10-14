@@ -85,8 +85,9 @@ class SyncClient:
     def job(self, nonce: str) -> dict[str, Any]:
         return self._req("GET", f"/jobs/{urllib.parse.quote(nonce)}")
 
-    def sets(self) -> list[dict[str, Any]]:
-        return self._req("GET", "/sets").get("sets", [])
+    def sets(self) -> dict[str, Any]:
+        """{'sets': [...], 'sites': [...], 'mode': ..., 'site_url': ...}"""
+        return self._req("GET", "/sets")
 
     def download(self, nonce: str, name: str, dest: Path, expected_size: int, log) -> None:
         """Resumable download with Range; verifies the final size."""
@@ -279,7 +280,8 @@ def pull(job: Job, inv: Inventory, source: str, label: str = "", fresh: bool = T
                 if time.time() > deadline:
                     raise SyncError("timed out waiting for the source backup")
                 time.sleep(15)
-        sets = cli.sets()
+        listing = cli.sets()
+        sets = listing.get("sets", [])
         if nonce:
             chosen = next((s for s in sets if s.get("nonce") == nonce), None)
             if not chosen:
@@ -302,7 +304,7 @@ def pull(job: Job, inv: Inventory, source: str, label: str = "", fresh: bool = T
             raise SyncError(f"not enough disk: set is {total // 2**20} MB, free {free // 2**20} MB (need headroom)")
         man = {
             "source": source, "nonce": chosen["nonce"], "timestamp": ts, "label": chosen.get("label", ""),
-            "mode": chosen.get("mode", ""), "site_url": chosen.get("site_url", ""), "sites": chosen.get("sites", []),
+            "mode": listing.get("mode", ""), "site_url": listing.get("site_url", ""), "sites": listing.get("sites", []),
             "entities": chosen.get("entities", []), "files": files, "pulled_at": None, "keep": False, "applied": [],
             "plugin_version": info.get("version"),
         }
@@ -408,7 +410,12 @@ def due(now: float | None = None) -> bool:
     now = now or time.time()
     st = state.read_json(SCHEDULE_STATE, {})
     last = st.get("last_run") or 0
-    nxt = next_run(spec, after=last) if last else next_run(spec, after=now - 8 * 86400)
+    if not last:
+        # First tick after install: anchor the schedule now instead of firing
+        # immediately for a slot that passed before the agent existed.
+        state.write_json(SCHEDULE_STATE, {"last_run": int(now), "last_result": {"note": "schedule anchored at install"}})
+        return False
+    nxt = next_run(spec, after=last)
     return nxt is not None and nxt <= now
 
 

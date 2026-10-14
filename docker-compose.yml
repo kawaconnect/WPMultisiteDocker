@@ -266,7 +266,7 @@ services:
       - |
         while true; do
           wp cron event run --due-now --path=/var/www/html 2>&1 || true
-          sleep 300
+          sleep 60
         done
     security_opt:
       - no-new-privileges:true
