@@ -67,3 +67,5 @@ sites/
 # Managed production stacks: generated secrets, content and login policies
 stacks/
 docker-compose.wpops-tunnels.json
+# Node-local Nginx settings, e.g. the legacy stack's connector subnet
+config/nginx/conf.d/*.local.conf

@@ -129,6 +129,47 @@ network name differs from `<directory>_frontend`. Enable `WP_SUNRISE=true` for
 multisite host aliases and recreate the WordPress/cron containers. Managed
 stacks enable the host-alias runtime automatically.
 
+### Visitor IPs behind the tunnel
+
+Through a tunnel, every request reaches Nginx from a cloudflared connector,
+so Nginx must take the visitor IP from `CF-Connecting-IP`. If it does not,
+the `/wp-login.php` and custom-login rate limit (20 requests/minute) is one
+bucket shared by all visitors, and one client can lock everyone out. Nginx
+believes that header only from Cloudflare's edge ranges
+(`cloudflare-real-ip.conf`) and from the connector side of `wpops-edge`
+(`connector-real-ip.conf`).
+
+- **Managed stacks**: wpops creates `wpops-edge` as `10.214.255.0/24`. Only
+  the connectors and each stack's Nginx are on it. WordPress, WP-CLI,
+  MariaDB and Redis are not, so PHP code cannot claim another IP. The
+  gateway `10.214.255.1` is not trusted: requests to the loopback-published
+  port (`127.0.0.1:<HTTP_PORT>`) and from the host come from it and keep
+  their own address. Keep that port on loopback.
+- **Nodes created before v0.0.4** have a `wpops-edge` with a Docker-assigned
+  subnet. `wpops stack up` and `wpops tunnels ensure` warn about this, and
+  until it is fixed, behind-the-tunnel logins still share one bucket.
+  Recreating the network briefly takes the sites down:
+  ```bash
+  docker compose -p wpops-<node>-tunnels -f docker-compose.wpops-tunnels.json down
+  wpops stack compose <name> down          # every managed stack; data stays on disk
+  docker network rm wpops-edge
+  wpops tunnels ensure                     # recreates 10.214.255.0/24, starts connectors
+  wpops stack up <name>                    # every managed stack
+  ```
+- **Legacy root stack** (Nginx on `<project>_frontend`): Docker picked that
+  subnet, so it cannot ship in the repo. Look it up and trust it in a
+  node-local file (`*.local.conf` is gitignored and read by every Nginx on
+  the node):
+  ```bash
+  docker network inspect <project>_frontend --format '{{range .IPAM.Config}}{{.Subnet}}{{end}}'
+  echo 'set_real_ip_from <that subnet>;' > config/nginx/conf.d/real-ip.local.conf
+  docker compose exec nginx nginx -s reload
+  ```
+  The legacy WordPress and `cf-backup` containers and that network's gateway
+  (the loopback port) share this subnet and could also set the header. This
+  only lets them pick the address they are rate limited as, but if that is
+  not acceptable, move the legacy site to a managed stack instead.
+
 ## 4. Cloudflare routes and failover
 
 ```bash

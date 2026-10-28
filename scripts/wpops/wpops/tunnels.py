@@ -89,7 +89,8 @@ def ensure(start: bool = True, log=print) -> dict[str, Any]:
             "deploy": {"resources": {"limits": {"memory": "128M"}}},
         }
     services["cf-backup"] = {
-        "image": "alpine:3.23", "restart": "unless-stopped", "networks": ["edge"],
+        # Not on the edge network: only connectors may send CF-Connecting-IP there.
+        "image": "alpine:3.23", "restart": "unless-stopped",
         "volumes": [f"{REPO_DIR}/scripts:/app/scripts:ro", f"{REPO_DIR}/config:/app/config:ro",
                     f"{REPO_DIR}/data/cloudflare/backups:/app/data/cloudflare/backups",
                     f"{REPO_DIR}/.env:/app/.env:ro"],

@@ -542,5 +542,79 @@ out({'status': 'active'})
         conf=(ROOT/'config/nginx/conf.d/default.conf').read_text()
         self.assertRegex(conf,r'location = /wp-content/wpops-host-aliases\.json \{\s*deny all;')
 
+    def test_edge_network_subnet_matches_trusted_connector_ranges(self):
+        import ipaddress, re
+        conf=(ROOT/'config/nginx/conf.d/connector-real-ip.conf').read_text()
+        trusted=[ipaddress.ip_network(c) for c in re.findall(r'^set_real_ip_from (\S+);',conf,re.M)]
+        edge=ipaddress.ip_network(stacks.EDGE_SUBNET)
+        hosts=set(edge.hosts())
+        covered={ip for n in trusted for ip in n if ip in hosts}
+        # every connector address except the gateway (.1), nothing outside the edge network
+        self.assertEqual(covered,hosts-{next(edge.hosts())})
+        self.assertTrue(all(n.subnet_of(edge) for n in trusted))
+        for st in range(1,255):   # no stack frontend/backend network overlaps it
+            self.assertFalse(ipaddress.ip_network(f'10.214.{st}.0/24').overlaps(edge))
+        calls=[]
+        def run(cmd,**kw):
+            calls.append(cmd);return subprocess.CompletedProcess(cmd,1 if cmd[2]=='inspect' else 0,'','')
+        with patch.object(provision.subprocess,'run',side_effect=run):
+            self.assertIsNone(provision.ensure_edge())
+        self.assertEqual(calls[-1],['docker','network','create','--subnet','10.214.255.0/24','wpops-edge'])
+        with patch.object(provision.subprocess,'run',return_value=subprocess.CompletedProcess([],0,'172.20.0.0/16 ','')):
+            self.assertIn('172.20.0.0/16',provision.ensure_edge())
+
+    def test_tunnel_backup_container_is_not_on_edge_network(self):
+        from unittest.mock import MagicMock
+        cf=MagicMock();cf.verify_token.return_value={'status':'active'};cf.tunnel.return_value={'id':'tid'};cf.tunnel_token.return_value='t'
+        accounts={'customer':config.CfAccount(1,'customer','acct','secret')}
+        with patch.object(tunnels,'Cloudflare',return_value=cf), patch.object(tunnels,'cf_accounts',return_value=accounts),patch.object(tunnels,'load_env',return_value={}):
+            tunnels.ensure(start=False,log=lambda _:None)
+        doc=json.loads((self.root/'docker-compose.wpops-tunnels.json').read_text())
+        self.assertNotIn('networks',doc['services']['cf-backup'])
+        self.assertIn('edge',doc['services']['cloudflared-customer']['networks'])
+
+    @unittest.skipUnless(os.environ.get('WPOPS_TEST_NGINX') and shutil.which('unshare') and shutil.which('ip') and shutil.which('curl'),
+                         'set WPOPS_TEST_NGINX to an nginx binary (needs unshare/ip/curl for a private network namespace)')
+    def test_live_nginx_rate_limits_real_visitor_only_from_connectors(self):
+        if subprocess.run(['unshare','-rn','true'],capture_output=True).returncode:
+            self.skipTest('no permission for a private network namespace')
+        nginx=os.environ['WPOPS_TEST_NGINX'];conf=self.root/'nginx';
+        for d in ('conf.d','wpops','wpops-http','logs','tmp','www'): (conf/d).mkdir(parents=True)
+        mime=Path(nginx).resolve().parents[2]/'etc/nginx/mime.types'
+        (conf/'mime.types').write_text(mime.read_text() if mime.exists() else 'types { text/html html; }\n')
+        (conf/'fastcgi_params').write_text('')
+        for f in (ROOT/'config/nginx/conf.d').glob('*.conf'):
+            text=f.read_text().replace('wordpress:9000','127.0.0.1:9').replace('listen 80;','listen 127.0.0.1:18099;')
+            (conf/'conf.d'/f.name).write_text(text.replace('/var/www/html',str(conf/'www')).replace('/etc/nginx',str(conf)))
+        main=(ROOT/'config/nginx/nginx.production.conf').read_text().replace('/etc/nginx',str(conf))
+        main=main.replace('user  nginx;','user root root;').replace('/var/log/nginx',str(conf/'logs')).replace('/var/run/nginx.pid',str(conf/'nginx.pid'))
+        temp=' '.join(f'{k}_temp_path {conf}/tmp/{k};' for k in ('client_body','proxy','fastcgi','uwsgi','scgi'))
+        main=main.replace('http {','http {\n    '+temp,1).replace("'$remote_addr ","'$remote_addr|$status ")
+        (conf/'nginx.conf').write_text(main)
+        script=r"""set -e
+ip link set lo up
+for a in 10.214.255.5 10.214.255.1 10.214.1.5; do ip addr add $a/32 dev lo; done
+"$1" -t -c "$2/nginx.conf" -e "$2/logs/error.log"
+"$1" -c "$2/nginx.conf" -e "$2/logs/error.log"
+sleep 0.5
+for src in 10.214.255.5 10.214.255.1 10.214.1.5; do
+  for n in $(seq 1 13); do
+    curl -s -o /dev/null --interface $src -H "CF-Connecting-IP: 198.51.100.$n" http://127.0.0.1:18099/wp-login.php
+  done
+done
+"$1" -c "$2/nginx.conf" -e "$2/logs/error.log" -s stop
+"""
+        r=subprocess.run(['unshare','-rn','bash','-c',script,'t',nginx,str(conf)],capture_output=True,text=True,timeout=60)
+        self.assertEqual(r.returncode,0,r.stdout+r.stderr)
+        lines=[l.split(' ',1)[0].split('|') for l in (conf/'logs/access.log').read_text().splitlines()]
+        connector,gateway,php=lines[:13],lines[13:26],lines[26:]
+        # From a connector: each visitor is its own client, nobody is rate limited.
+        self.assertEqual([a for a,_ in connector],[f'198.51.100.{n}' for n in range(1,14)])
+        self.assertNotIn('429',[s for _,s in connector])
+        # From the gateway (loopback port) or a frontend container: the header is ignored.
+        for src,rows in (('10.214.255.1',gateway),('10.214.1.5',php)):
+            self.assertEqual({a for a,_ in rows},{src})
+            self.assertIn('429',[s for _,s in rows])
+
 
 if __name__=='__main__': unittest.main()

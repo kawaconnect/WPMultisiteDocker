@@ -8,6 +8,7 @@ import re
 import secrets
 import shutil
 import subprocess
+import sys
 import urllib.request
 import zipfile
 from pathlib import Path
@@ -109,11 +110,24 @@ def create(name: str, mode: str, domain: str, port: int, login_path: str = '',
     return {'stack': name, **entry, 'login_path': slug, 'next': f'wpops stack init {name}'}
 
 
-def ensure_edge() -> None:
+def ensure_edge() -> str | None:
+    """Create wpops-edge with its fixed subnet. Returns a warning when an older
+    network with another subnet exists (Nginx then cannot tell connectors apart)."""
+    from .stacks import EDGE_NETWORK, EDGE_SUBNET
     with state.locked('edge-network'):
-        r = subprocess.run(['docker', 'network', 'inspect', 'wpops-edge'], capture_output=True)
+        r = subprocess.run(['docker', 'network', 'inspect', EDGE_NETWORK, '--format',
+                            '{{range .IPAM.Config}}{{.Subnet}} {{end}}'], capture_output=True, text=True)
         if r.returncode:
-            subprocess.run(['docker', 'network', 'create', 'wpops-edge'], check=True, capture_output=True)
+            subprocess.run(['docker', 'network', 'create', '--subnet', EDGE_SUBNET, EDGE_NETWORK],
+                           check=True, capture_output=True)
+            return None
+        if EDGE_SUBNET not in (r.stdout or '').split():
+            warning = (f'{EDGE_NETWORK} uses {(r.stdout or "").strip() or "an unknown subnet"}, not {EDGE_SUBNET}: '
+                       'login rate limits cannot see visitor IPs behind the tunnel. '
+                       'Recreate it (docs/deployments.md, "Visitor IPs behind the tunnel").')
+            print('warning: ' + warning, file=sys.stderr)
+            return warning
+        return None
 
 
 

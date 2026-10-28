@@ -119,6 +119,10 @@ def install_host_alias(origin: Origin, name: str, log=print) -> dict[str, Any]:
 
 
 EDGE_NETWORK = "wpops-edge"
+# Fixed so Nginx can trust CF-Connecting-IP from the connectors on it
+# (config/nginx/conf.d/connector-real-ip.conf). Outside the stacks' own
+# 10.214.1-254.x networks.
+EDGE_SUBNET = "10.214.255.0/24"
 
 
 def compose_project(stack_cfg: dict[str, Any]) -> str:

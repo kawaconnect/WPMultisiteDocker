@@ -467,3 +467,5 @@ docker compose down && docker compose up -d --force-recreate
 ## Updating Cloudflare IP Ranges
 
 The file `config/nginx/conf.d/cloudflare-real-ip.conf` contains Cloudflare's IP ranges for restoring real visitor IPs. These should be periodically verified against https://www.cloudflare.com/ips/.
+
+Traffic that arrives through a tunnel comes from the cloudflared connectors. `config/nginx/conf.d/connector-real-ip.conf` trusts `CF-Connecting-IP` from the connector side of the `wpops-edge` network (10.214.255.0/24), so login rate limits apply per visitor. For nodes created before v0.0.4 and for the legacy root stack, see "Visitor IPs behind the tunnel" in [docs/deployments.md](docs/deployments.md).
