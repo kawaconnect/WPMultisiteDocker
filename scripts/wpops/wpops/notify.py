@@ -16,6 +16,15 @@ from .config import load_env, node_config
 EVENTS_FILE = state.STATE_DIR / "events.jsonl"
 
 
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):  # noqa: D401
+        return None
+
+
+# The webhook token must not follow a redirect to another host or scheme.
+_OPENER = urllib.request.build_opener(_NoRedirect())
+
+
 def record_event(kind: str, data: dict[str, Any]) -> dict[str, Any]:
     """Append to state/events.jsonl; the bot reads these through the API."""
     state.ensure_dirs()
@@ -90,7 +99,7 @@ def post_webhook(event: dict[str, Any]) -> dict[str, Any]:
         headers["Authorization"] = "Bearer " + env["WPOPS_WEBHOOK_TOKEN"]
     req = urllib.request.Request(url, data=json.dumps(event).encode(), headers=headers, method="POST")
     try:
-        with urllib.request.urlopen(req, timeout=20) as resp:
+        with _OPENER.open(req, timeout=20) as resp:
             return {"posted": True, "status": resp.status}
     except Exception as exc:  # noqa: BLE001
         return {"posted": False, "reason": str(exc)}

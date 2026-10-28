@@ -111,19 +111,23 @@ if [ ${#ALL_DOMAIN_NAMES[@]} -gt 0 ]; then
     read -r toggle_input
 
     while [ -n "$toggle_input" ]; do
-        idx=$((toggle_input - 1))
+        # Digits only: anything else would be evaluated as a shell arithmetic expression.
+        idx=-1
+        [[ "$toggle_input" =~ ^[0-9]{1,4}$ ]] && idx=$((10#$toggle_input - 1))
         if [ "$idx" -ge 0 ] && [ "$idx" -lt ${#ALL_DOMAIN_NAMES[@]} ]; then
             local_domain="${ALL_DOMAIN_NAMES[$idx]}"
             acct_n="${ALL_DOMAIN_ACCT_N[$idx]}"
 
-            # Escape dots in domain for use in sed patterns
-            local_domain_escaped="${local_domain//./\\.}"
-
             if [ "${ALL_DOMAIN_FAILOVER[$idx]}" = "true" ]; then
-                # Remove domain from failover list
+                # Remove exactly this domain from the failover list (a substring
+                # edit would also cut it out of e.g. "shop.a.com" when removing "a.com")
                 ALL_DOMAIN_FAILOVER[$idx]="false"
                 current=$(get_account_var "$acct_n" FAILOVER)
-                new=$(echo "$current" | sed "s/$local_domain_escaped//" | sed 's/,,/,/g' | sed 's/^,//;s/,$//')
+                new=""
+                IFS=',' read -ra failover_list <<< "$current"
+                for entry in "${failover_list[@]}"; do
+                    [ -n "$entry" ] && [ "$entry" != "$local_domain" ] && new="${new:+$new,}$entry"
+                done
                 if grep -q "^CF_ACCOUNT_${acct_n}_FAILOVER=" "$ENV_FILE"; then
                     sed -i "s/^CF_ACCOUNT_${acct_n}_FAILOVER=.*/CF_ACCOUNT_${acct_n}_FAILOVER=$new/" "$ENV_FILE"
                 else
@@ -243,6 +247,9 @@ echo ""
 echo "[6/7] Generating docker-compose.tunnels.yml..."
 
 COMPOSE_TUNNELS="$PROJECT_DIR/docker-compose.tunnels.yml"
+# The file carries every connector token: create it private (0600).
+( umask 077; : > "$COMPOSE_TUNNELS" )
+chmod 600 "$COMPOSE_TUNNELS"
 
 # Derive network name from project directory (same convention as docker compose)
 PROJECT_NAME=$(basename "$PROJECT_DIR" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9_-]//g')

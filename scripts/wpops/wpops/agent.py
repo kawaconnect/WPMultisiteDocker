@@ -36,6 +36,29 @@ class ApiError(Exception):
         self.status = status
 
 
+def _int_arg(q: dict[str, str], key: str, default: int) -> int:
+    try:
+        return int(q.get(key, default))
+    except ValueError:
+        raise ApiError(400, f"{key} must be an integer") from None
+
+
+def _str_list(value: Any, what: str) -> list[str] | None:
+    """None, or a list of strings (anything else is a 400)."""
+    if value is None:
+        return None
+    if not isinstance(value, list) or not all(isinstance(v, str) for v in value):
+        raise ApiError(400, f"{what} must be a list of strings")
+    return value
+
+
+def _set_ref(body: dict[str, Any]) -> str:
+    ref = body.get("set")
+    if not isinstance(ref, str) or not ref:
+        raise ApiError(400, "set must be a <source>/<set-id> string")
+    return ref
+
+
 def token_hash() -> str:
     return TOKEN_FILE.read_text(encoding="utf-8").strip() if TOKEN_FILE.exists() else ""
 
@@ -43,8 +66,9 @@ def token_hash() -> str:
 def rotate_token() -> str:
     state.ensure_dirs()
     tok = secrets.token_urlsafe(36)
-    TOKEN_FILE.write_text(hashlib.sha256(tok.encode()).hexdigest() + "\n", encoding="utf-8")
-    TOKEN_FILE.chmod(0o600)
+    # Atomic replace: a running agent reads the hash on every request, so the
+    # old token stops working at once and no request sees a half-written file.
+    state.write_private_text(TOKEN_FILE, hashlib.sha256(tok.encode()).hexdigest() + "\n")
     state.audit("local", "token.rotate")
     return tok
 
@@ -146,7 +170,7 @@ class Agent:
             if p == ["backups", "schedule"]:
                 return bk.schedule_info()
             if p == ["jobs"]:
-                return {"jobs": jobs.list_jobs(int(q1.get("limit", "30")), q1.get("kind"))}
+                return {"jobs": jobs.list_jobs(_int_arg(q1, "limit", 30), q1.get("kind"))}
             if len(p) == 2 and p[0] == "jobs":
                 j = jobs.get(p[1])
                 if not j:
@@ -155,9 +179,9 @@ class Agent:
             if len(p) == 3 and p[0] == "jobs" and p[2] == "log":
                 if not p[1].replace("-", "").isalnum():
                     raise ApiError(400, "bad job id")
-                return {"log": jobs.tail(p[1], max(1, min(int(q1.get("lines", "80")), 2000)))}
+                return {"log": jobs.tail(p[1], max(1, min(_int_arg(q1, "lines", 80), 2000)))}
             if p == ["events"]:
-                return {"events": notify.recent_events(int(q1.get("since", "0")), int(q1.get("limit", "100")))}
+                return {"events": notify.recent_events(_int_arg(q1, "since", 0), _int_arg(q1, "limit", 100))}
             raise ApiError(404, "not found")
         if method == "POST":
             if p == ["failover", "plan"]:
@@ -183,17 +207,28 @@ class Agent:
                 return {"job": job.id}
             if p == ["backups", "pull"]:
                 source = body.get("source") or ""
-                if source not in self.inv.sources():
+                if not isinstance(source, str) or source not in self.inv.sources():
                     raise ApiError(400, "unknown source")
+                label, nonce = body.get("label", ""), body.get("nonce")
+                if not isinstance(label, str) or (nonce is not None and not isinstance(nonce, str)):
+                    raise ApiError(400, "label and nonce must be strings")
+                entities = _str_list(body.get("entities"), "entities")
                 if jobs.active("backup.pull"):
                     raise ApiError(409, "a pull is already running")
-                job = jobs.Job("backup.pull", {"source": source, "label": body.get("label", "")}, actor)
-                jobs.start_background(job, lambda j: bk.pull(j, self.inv, source, body.get("label", ""),
-                                                             fresh=body.get("fresh", True), nonce=body.get("nonce"),
-                                                             entities=body.get("entities"), db=body.get("db", True)))
+                job = jobs.Job("backup.pull", {"source": source, "label": label}, actor)
+                jobs.start_background(job, lambda j: bk.pull(j, self.inv, source, label,
+                                                             fresh=bool(body.get("fresh", True)), nonce=nonce,
+                                                             entities=entities, db=bool(body.get("db", True))))
                 return {"job": job.id}
             if p == ["backups", "prune"]:
-                return {"removed": bk.prune(body.get("source"), body.get("retain"), body.get("dry_run", False), log=lambda s: None)}
+                source = body.get("source")
+                if source is not None and not isinstance(source, str):
+                    raise ApiError(400, "source must be a string")
+                retain = body.get("retain")
+                # retain=0 (or a negative number) would delete every unkept set.
+                if retain is not None and (not isinstance(retain, int) or isinstance(retain, bool) or retain < 1 or retain > 365):
+                    raise ApiError(400, "retain must be an integer 1-365")
+                return {"removed": bk.prune(source or None, retain, bool(body.get("dry_run", False)), log=lambda s: None)}
             if p == ["backups", "schedule"]:
                 schedule = body.get("schedule")
                 if schedule is not None and not isinstance(schedule, str):
@@ -210,24 +245,25 @@ class Agent:
                         raise ApiError(400, f"unknown sources: {', '.join(unknown)}")
                 return bk.set_schedule(schedule, retain, sources)
             if p == ["backups", "keep"]:
-                return {"manifest": bk.mark_keep(body["set"], bool(body.get("keep", True)))}
+                return {"manifest": bk.mark_keep(_set_ref(body), bool(body.get("keep", True)))}
             if p == ["backups", "delete"]:
-                ref = body["set"]
+                ref = _set_ref(body)
                 bk.delete_set(ref)
                 state.audit(actor, "backup.delete", {"set": ref})
                 return {"deleted": ref}
             if p == ["restore", "apply"]:
                 set_ref = body.get("set") or ""
                 stack = body.get("stack") or ""
-                if not set_ref or not stack:
+                if not set_ref or not stack or not isinstance(set_ref, str) or not isinstance(stack, str):
                     raise ApiError(400, "set and stack are required")
                 sel = self._selection(body)
+                entities = _str_list(body.get("entities"), "entities")
                 if jobs.active("restore.apply"):
                     raise ApiError(409, "a restore is already running")
                 job = jobs.Job("restore.apply", {"set": set_ref, "stack": stack, **{k: v for k, v in sel.items() if v}}, actor)
                 jobs.start_background(job, lambda j: restore.apply(
                     j, self.inv, self.node(), set_ref, stack, sites=sel["sites"], all_sites=sel["all"],
-                    entities=body.get("entities")))
+                    entities=entities))
                 return {"job": job.id}
             if p == ["notify", "test"]:
                 return notify.notify("test", "[wpops] test notification", "This is a test from the wpops agent.", {})
@@ -238,6 +274,7 @@ class Agent:
         sites = body.get("sites") or []
         if isinstance(sites, str):
             sites = [s.strip() for s in sites.split(",") if s.strip()]
+        _str_list(sites, "sites")
         return {"sites": sites, "all": bool(body.get("all"))}
 
     def _plan(self, body: dict[str, Any]) -> failover.Plan:
@@ -276,8 +313,6 @@ class Agent:
 
 
 def make_handler(agent: Agent) -> type[BaseHTTPRequestHandler]:
-    expected = token_hash()
-
     class Handler(BaseHTTPRequestHandler):
         server_version = f"wpops/{__version__}"
         protocol_version = "HTTP/1.1"
@@ -308,6 +343,9 @@ def make_handler(agent: Agent) -> type[BaseHTTPRequestHandler]:
 
         def _auth(self) -> bool:
             auth = self.headers.get("Authorization", "")
+            # Read on every request so `wpops token rotate` revokes the old
+            # token without restarting the agent.
+            expected = token_hash()
             if not auth.startswith("Bearer ") or not expected:
                 return False
             given = hashlib.sha256(auth[7:].strip().encode()).hexdigest()
@@ -385,6 +423,9 @@ def serve(extra_binds: list[str] | None = None) -> None:
     port = int(agent.cfg["agent"].get("port", 8787))
     binds = list(dict.fromkeys((agent.cfg["agent"].get("bind") or ["127.0.0.1"]) + (extra_binds or [])))
     os.umask(0o077)  # every file the agent creates starts private
+    reaped = jobs.reap_stale()
+    if reaped:
+        state.audit("local", "jobs.reap", {"jobs": reaped})
     handler = make_handler(agent)
     servers = []
     for b in binds:

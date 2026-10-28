@@ -216,13 +216,21 @@ def list_sets(source: str | None = None) -> list[dict[str, Any]]:
             except json.JSONDecodeError:
                 continue
             size = sum(int(f.get("size", 0)) for f in man.get("files", []))
-            complete = all((d / f["name"]).exists() for f in man.get("files", []))
+            # Complete = every file present AND the pull finished its checksum
+            # verification (pulled_at). A set that failed verification is not
+            # restorable and must not count toward retention.
+            complete = bool(man.get("pulled_at")) and all((d / f["name"]).exists() for f in man.get("files", []))
+            try:
+                # Last write in the set (a running download keeps touching its .part file).
+                updated = max(p.stat().st_mtime for p in d.iterdir())
+            except (OSError, ValueError):
+                updated = 0
             out.append({
                 "id": f"{src.name}/{d.name}", "source": src.name, "set": d.name, "nonce": man.get("nonce"),
                 "timestamp": man.get("timestamp"), "label": man.get("label", ""), "size": size,
                 "files": len(man.get("files", [])), "complete": complete, "keep": bool(man.get("keep")),
                 "pulled_at": man.get("pulled_at"), "sites": len(man.get("sites", [])),
-                "mode": man.get("mode", ""), "applied": man.get("applied", []),
+                "mode": man.get("mode", ""), "applied": man.get("applied", []), "updated": int(updated),
             })
     return out
 
@@ -272,8 +280,9 @@ def prune(source: str | None = None, retain: int | None = None, dry_run: bool = 
             if s["keep"]:
                 continue
             if not s["complete"]:
-                # incomplete and older than a day: junk
-                if time.time() - (s.get("pulled_at") or 0) > 86400:
+                # Incomplete and untouched for a day: junk. A pull in progress
+                # (or one that failed today) is left alone.
+                if time.time() - (s.get("pulled_at") or s.get("updated") or 0) > 86400:
                     log(f"prune {s['id']} (incomplete)")
                     if not dry_run:
                         delete_set(s["id"])

@@ -9,6 +9,7 @@ polls `jobs get`.
 from __future__ import annotations
 
 import json
+import os
 import secrets
 import threading
 import time
@@ -21,6 +22,35 @@ from .config import STATE_DIR
 
 JOBS_DIR = STATE_DIR / "jobs"
 TERMINAL = {"succeeded", "failed", "cancelled"}
+# A queued/running record from before jobs carried an owner is treated as
+# abandoned once it is this old (longer than any pull or restore can take).
+LEGACY_STALE_SECONDS = 24 * 3600
+
+
+def _proc_start(pid: int) -> str | None:
+    """Kernel start time of a process (tells a live process from a reused pid), or None."""
+    try:
+        with open(f"/proc/{pid}/stat", encoding="utf-8") as fh:
+            fields = fh.read().rsplit(")", 1)[1].split()
+        return fields[19]
+    except (OSError, IndexError):
+        return None
+
+
+def _owner() -> dict[str, Any]:
+    return {"pid": os.getpid(), "start": _proc_start(os.getpid())}
+
+
+def is_stale(j: dict[str, Any], now: float | None = None) -> bool:
+    """True for a queued/running record whose process has gone (agent restart, crash, killed CLI)."""
+    if j.get("status") not in ("queued", "running"):
+        return False
+    owner = j.get("owner")
+    if isinstance(owner, dict) and owner.get("pid"):
+        if owner.get("start") is None:
+            return False  # no /proc when the job was created: cannot tell
+        return _proc_start(int(owner["pid"])) != owner["start"]
+    return (now or time.time()) - int(j.get("created") or 0) > LEGACY_STALE_SECONDS
 
 
 class Job:
@@ -36,6 +66,7 @@ class Job:
         self.progress: dict[str, Any] = {}
         self.result: Any = None
         self.error: str = ""
+        self.owner = _owner()
         self._log_fh = None
         self._lock = threading.Lock()
         self.save()
@@ -54,7 +85,7 @@ class Job:
             "id": self.id, "kind": self.kind, "params": self.params, "actor": self.actor,
             "status": self.status, "created": self.created, "started": self.started,
             "finished": self.finished, "progress": self.progress, "result": self.result,
-            "error": self.error, "terminal": self.status in TERMINAL,
+            "error": self.error, "terminal": self.status in TERMINAL, "owner": self.owner,
         }
 
     def save(self) -> None:
@@ -121,11 +152,29 @@ def start_background(job: Job, fn: Callable[[Job], Any], on_done: Callable[[Job]
 
 
 def active(kind: str | None = None) -> list[dict[str, Any]]:
+    """Queued/running jobs whose process is still alive. A record left behind by
+    a restarted agent must not block every later pull or restore."""
     out = []
     for j in list_jobs(limit=200):
-        if j["status"] in ("queued", "running") and (kind is None or j["kind"] == kind):
+        if j["status"] in ("queued", "running") and (kind is None or j["kind"] == kind) and not is_stale(j):
             out.append(j)
     return out
+
+
+def reap_stale() -> list[str]:
+    """Mark abandoned queued/running records as failed (called at agent start)."""
+    reaped = []
+    for f in sorted(JOBS_DIR.glob("*.json")) if JOBS_DIR.exists() else []:
+        try:
+            j = json.loads(f.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if isinstance(j, dict) and is_stale(j):
+            j.update(status="failed", terminal=True, finished=j.get("finished") or int(time.time()),
+                     error=j.get("error") or "interrupted: the process running this job exited")
+            state.write_json(f, j)
+            reaped.append(str(j.get("id", f.stem)))
+    return reaped
 
 
 def get(job_id: str) -> dict[str, Any] | None:

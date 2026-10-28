@@ -81,6 +81,7 @@ declare -a PLAN_RECORD_IDS=()
 declare -a PLAN_NAMES=()
 declare -a PLAN_PROXIED=()
 declare -a PLAN_TUNNEL_IDS=()
+declare -a PLAN_CONTENTS=()    # current CNAME target (restored if the A record cannot be created)
 PLAN_COUNT=0
 
 for ((n = 1; n <= ACCOUNT_COUNT; n++)); do
@@ -138,6 +139,7 @@ for ((n = 1; n <= ACCOUNT_COUNT; n++)); do
             PLAN_NAMES+=("$record_name")
             PLAN_PROXIED+=("$record_proxied")
             PLAN_TUNNEL_IDS+=("${tunnel_id:-unknown}")
+            PLAN_CONTENTS+=("$record_content")
             PLAN_COUNT=$((PLAN_COUNT + 1))
         done
     done
@@ -171,41 +173,17 @@ echo ""
 
 confirm_yes "You are about to modify $PLAN_COUNT live DNS record(s). Proceed?"
 
-# ── Step 6: Reset tunnel ingress first ───────────────────────────────────────
+# ── Step 6: Execute DNS changes ──────────────────────────────────────────────
 
-echo "[4/5] Resetting tunnel ingress..."
-
-# Clear ingress only for the hostnames actually being rolled back on each
-# tunnel, NOT a blind wipe. A tunnel may carry unrelated standing rules
-# (e.g. the standby account's own *.STANDBY_DOMAIN wildcard) that must
-# survive a rollback of one of its other (production-domain) hosts.
-declare -A HOSTS_BY_TUNNEL
-declare -A ACCOUNT_BY_TUNNEL
-for ((p = 0; p < PLAN_COUNT; p++)); do
-    tid="${PLAN_TUNNEL_IDS[$p]}"
-    [ "$tid" = "unknown" ] && continue
-    HOSTS_BY_TUNNEL[$tid]+="${PLAN_NAMES[$p]} "
-    ACCOUNT_BY_TUNNEL[$tid]="${PLAN_ACCOUNTS[$p]}"
-done
-
-for tunnel_id in "${!HOSTS_BY_TUNNEL[@]}"; do
-    acct_n="${ACCOUNT_BY_TUNNEL[$tunnel_id]}"
-    account_id=$(get_account_var "$acct_n" ID)
-    api_token=$(get_account_var "$acct_n" TOKEN)
-    hosts="${HOSTS_BY_TUNNEL[$tunnel_id]}"
-    host_count=$(echo "$hosts" | wc -w)
-    log_info "Clearing ingress for $host_count hostname(s) (unrelated rules preserved)"
-    remove_tunnel_ingress_hosts "$account_id" "$api_token" "$tunnel_id" "$hosts" >/dev/null
-    log_ok "Tunnel ingress updated"
-done
-
-# ── Step 7: Execute DNS changes ──────────────────────────────────────────────
-
+# DNS first, ingress after: a hostname whose record could not be restored
+# (and was put back on its tunnel CNAME) keeps its tunnel route.
 echo ""
-echo "[5/5] Restoring DNS records..."
+echo "[4/5] Restoring DNS records..."
 echo ""
 
 RESTORED=()
+declare -A HOSTS_BY_TUNNEL
+declare -A ACCOUNT_BY_TUNNEL
 
 for ((p = 0; p < PLAN_COUNT; p++)); do
     acct_n="${PLAN_ACCOUNTS[$p]}"
@@ -220,11 +198,10 @@ for ((p = 0; p < PLAN_COUNT; p++)); do
     # Delete the CNAME
     delete_dns_record "$zone_id" "$api_token" "$record_id"
 
-    # Create A record; if this fails, attempt to restore original CNAME
+    # Create A record; if this fails, put back the exact CNAME that was there
     if ! create_dns_a "$zone_id" "$api_token" "$record_name" "$CLOUD_IP" "$record_proxied" >/dev/null; then
         log_error "Failed to create A record for $record_name, attempting to restore original CNAME"
-        tunnel_id_for_restore="${PLAN_TUNNEL_IDS[$p]}"
-        cname_target_restore="${tunnel_id_for_restore}.cfargotunnel.com"
+        cname_target_restore="${PLAN_CONTENTS[$p]}"
         if create_dns_cname "$zone_id" "$api_token" "$record_name" "$cname_target_restore" "$record_proxied" >/dev/null; then
             log_ok "Restored original CNAME for $record_name"
         else
@@ -235,7 +212,36 @@ for ((p = 0; p < PLAN_COUNT; p++)); do
 
     RESTORED+=("$record_name")
     PARTIALLY_RESTORED+=("$record_name")
+    tid="${PLAN_TUNNEL_IDS[$p]}"
+    if [ "$tid" != "unknown" ]; then
+        HOSTS_BY_TUNNEL[$tid]+="$record_name "
+        ACCOUNT_BY_TUNNEL[$tid]="$acct_n"
+    fi
     log_ok "Restored: $record_name → $CLOUD_IP"
+done
+
+# ── Step 7: Remove tunnel ingress for the restored hostnames ─────────────────
+
+echo ""
+echo "[5/5] Cleaning tunnel ingress..."
+
+# Only the hostnames actually rolled back on each tunnel, NOT a blind wipe.
+# A tunnel may carry unrelated standing rules (e.g. the standby account's own
+# *.STANDBY_DOMAIN wildcard) that must survive a rollback of one of its other
+# (production-domain) hosts.
+for tunnel_id in "${!HOSTS_BY_TUNNEL[@]}"; do
+    acct_n="${ACCOUNT_BY_TUNNEL[$tunnel_id]}"
+    account_id=$(get_account_var "$acct_n" ID)
+    api_token=$(get_account_var "$acct_n" TOKEN)
+    hosts="${HOSTS_BY_TUNNEL[$tunnel_id]}"
+    host_count=$(echo "$hosts" | wc -w)
+    log_info "Clearing ingress for $host_count hostname(s) (unrelated rules preserved)"
+    if remove_tunnel_ingress_hosts "$account_id" "$api_token" "$tunnel_id" "$hosts" >/dev/null; then
+        log_ok "Tunnel ingress updated"
+    else
+        # DNS is already back on production; a stale ingress rule is harmless.
+        log_warn "Could not clean tunnel ingress for: $hosts (DNS is restored; remove the rules later)"
+    fi
 done
 
 # ── Summary ───────────────────────────────────────────────────────────────────

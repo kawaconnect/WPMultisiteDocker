@@ -38,7 +38,7 @@ test:
     - chmod +x "$HOME/.docker/cli-plugins/docker-compose" && docker compose version
     - python3 -m unittest discover -s tests -v
     - find config/php plugin -name '*.php' -print0 | xargs -0 -n1 php -l
-    - bash -n scripts/cf-common.sh scripts/cf-backup.sh scripts/cf-status.sh
+    - for f in scripts/*.sh scripts/wpops/install-agent.sh; do bash -n "$f"; done
 
 release:
   extends: .linux

@@ -151,7 +151,7 @@ discover_account_zones() {
     local cache_file="$_CF_RUNTIME_CACHE/zones_${account_id}"
 
     # Return cached result if available
-    if [ -f "$cache_file" ]; then
+    if _cf_cache_ready && [ -f "$cache_file" ]; then
         cat "$cache_file"
         return
     fi
@@ -177,10 +177,19 @@ discover_account_zones() {
         ((page++))
     done
 
-    # Cache result
-    mkdir -p "$_CF_RUNTIME_CACHE"
-    echo "$all_zones" > "$cache_file"
+    # Cache result (only in a directory this user created; never through a
+    # directory or symlink someone else planted under the predictable name)
+    if _cf_cache_ready; then
+        echo "$all_zones" > "$cache_file"
+    fi
     echo "$all_zones"
+}
+
+# _cf_cache_ready, create the per-run cache dir privately; succeed only if it
+# is a real directory owned by this user.
+_cf_cache_ready() {
+    [ -e "$_CF_RUNTIME_CACHE" ] || mkdir -m 700 "$_CF_RUNTIME_CACHE" 2>/dev/null || true
+    [ -d "$_CF_RUNTIME_CACHE" ] && [ ! -L "$_CF_RUNTIME_CACHE" ] && [ -O "$_CF_RUNTIME_CACHE" ]
 }
 
 # is_domain_failover N DOMAIN, returns 0 (true) if domain is in failover list
@@ -265,7 +274,8 @@ require_backup() {
         read -ra domains <<< "$(get_account_domains "$n")"
         for domain in "${domains[@]}"; do
             local zone_id
-            zone_id=$(get_zone_id "$domain" "$api_token" 2>/dev/null)
+            # "|| ..." keeps set -e from ending the run before the error is counted
+            zone_id=$(get_zone_id "$domain" "$api_token" 2>/dev/null) || zone_id=""
             if [ -z "$zone_id" ]; then
                 log_error "Could not get zone ID for $domain"
                 backup_errors=$((backup_errors + 1))
@@ -276,7 +286,11 @@ require_backup() {
 
         # Backup tunnel config if tunnel exists
         local tunnel_json
-        tunnel_json=$(get_configured_tunnel "$account_id" "$api_token" "$name" 2>/dev/null)
+        if ! tunnel_json=$(get_configured_tunnel "$account_id" "$api_token" "$name" 2>/dev/null); then
+            log_error "Could not look up the tunnel for $name"
+            backup_errors=$((backup_errors + 1))
+            tunnel_json=""
+        fi
         if [ -n "$tunnel_json" ]; then
             local tunnel_id
             tunnel_id=$(echo "$tunnel_json" | jq -r '.id')
@@ -307,23 +321,29 @@ cf_api() {
     local url="$CF_API$path"
     local response http_code
 
+    # The token and the body (a tunnel secret, for create_tunnel) are passed
+    # through a file descriptor and stdin, never as arguments that any local
+    # user can read in the process list.
     local curl_args=(
         -s
+        --connect-timeout 15
+        --max-time 120
         -w "\n%{http_code}"
         -X "$method"
-        -H "Authorization: Bearer $token"
         -H "Content-Type: application/json"
     )
     if [ -n "$body" ]; then
-        curl_args+=(-d "$body")
+        curl_args+=(--data-binary @-)
     fi
 
-    response=$(curl "${curl_args[@]}" "$url")
+    # On a transport error curl still writes http_code 000, handled below.
+    response=$(printf '%s' "$body" | curl "${curl_args[@]}" \
+        -H @<(printf 'Authorization: Bearer %s\n' "$token") "$url") || true
     http_code=$(echo "$response" | tail -1)
     response=$(echo "$response" | sed '$d')
 
-    if [ "$http_code" -lt 200 ] || [ "$http_code" -ge 300 ]; then
-        log_error "CF API $method $path → HTTP $http_code"
+    if ! [[ "$http_code" =~ ^[0-9]+$ ]] || [ "$http_code" -lt 200 ] || [ "$http_code" -ge 300 ]; then
+        log_error "CF API $method $path → HTTP ${http_code:-none}"
         local err_detail
         err_detail=$(echo "$response" | jq -r '.errors[]?.message // empty' 2>/dev/null)
         if [ -n "$err_detail" ]; then

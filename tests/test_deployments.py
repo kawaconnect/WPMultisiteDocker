@@ -375,5 +375,172 @@ get_configured_tunnel acct dummy customer
             self.assertNotIn('COMPOSE_FILE',run.call_args.kwargs['env'])
             self.assertEqual(run.call_args.kwargs['cwd'],self.root/'one')
 
+    def test_rotated_agent_token_takes_effect_without_restart(self):
+        from wpops import agent
+        token_file=self.root/'state/agent-token.sha256'
+        with patch.object(agent,'TOKEN_FILE',token_file):
+            old=agent.rotate_token()
+            self.assertEqual(token_file.stat().st_mode & 0o777,0o600)
+            handler=agent.make_handler(type('A',(),{'node':lambda self:'n'})())
+            def auth(tok):
+                h=handler.__new__(handler);h.headers={'Authorization':'Bearer '+tok};return h._auth()
+            self.assertTrue(auth(old))
+            new=agent.rotate_token()
+            self.assertFalse(auth(old));self.assertTrue(auth(new))
+
+    def test_abandoned_job_records_do_not_block_pulls_or_restores(self):
+        from wpops import jobs
+        with patch.object(jobs,'JOBS_DIR',self.root/'state/jobs'):
+            live=jobs.Job('backup.pull',{},'test');live.status='running';live.save()
+            self.assertEqual([j['id'] for j in jobs.active('backup.pull')],[live.id])
+            dead=jobs.Job('restore.apply',{},'test');dead.status='running'
+            dead.owner={'pid':live.owner['pid'],'start':'not-this-process'};dead.save()
+            legacy=self.root/'state/jobs/20200101-000000-aaaaaa.json'
+            legacy.write_text(json.dumps({'id':'20200101-000000-aaaaaa','kind':'restore.apply','status':'running','created':1}))
+            self.assertEqual(jobs.active('restore.apply'),[])
+            self.assertEqual(sorted(jobs.reap_stale()),sorted([dead.id,'20200101-000000-aaaaaa']))
+            self.assertEqual(jobs.get(dead.id)['status'],'failed')
+            self.assertEqual(jobs.get(live.id)['status'],'running')
+
+    def test_prune_spares_running_pull_and_ignores_unverified_sets(self):
+        import time
+        backups=self.root/'backups'
+        def make(set_id,pulled,files=True,age=0):
+            d=backups/'src'/set_id;d.mkdir(parents=True)
+            if files: (d/'backup_a.zip').write_bytes(b'x')
+            (d/'manifest.json').write_text(json.dumps({'files':[{'name':'backup_a.zip','size':1}],'pulled_at':pulled}))
+            for f in d.iterdir(): os.utime(f,(time.time()-age,)*2)
+        make('20260101-0000-good1',1);make('20260102-0000-good2',1)
+        make('20260103-0000-unverified',None,age=3600)      # checksum failed this hour
+        make('20260104-0000-running',None,files=False)       # download in progress
+        make('20250101-0000-junk',None,files=False,age=3*86400)
+        with patch.object(backup,'BACKUPS_DIR',backups), patch.object(backup,'node_config',return_value={'backup':{'retain_sets':2}}):
+            rows={s['set']:s for s in backup.list_sets()}
+            self.assertFalse(rows['20260103-0000-unverified']['complete'])
+            self.assertEqual(backup.prune(log=lambda _:None),['src/20250101-0000-junk'])
+            self.assertTrue((backups/'src/20260104-0000-running').exists())
+            self.assertTrue((backups/'src/20260101-0000-good1').exists())
+
+    def test_agent_rejects_malformed_backup_requests(self):
+        from wpops.agent import Agent, ApiError
+        agent=Agent.__new__(Agent);agent.inv=self.inventory();agent.cfg={'node':'backup'};agent.reload=lambda:None
+        with patch.object(backup,'prune') as prune:
+            for body in ({'retain':0},{'retain':-1},{'retain':'2'},{'source':['x']}):
+                with self.assertRaises(ApiError) as e: agent.route('POST','/v1/backups/prune',{},body,'t')
+                self.assertEqual(e.exception.status,400)
+            prune.assert_not_called()
+        for path,body in (('/v1/backups/keep',{}),('/v1/backups/delete',{'set':5}),
+                          ('/v1/restore/apply',{'set':'a/b','stack':'s','entities':'db'}),
+                          ('/v1/restore/apply',{'set':'a/b','stack':'s','sites':[1]})):
+            with self.assertRaises(ApiError) as e: agent.route('POST',path,{},body,'t')
+            self.assertEqual(e.exception.status,400)
+        with self.assertRaises(ApiError) as e: agent.route('GET','/v1/jobs',{'limit':['x']},{},'t')
+        self.assertEqual(e.exception.status,400)
+
+    def _fake_cloudflare(self, accounts_env, **flags):
+        """Copy the Cloudflare scripts into a scratch project and put a fake curl/docker on PATH."""
+        proj=self.root/'cfproj';(proj/'scripts').mkdir(parents=True)
+        for f in (ROOT/'scripts').glob('cf-*.sh'): shutil.copy(f,proj/'scripts')
+        (proj/'.env').write_text('CF_STANDBY_DOMAIN=standby.example\nCF_CLOUD_IP=192.0.2.10\n'+accounts_env)
+        bin_dir=self.root/'fakebin';bin_dir.mkdir()
+        log=self.root/'curl.log'
+        (bin_dir/'curl').write_text('#!/usr/bin/env python3\n' + r"""
+import json, os, re, sys
+args = sys.argv[1:]
+method, url, headers, body = 'GET', args[-1], [], ''
+for i, a in enumerate(args):
+    if a == '-X': method = args[i + 1]
+    if a == '-H':
+        h = args[i + 1]
+        headers += open(h[1:]).read().splitlines() if h.startswith('@') else [h]
+    if a == '--data-binary' and args[i + 1] == '@-': body = sys.stdin.read()
+state = json.load(open(os.environ['FAKE_CF_STATE']))
+with open(os.environ['FAKE_CF_LOG'], 'a') as fh:
+    fh.write(json.dumps({'method': method, 'url': url, 'argv': args, 'headers': headers, 'body': body}) + '\n')
+def out(result, code=200, ok=True):
+    print(json.dumps({'success': ok, 'result': result, 'errors': [] if ok else [{'message': 'simulated'}],
+                      'result_info': {'total_pages': 1}}))
+    print(code)
+    sys.exit(0)
+path = url.split('/client/v4', 1)[1]
+if path.startswith('/zones?'):
+    name = re.search(r'name=([^&]+)', path)
+    out([{'id': 'zone-' + name.group(1), 'name': name.group(1)}] if name and name.group(1) in state['zones'] else [])
+if '/dns_records' in path:
+    zone = path.split('/')[2][5:]
+    recs = state['records'].get(zone, [])
+    if method == 'GET':
+        t = re.search(r'type=([A-Z]+)', path)
+        out([r for r in recs if not t or r['type'] == t.group(1)])
+    if method == 'DELETE':
+        rid = path.rsplit('/', 1)[1]
+        state['records'][zone] = [r for r in recs if r['id'] != rid]
+    if method == 'POST':
+        rec = json.loads(body)
+        if rec['type'] in state.get('fail_create', []): out(None, 400, False)
+        rec['id'] = 'new-' + rec['type']
+        state['records'].setdefault(zone, []).append(rec)
+    json.dump(state, open(os.environ['FAKE_CF_STATE'], 'w'))
+    out({})
+if '/cfd_tunnel?' in path: out([{'id': 'tun1', 'name': 'wp-docker-customer'}])
+if path.endswith('/configurations'):
+    if method == 'PUT':
+        state['ingress'] = json.loads(body)['config']['ingress']; json.dump(state, open(os.environ['FAKE_CF_STATE'], 'w'))
+    out({'config': {'ingress': state['ingress']}})
+out({'status': 'active'})
+""")
+        (bin_dir/'docker').write_text('#!/bin/sh\necho healthy\n')
+        for f in bin_dir.iterdir(): f.chmod(0o755)
+        cf_state=self.root/'cf-state.json';cf_state.write_text(json.dumps(flags))
+        env={**os.environ,'PATH':f'{bin_dir}:{os.environ["PATH"]}','FAKE_CF_LOG':str(log),'FAKE_CF_STATE':str(cf_state)}
+        def calls(): return [json.loads(l) for l in log.read_text().splitlines()] if log.exists() else []
+        return proj,env,calls,lambda: json.loads(cf_state.read_text())
+
+    ACCOUNT_ENV='CF_ACCOUNT_1_NAME=customer\nCF_ACCOUNT_1_ID=acct\nCF_ACCOUNT_1_TOKEN=secret-token-value\nCF_ACCOUNT_1_DOMAINS=good.example,missing.example\n'
+
+    @unittest.skipUnless(shutil.which('jq'), 'jq is needed for the Cloudflare shell scripts')
+    def test_shell_backup_survives_missing_zone_and_keeps_token_out_of_argv(self):
+        proj,env,calls,_=self._fake_cloudflare(self.ACCOUNT_ENV,zones=['good.example'],records={},ingress=[])
+        r=subprocess.run(['bash',str(proj/'scripts/cf-backup.sh')],env=env,capture_output=True,text=True,timeout=120)
+        self.assertEqual(r.returncode,0,r.stdout+r.stderr)
+        self.assertTrue(list((proj/'data/cloudflare/backups/dns/good.example').glob('*.json')))
+        self.assertTrue(calls())
+        for c in calls():
+            self.assertNotIn('secret-token-value',' '.join(c['argv']))
+            self.assertIn('Authorization: Bearer secret-token-value',c['headers'])
+
+    @unittest.skipUnless(shutil.which('jq'), 'jq is needed for the Cloudflare shell scripts')
+    def test_shell_failover_routes_tunnel_before_dns(self):
+        rec={'id':'a1','type':'A','name':'good.example','content':'192.0.2.10','proxied':True}
+        proj,env,calls,cf=self._fake_cloudflare(self.ACCOUNT_ENV.replace(',missing.example',''),zones=['good.example'],
+                                                records={'good.example':[rec]},ingress=[{'service':'http_status:404'}])
+        r=subprocess.run(['bash',str(proj/'scripts/cf-failover.sh')],env=env,input='FAILOVER\ny\n',capture_output=True,text=True,timeout=120)
+        self.assertEqual(r.returncode,0,r.stdout+r.stderr)
+        writes=[(c['method'],c['url'].rsplit('/',1)[1]) for c in calls() if c['method']!='GET']
+        self.assertEqual(writes[0],('PUT','configurations'))
+        self.assertEqual([w[0] for w in writes[1:]],['DELETE','POST'])
+        self.assertEqual(cf()['ingress'][0],{'hostname':'good.example','service':'http://nginx:80'})
+        self.assertEqual([(x['type'],x['content']) for x in cf()['records']['good.example']],[('CNAME','tun1.cfargotunnel.com')])
+
+    @unittest.skipUnless(shutil.which('jq'), 'jq is needed for the Cloudflare shell scripts')
+    def test_shell_rollback_keeps_tunnel_route_when_dns_restore_fails(self):
+        rec={'id':'c1','type':'CNAME','name':'good.example','content':'tun1.cfargotunnel.com','proxied':True}
+        ingress=[{'hostname':'good.example','service':'http://nginx:80'},{'service':'http_status:404'}]
+        proj,env,calls,cf=self._fake_cloudflare(self.ACCOUNT_ENV.replace(',missing.example',''),zones=['good.example'],
+                                                records={'good.example':[rec]},ingress=ingress,fail_create=['A'])
+        r=subprocess.run(['bash',str(proj/'scripts/cf-rollback.sh')],env=env,input='ROLLBACK\ny\n',capture_output=True,text=True,timeout=120)
+        self.assertEqual(r.returncode,0,r.stdout+r.stderr)
+        self.assertEqual([(x['type'],x['content']) for x in cf()['records']['good.example']],[('CNAME','tun1.cfargotunnel.com')])
+        self.assertEqual(cf()['ingress'],ingress)
+        self.assertFalse(any(c['method']=='PUT' for c in calls()))
+
+    def test_webhook_does_not_follow_redirects(self):
+        from wpops import notify
+        self.assertTrue(any(isinstance(h,notify._NoRedirect) for h in notify._OPENER.handlers))
+
+    def test_nginx_denies_host_alias_map(self):
+        conf=(ROOT/'config/nginx/conf.d/default.conf').read_text()
+        self.assertRegex(conf,r'location = /wp-content/wpops-host-aliases\.json \{\s*deny all;')
+
 
 if __name__=='__main__': unittest.main()

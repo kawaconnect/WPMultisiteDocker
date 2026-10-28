@@ -43,6 +43,7 @@ check_deps
 load_config
 
 CLOUD_IP="$CF_CLOUD_IP"
+STANDBY_DOMAIN="$CF_STANDBY_DOMAIN"
 ACCOUNT_COUNT=$(get_account_count)
 
 echo ""
@@ -192,13 +193,45 @@ echo ""
 
 confirm_yes "You are about to modify $PLAN_COUNT live DNS record(s). Proceed?"
 
-# ── Step 7: Execute changes ──────────────────────────────────────────────────
+# ── Step 7: Configure tunnel ingress (before any DNS change) ─────────────────
 
-echo "[5/6] Switching DNS records..."
+# Every hostname must already be routed by its tunnel when its DNS switches,
+# and a failure here must stop the run while DNS is still untouched: a
+# re-run only finds records that still point at $CLOUD_IP, so ingress missed
+# after a switch would never be added.
+echo "[5/6] Configuring tunnel ingress..."
+
+declare -A INGRESS_BY_TUNNEL   # tunnel_id → space-separated hostnames
+declare -A ACCOUNT_BY_TUNNEL   # tunnel_id → account number
+for ((p = 0; p < PLAN_COUNT; p++)); do
+    INGRESS_BY_TUNNEL[${PLAN_TUNNEL_IDS[$p]}]+="${PLAN_NAMES[$p]} "
+    ACCOUNT_BY_TUNNEL[${PLAN_TUNNEL_IDS[$p]}]="${PLAN_ACCOUNTS[$p]}"
+done
+
+for tunnel_id in "${!INGRESS_BY_TUNNEL[@]}"; do
+    acct_n="${ACCOUNT_BY_TUNNEL[$tunnel_id]}"
+    account_id=$(get_account_var "$acct_n" ID)
+    api_token=$(get_account_var "$acct_n" TOKEN)
+    hosts="${INGRESS_BY_TUNNEL[$tunnel_id]}"
+    # Named-host rules only; the merge keeps unrelated rules already on the
+    # tunnel (e.g. the standby wildcard on the standby account's own tunnel).
+    ingress=$(printf '%s\n' $hosts | jq -R 'select(length > 0) | {hostname: ., service: "http://nginx:80"}' | jq -s -c .)
+    host_count=$(echo "$hosts" | wc -w)
+    log_info "Configuring tunnel ingress ($host_count hostname(s))"
+    if ! merge_tunnel_ingress "$account_id" "$api_token" "$tunnel_id" "$ingress" >/dev/null; then
+        log_error "Tunnel ingress update failed, no DNS record has been changed."
+        exit 1
+    fi
+    log_ok "Tunnel ingress updated"
+done
+
+# ── Step 8: Execute DNS changes ──────────────────────────────────────────────
+
+echo ""
+echo "[6/6] Switching DNS records..."
 echo ""
 
 SWITCHED=()
-declare -A INGRESS_BY_TUNNEL  # tunnel_id → space-separated hostnames
 
 for ((p = 0; p < PLAN_COUNT; p++)); do
     acct_n="${PLAN_ACCOUNTS[$p]}"
@@ -228,43 +261,7 @@ for ((p = 0; p < PLAN_COUNT; p++)); do
 
     SWITCHED+=("$record_name")
     PARTIALLY_SWITCHED+=("$record_name")
-    INGRESS_BY_TUNNEL[$tunnel_id]+="$record_name "
     log_ok "Switched: $record_name"
-done
-
-# ── Step 8: Configure tunnel ingress ─────────────────────────────────────────
-
-echo ""
-echo "[6/6] Configuring tunnel ingress..."
-
-for tunnel_id in "${!INGRESS_BY_TUNNEL[@]}"; do
-    hosts="${INGRESS_BY_TUNNEL[$tunnel_id]}"
-
-    # Find the account for this tunnel
-    for ((n = 1; n <= ACCOUNT_COUNT; n++)); do
-        account_id=$(get_account_var "$n" ID)
-        api_token=$(get_account_var "$n" TOKEN)
-        tunnel_name="wp-docker-$(get_account_var "$n" NAME)"
-        tj=$(get_tunnel_by_name "$account_id" "$api_token" "$tunnel_name" 2>/dev/null)
-        [ -z "$tj" ] && continue
-        tid=$(echo "$tj" | jq -r '.id')
-        if [ "$tid" = "$tunnel_id" ]; then
-            # Build ingress JSON (named-host rules only, merge preserves
-            # any unrelated rules already on the tunnel, e.g. the standby
-            # wildcard if this is the standby account's own tunnel)
-            ingress="["
-            for host in $hosts; do
-                ingress+="{\"hostname\": \"$host\", \"service\": \"http://nginx:80\"},"
-            done
-            ingress="${ingress%,}]"
-
-            host_count=$(echo "$hosts" | wc -w)
-            log_info "Configuring tunnel ingress ($host_count hostname(s))"
-            merge_tunnel_ingress "$account_id" "$api_token" "$tunnel_id" "$ingress" >/dev/null
-            log_ok "Tunnel ingress updated"
-            break
-        fi
-    done
 done
 
 # ── Summary ───────────────────────────────────────────────────────────────────

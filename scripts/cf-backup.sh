@@ -51,7 +51,8 @@ for ((n = 1; n <= ACCOUNT_COUNT; n++)); do
     # Backup DNS for each domain
     read -ra domains <<< "$(get_account_domains "$n")"
     for domain in "${domains[@]}"; do
-        zone_id=$(get_zone_id "$domain" "$api_token" 2>/dev/null)
+        # Under set -e a failed lookup would end the whole run here; skip the domain instead.
+        zone_id=$(get_zone_id "$domain" "$api_token" 2>/dev/null) || zone_id=""
         if [ -z "$zone_id" ]; then
             log_warn "Could not get zone ID for $domain, skipping"
             ERRORS=$((ERRORS + 1))
@@ -61,7 +62,11 @@ for ((n = 1; n <= ACCOUNT_COUNT; n++)); do
     done
 
     # Backup tunnel config
-    tunnel_json=$(get_configured_tunnel "$account_id" "$api_token" "$name" 2>/dev/null)
+    if ! tunnel_json=$(get_configured_tunnel "$account_id" "$api_token" "$name" 2>/dev/null); then
+        log_warn "Tunnel lookup failed for $name, skipping tunnel backup"
+        ERRORS=$((ERRORS + 1))
+        tunnel_json=""
+    fi
     if [ -n "$tunnel_json" ]; then
         tunnel_id=$(echo "$tunnel_json" | jq -r '.id')
         backup_tunnel_config "$name" "$account_id" "$api_token" "$tunnel_id" || ERRORS=$((ERRORS + 1))

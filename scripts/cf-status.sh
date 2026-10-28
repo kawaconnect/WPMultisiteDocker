@@ -43,7 +43,7 @@ for ((n = 1; n <= ACCOUNT_COUNT; n++)); do
     is_standby=$(get_account_var "$n" STANDBY)
     tunnel_name="wp-docker-$name"
 
-    tunnel_json=$(get_configured_tunnel "$account_id" "$api_token" "$name" 2>/dev/null)
+    tunnel_json=$(get_configured_tunnel "$account_id" "$api_token" "$name" 2>/dev/null) || tunnel_json=""
     if [ -z "$tunnel_json" ]; then
         printf "  %-20s %-38s %-10s %s\n" "$name" "(not created)" "-" "-"
         continue
@@ -53,7 +53,7 @@ for ((n = 1; n <= ACCOUNT_COUNT; n++)); do
     tunnel_status=$(echo "$tunnel_json" | jq -r '.status // "unknown"')
 
     # Get ingress hostnames
-    config=$(get_tunnel_config "$account_id" "$api_token" "$tunnel_id" 2>/dev/null)
+    config=$(get_tunnel_config "$account_id" "$api_token" "$tunnel_id" 2>/dev/null) || config=""
     if [ -n "$config" ]; then
         hostnames=$(echo "$config" | jq -r '.config.ingress[]?.hostname // empty' 2>/dev/null | tr '\n' ', ' | sed 's/,$//')
         [ -z "$hostnames" ] && hostnames="(catch-all only)"

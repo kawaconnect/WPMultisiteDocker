@@ -193,7 +193,7 @@ When production goes down:
 ```bash
 ./scripts/cf-failover.sh
 ```
-This backs up DNS, switches A records to tunnel CNAMEs, and configures tunnel ingress, all automatically.
+This backs up DNS, configures tunnel ingress for the affected hostnames, then switches A records to tunnel CNAMEs, all automatically.
 
 ### Rollback
 
