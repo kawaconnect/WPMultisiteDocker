@@ -2,6 +2,20 @@
 
 Versions are git tags (`vX.Y.Z`). This repo has no build; tags mark reviewed states of the stack and scripts.
 
+## [0.0.4] - 2026-10-28
+
+### Added
+- `config/nginx/conf.d/connector-real-ip.conf`: Nginx takes the visitor IP from `CF-Connecting-IP` when the request comes from a tunnel connector on `wpops-edge`. The network gateway, which carries the loopback-published port and host traffic, is excluded. Cloudflare's own ranges stay trusted as before.
+- Node-local `config/nginx/conf.d/*.local.conf` (gitignored) for the legacy root stack's Docker-assigned frontend subnet; steps in `docs/deployments.md` ("Visitor IPs behind the tunnel").
+- Tests: the trusted ranges match the edge subnet, and a live Nginx check in a private network namespace (CI installs Nginx for it).
+
+### Changed
+- wpops creates `wpops-edge` with the fixed subnet `10.214.255.0/24`. `wpops stack up` and `wpops tunnels ensure` warn when an older network with another subnet exists; the docs explain how to recreate it.
+- The tunnel project's `cf-backup` container no longer joins `wpops-edge`, so only connectors and the stacks' Nginx are on it.
+
+### Fixed
+- Behind the tunnel every visitor reached Nginx from the connector's address, so the `/wp-login.php` and custom-login rate limit (20 requests/minute) was one bucket shared by everyone, and one client could lock all users out of logging in. Logs and WordPress also saw the connector's address instead of the visitor's.
+
 ## [0.0.3] - 2026-10-28
 
 ### Added
