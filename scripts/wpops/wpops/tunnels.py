@@ -4,8 +4,8 @@
   - verify the token, get-or-create tunnel "wp-docker-<account>" (no DNS, no ingress
     changes for non-standby accounts: an idle tunnel cannot affect traffic)
   - record the tunnel id in config/inventory.json under this node
-  - regenerate docker-compose.tunnels.yml (same layout as cf-setup.sh) and start
-    the connectors with `docker compose --profile tunnels up -d`
+  - generate a standalone docker-compose.wpops-tunnels.json connector project
+    joined to every configured ingress network
 """
 
 from __future__ import annotations
@@ -27,13 +27,15 @@ def ensure(start: bool = True, log=print) -> dict[str, Any]:
     inv = load_inventory()
     node = cfg["node"]
     origin = inv.origin(node)
-    stack_path = Path(origin.stacks.get("main", {}).get("path") or REPO_DIR)
     results: dict[str, Any] = {}
     tokens: list[tuple[str, str]] = []
     changed = False
     for acct in cf_accounts(env).values():
         cf = Cloudflare(acct.token, acct.account_id, acct.name)
-        name = f"wp-docker-{acct.name}"
+        from .config import _SLUG_RE, ConfigError
+        if not _SLUG_RE.fullmatch(acct.name) or not _SLUG_RE.fullmatch(node):
+            raise ConfigError("node and Cloudflare account names must be URL slugs")
+        name = f"wp-docker-{node}-{acct.name}"
         try:
             # /user/tokens/verify needs the "User API Tokens: Read" permission, which
             # most zone/tunnel tokens do not carry; a failure here is not a verdict.
@@ -44,7 +46,8 @@ def ensure(start: bool = True, log=print) -> dict[str, Any]:
             except CfError as exc:
                 if "401" not in str(exc) and "403" not in str(exc):
                     raise
-            t = cf.tunnel_by_name(name)
+            tid = origin.tunnels.get(acct.name)
+            t = cf.tunnel(tid) if tid else cf.tunnel_by_name(name)
             if not t:
                 t = cf.create_tunnel(name)
                 log(f"{acct.name}: created tunnel {name} ({t['id']})")
@@ -66,30 +69,45 @@ def ensure(start: bool = True, log=print) -> dict[str, Any]:
         tmp.write_text(json.dumps(raw, indent=2) + "\n", encoding="utf-8")
         os.replace(tmp, INVENTORY_FILE)
         log(f"inventory updated: {INVENTORY_FILE} (commit it)")
-    project = stack_path.name.lower()
-    project = "".join(ch for ch in project if ch.isalnum() or ch in "_-")
-    lines = ["services:"]
+    # A standalone connector project can serve any mixture of stacks, including
+    # a legacy main stack. No base WordPress project needs to be running.
+    networks = {"edge": {"external": True, "name": "wpops-edge"}}
+    for st in origin.stacks.values():
+        if st.get("ingress_network") == "wpops-edge":
+            continue
+        from .stacks import compose_project
+        net = st.get("ingress_network") or f"{compose_project(st)}_frontend"
+        if net not in [n["name"] for n in networks.values()]:
+            networks[f"stack{len(networks)}"] = {"external": True, "name": net}
+    services = {}
     for name, token in tokens:
-        lines += [
-            f"  cloudflared-{name}:",
-            "    image: cloudflare/cloudflared:2026.10.0",
-            "    restart: unless-stopped",
-            "    profiles: [tunnels]",
-            "    networks: [frontend]",
-            "    command: tunnel --no-autoupdate run",
-            "    environment:",
-            f'      TUNNEL_TOKEN: "{token}"',
-            "    deploy:",
-            "      resources:",
-            "        limits:",
-            "          memory: 128M",
-        ]
-    lines += ["networks:", "  frontend:", "    external: true", f"    name: {project}_frontend", ""]
-    compose = stack_path / "docker-compose.tunnels.yml"
-    state.write_private_text(compose, "\n".join(lines))
+        services[f"cloudflared-{name}"] = {
+            "image": "cloudflare/cloudflared:2026.10.0", "restart": "unless-stopped",
+            "networks": list(networks), "command": ["tunnel", "--no-autoupdate", "run"],
+            "environment": {"TUNNEL_TOKEN": token},
+            "logging": {"driver": "json-file", "options": {"max-size": "10m", "max-file": "3"}},
+            "deploy": {"resources": {"limits": {"memory": "128M"}}},
+        }
+    services["cf-backup"] = {
+        "image": "alpine:3.23", "restart": "unless-stopped", "networks": ["edge"],
+        "volumes": [f"{REPO_DIR}/scripts:/app/scripts:ro", f"{REPO_DIR}/config:/app/config:ro",
+                    f"{REPO_DIR}/data/cloudflare/backups:/app/data/cloudflare/backups",
+                    f"{REPO_DIR}/.env:/app/.env:ro"],
+        "entrypoint": ["/bin/sh", "-c"],
+        "command": ["apk add --no-cache bash curl jq openssl && "
+                    "ln -sf /bin/true /usr/local/bin/docker && "
+                    "while true; do bash /app/scripts/cf-backup.sh; sleep 21600; done"],
+        "logging": {"driver": "json-file", "options": {"max-size": "10m", "max-file": "3"}},
+    }
+    compose = REPO_DIR / "docker-compose.wpops-tunnels.json"
+    state.write_private_text(compose, json.dumps({"services": services, "networks": networks}, indent=2)+"\n")
     log(f"wrote {compose} ({len(tokens)} connector(s))")
     if start and tokens:
-        r = subprocess.run(["docker", "compose", "--profile", "tunnels", "up", "-d", "--quiet-pull"], cwd=stack_path,
+        from .provision import ensure_edge
+        ensure_edge()
+        child_env = {k: v for k, v in os.environ.items() if not k.startswith('COMPOSE_')}
+        r = subprocess.run(["docker", "compose", "-p", f"wpops-{node}-tunnels", "-f", str(compose),
+                            "up", "-d", "--quiet-pull"], cwd=REPO_DIR, env=child_env,
                            capture_output=True, text=True, timeout=600)
         log((r.stdout + r.stderr).strip()[-800:])
         results["_compose"] = r.returncode

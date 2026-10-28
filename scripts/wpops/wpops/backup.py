@@ -299,8 +299,8 @@ def source_key(source: str, env: dict[str, str] | None = None) -> str:
 
 
 def client_for(inv: Inventory, source: str) -> SyncClient:
-    o = inv.origin(source)
-    if not o.sync_api:
+    o = inv.sources().get(source)
+    if not o or not o.sync_api:
         raise SyncError(f"origin '{source}' has no sync_api configured")
     return SyncClient(o.sync_api, source_key(source))
 
@@ -407,7 +407,8 @@ def _pull_locked(job: Job, inv: Inventory, source: str, label: str, fresh: bool,
                 dest.rmdir() if not any(dest.iterdir()) else None
                 raise SyncError(str(exc)) from None
         man = {
-            "source": source, "nonce": chosen["nonce"], "timestamp": ts, "label": chosen.get("label", ""),
+            "source": source, "source_origin": inv.sources()[source].origin,
+            "source_stack": inv.sources()[source].stack, "nonce": chosen["nonce"], "timestamp": ts, "label": chosen.get("label", ""),
             "mode": listing.get("mode", ""), "site_url": listing.get("site_url", ""), "sites": listing.get("sites", []),
             "entities": chosen.get("entities", []), "files": files, "pulled_at": None, "keep": False, "applied": [],
             "plugin_version": info.get("version"),
@@ -545,5 +546,5 @@ def mark_run(result: dict[str, Any]) -> None:
 
 def sources_to_pull(inv: Inventory) -> list[str]:
     cfg = node_config()["backup"]
-    wanted = cfg.get("sources") or [n for n, o in inv.origins.items() if o.sync_api]
-    return [s for s in wanted if s in inv.origins and inv.origins[s].sync_api]
+    wanted = cfg.get("sources") or list(inv.sources())
+    return [s for s in wanted if s in inv.sources()]

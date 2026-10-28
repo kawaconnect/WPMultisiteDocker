@@ -135,10 +135,13 @@ def plan(inv: Inventory, sites: list[Site], to: str | None = None, stack: str | 
             if not tunnel_id:
                 raise FailoverError(f"node '{target}' has no tunnel for Cloudflare account '{site.cf_account}' (run cf-setup.sh there)")
             stack_name = stack or host.get("stack") or ""
+            if stack_name != host.get("stack"):
+                raise FailoverError("target stack differs from the site host mapping; update the inventory first")
             stack_cfg = origin.stacks.get(stack_name)
             if not stack_cfg:
                 raise FailoverError(f"stack '{stack_name}' is not defined on node '{target}'")
-            service = stack_cfg.get("service") or cfg["failover"]["tunnel_service"]
+            from .stacks import ingress_service
+            service = ingress_service(origin, stack_name, cfg["failover"]["tunnel_service"])
             cf = clients.setdefault(site.cf_account, _cf_for(site.cf_account, accounts))
             for domain in site.domains:
                 try:
@@ -147,12 +150,28 @@ def plan(inv: Inventory, sites: list[Site], to: str | None = None, stack: str | 
                 except CfError as exc:
                     p.refused.append({"site": site.slug, "domain": domain, "reason": str(exc)})
                     continue
+                existing_override = state.overrides().get(domain, {})
+                if (not recs and existing_override.get('to') == target
+                        and existing_override.get('status') in ('failed', 'switching', 'preparing')):
+                    recs = existing_override.get('original_records', [])
                 current = _record_origin(inv, recs)
                 sibling = [r for r in recs if r.get("type") == "CNAME" and r.get("content", "").lower().rstrip(".") in site.domains]
                 if sibling and len(sibling) == len(recs):
-                    p.noop.append({"site": site.slug, "domain": domain, "reason": f"CNAME to {sibling[0]['content']} (follows that record)"})
-                    continue
-                if current == target:
+                    # A sibling CNAME still needs ingress and an alias on the node.
+                    seen = {domain}
+                    follow = sibling[0]['content'].lower().rstrip('.')
+                    while follow in site.domains and follow not in seen:
+                        seen.add(follow)
+                        followed = cf.dns_records(cf.zone_id(follow), name=follow)
+                        current = _record_origin(inv, followed)
+                        if current:
+                            break
+                        cnames = [r for r in followed if r.get('type') == 'CNAME']
+                        if not cnames:
+                            break
+                        follow = cnames[0]['content'].lower().rstrip('.')
+                existing_override = state.overrides().get(domain, {})
+                if current == target and existing_override.get("status") not in ("failed", "switching", "preparing"):
                     p.noop.append({"site": site.slug, "domain": domain, "reason": f"already on {target}"})
                     continue
                 if not recs:
@@ -188,6 +207,16 @@ def write_aliases(inv: Inventory, this_node: str) -> dict[str, dict[str, Any]]:
     """Rebuild the host-alias maps for every stack on this node from the overrides."""
     origin = inv.origin(this_node)
     per_stack: dict[str, dict[str, Any]] = {name: {} for name in origin.stacks}
+    # A node can also be primary. Native www/alternate domains need the same
+    # alias handling without creating a temporary failover override.
+    for site in inv.sites:
+        host = site.host_on(this_node)
+        if site.enabled and site.primary == this_node and host:
+            entry = {'site': site.slug, 'host': host['host']}
+            if host.get('blog_id'):
+                entry['blog_id'] = int(host['blog_id'])
+            for domain in site.domains:
+                per_stack[host['stack']][domain] = entry
     for domain, ov in state.overrides().items():
         if ov.get("to") != this_node:
             continue
@@ -202,11 +231,15 @@ def write_aliases(inv: Inventory, this_node: str) -> dict[str, dict[str, Any]]:
         entry: dict[str, Any] = {"site": site.slug, "host": host.get("host", "")}
         if host.get("blog_id"):
             entry["blog_id"] = int(host["blog_id"])
-        per_stack[st][domain] = entry
+        # All sibling hostnames must work the instant apex DNS is switched.
+        for hostname in site.domains:
+            per_stack[st][hostname] = entry
     for st, aliases in per_stack.items():
         f = alias_file(origin, st)
         if not f.parent.exists():
-            continue
+            if not aliases:
+                continue
+            raise FailoverError(f"stack {st} has no wp-content directory; initialise it first")
         tmp = f.with_suffix(".json.tmp")
         tmp.write_text(json.dumps({"generated": int(time.time()), "aliases": aliases}, indent=2, sort_keys=True) + "\n",
                        encoding="utf-8")
@@ -224,62 +257,78 @@ def apply(inv: Inventory, p: Plan, actor: str, this_node: str, accounts: dict | 
           log=print) -> dict[str, Any]:
     """Execute a plan. Idempotent: domains already overridden are skipped."""
     accounts = accounts if accounts is not None else cf_accounts(load_env())
-    done: list[dict[str, Any]] = []
-    failed: list[dict[str, Any]] = []
-    with state.locked("failover"):
+    if any(c.to_origin != this_node for c in p.changes):
+        raise FailoverError('run apply on the target node so its aliases can be prepared before DNS')
+    from .stacks import ps, install_host_alias, env_flag
+    origin = inv.origin(this_node)
+    for stack in {c.stack for c in p.changes}:
+        containers = ps(origin, stack)
+        for service in ('wordpress', 'nginx'):
+            if not any(c.get('service') == service and c.get('state') == 'running'
+                       and c.get('health') in ('healthy', '', None) for c in containers):
+                raise FailoverError(f'stack {stack}: {service} is not ready')
+        if not origin.stacks[stack].get('managed'):
+            install_host_alias(origin, stack, log=log)
+            if (origin.stacks[stack].get('mode', 'multisite') == 'multisite'
+                    and env_flag(Path(origin.stacks[stack]['path']), 'WP_SUNRISE') != 'true'):
+                raise FailoverError(f'stack {stack}: enable WP_SUNRISE=true and recreate WordPress first')
+    done, failed = [], []
+    with state.locked('failover'):
         ovs = state.overrides()
-        clients: dict[str, Cloudflare] = {}
-        backed_zones: set[str] = set()
-        backed_tunnels: set[str] = set()
-        ingress: dict[tuple[str, str], list[dict[str, Any]]] = {}
+        clients = {}
+        backed_zones, backed_tunnels = set(), set()
         for c in p.changes:
-            cf = clients.setdefault(c.cf_account, _cf_for(c.cf_account, accounts))
-            if c.domain in ovs and ovs[c.domain].get("status") == "active":
-                done.append({"domain": c.domain, "status": "already-active"})
+            if c.domain in ovs and ovs[c.domain].get('status') == 'active':
+                done.append({'domain': c.domain, 'status': 'already-active'})
                 continue
             try:
+                cf = clients.setdefault(c.cf_account, _cf_for(c.cf_account, accounts))
                 if c.zone_id not in backed_zones:
                     cf.backup_zone(c.domain)
                     backed_zones.add(c.zone_id)
                 if c.tunnel_id not in backed_tunnels:
                     cf.backup_tunnel(c.tunnel_id)
                     backed_tunnels.add(c.tunnel_id)
-                # 1. record the intent + originals BEFORE touching DNS
-                ovs[c.domain] = {
-                    "site": c.site, "from": c.from_origin, "to": c.to_origin, "stack": c.stack,
-                    "cf_account": c.cf_account, "zone_id": c.zone_id, "tunnel_id": c.tunnel_id,
-                    "original_records": c.original_records, "switched_at": int(time.time()),
-                    "actor": actor, "status": "switching",
+                previous = ovs.get(c.domain)
+                if previous and (previous.get('to') != this_node or previous.get('stack') != c.stack):
+                    raise FailoverError('an existing override targets another stack/node; roll it back first')
+                # Preserve the original records when retrying a partially applied operation.
+                ovs[c.domain] = previous or {
+                    'site': c.site, 'from': c.from_origin, 'to': c.to_origin, 'stack': c.stack,
+                    'cf_account': c.cf_account, 'zone_id': c.zone_id, 'tunnel_id': c.tunnel_id,
+                    'original_records': c.original_records, 'switched_at': int(time.time()), 'actor': actor,
                 }
+                ovs[c.domain]['status'] = 'preparing'
                 state.save_overrides(ovs)
-                # 2. replace records
-                for r in c.original_records:
-                    cf.delete_record(c.zone_id, r["id"])
+                rules = [{'hostname': d, 'service': c.service} for d in inv.site(c.site).domains]
+                cf.merge_tunnel_ingress(c.tunnel_id, rules)
+                write_aliases(inv, this_node)
+                ovs[c.domain]['status'] = 'switching'
+                state.save_overrides(ovs)
+                # Refuse records changed by another operator since the plan.
+                current_records = [r for r in cf.dns_records(c.zone_id, name=c.domain)
+                                   if r.get('type') in SWITCHABLE_TYPES]
+                allowed = {(r['type'], r['content'].lower().rstrip('.'))
+                           for r in ovs[c.domain]['original_records']}
+                allowed.add(('CNAME', c.create['content'].lower().rstrip('.')))
+                if any((r['type'], r['content'].lower().rstrip('.')) not in allowed for r in current_records):
+                    raise FailoverError('DNS changed since the plan; refusing to replace unexpected records')
+                # Re-read current DNS for retries rather than deleting stale record IDs.
+                for r in current_records:
+                    if r.get('type') in SWITCHABLE_TYPES:
+                        cf.delete_record(c.zone_id, r['id'])
                 created = cf.create_record(c.zone_id, c.create)
-                ovs[c.domain]["record_id"] = created.get("id")
-                ovs[c.domain]["status"] = "active"
+                ovs[c.domain].update(record_id=created.get('id'), status='active')
+                ovs[c.domain].pop('error', None)
                 state.save_overrides(ovs)
-                ingress.setdefault((c.cf_account, c.tunnel_id), []).append({"hostname": c.domain, "service": c.service})
-                done.append({"domain": c.domain, "status": "switched", "from": c.from_origin, "to": c.to_origin})
-                log(f"switched {c.domain}: {c.from_origin} -> {c.to_origin}")
-            except (CfError, Exception) as exc:  # noqa: BLE001 - keep going, report
-                ovs[c.domain]["status"] = "failed"
-                ovs[c.domain]["error"] = str(exc)
-                state.save_overrides(ovs)
-                failed.append({"domain": c.domain, "error": str(exc)})
-                log(f"FAILED {c.domain}: {exc}")
-        # 3. tunnel ingress (merge, per tunnel)
-        for (acct, tid), rules in ingress.items():
-            try:
-                clients[acct].merge_tunnel_ingress(tid, rules)
-                log(f"tunnel {tid}: ingress +{len(rules)} host(s)")
-            except CfError as exc:
-                failed.append({"tunnel": tid, "error": f"ingress update failed: {exc}"})
-        # 4. host aliases on this node
-        try:
-            write_aliases(inv, this_node)
-        except Exception as exc:  # noqa: BLE001
-            failed.append({"aliases": this_node, "error": str(exc)})
+                done.append({'domain': c.domain, 'status': 'switched', 'from': c.from_origin, 'to': c.to_origin})
+                log(f'switched {c.domain}: {c.from_origin} -> {c.to_origin}')
+            except Exception as exc:
+                if c.domain in ovs:
+                    ovs[c.domain].update(status='failed', error=str(exc))
+                    state.save_overrides(ovs)
+                failed.append({'domain': c.domain, 'error': str(exc)})
+                log(f'FAILED {c.domain}: {exc}')
     state.audit(actor, "failover.apply", {"to": p.to_origin, "done": done, "failed": failed})
     switched = [d["domain"] for d in done if d.get("status") == "switched"]
     if switched or failed:
@@ -318,6 +367,8 @@ def rollback(inv: Inventory, actor: str, this_node: str, sites: list[str] | None
                 failed.append({"domain": domain, "error": "no override recorded"})
                 continue
             try:
+                if ov.get("to") != this_node:
+                    raise FailoverError("run rollback on the node that owns this override")
                 cf = clients.setdefault(ov["cf_account"], _cf_for(ov["cf_account"], accounts))
                 ov["status"] = "rolling-back"
                 state.save_overrides(ovs)
@@ -327,7 +378,7 @@ def rollback(inv: Inventory, actor: str, this_node: str, sites: list[str] | None
                         cf.delete_record(ov["zone_id"], r["id"])
                 for r in ov["original_records"]:
                     cf.create_record(ov["zone_id"], r)
-                removed.setdefault((ov["cf_account"], ov["tunnel_id"]), []).append(domain)
+                removed.setdefault((ov["cf_account"], ov["tunnel_id"]), []).extend(inv.site(ov["site"]).domains)
                 del ovs[domain]
                 state.save_overrides(ovs)
                 done.append({"domain": domain, "status": "restored", "to": ov["from"]})
@@ -338,7 +389,12 @@ def rollback(inv: Inventory, actor: str, this_node: str, sites: list[str] | None
                 state.save_overrides(ovs)
                 failed.append({"domain": domain, "error": str(exc)})
                 log(f"FAILED {domain}: {exc}")
+        still_needed = {domain for ov in ovs.values() if ov.get('to') == this_node
+                        for domain in inv.site(ov['site']).domains}
         for (acct, tid), hosts in removed.items():
+            hosts = sorted(set(hosts) - still_needed)
+            if not hosts:
+                continue
             try:
                 clients[acct].remove_tunnel_ingress_hosts(tid, hosts)
                 log(f"tunnel {tid}: ingress -{len(hosts)} host(s)")

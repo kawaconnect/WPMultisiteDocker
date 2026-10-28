@@ -6,9 +6,8 @@ import argparse
 import getpass
 import json
 import os
-import shutil
+import subprocess
 import sys
-from pathlib import Path
 from typing import Any
 
 from . import __version__, backup as bk, failover, jobs, notify, restore, state
@@ -126,7 +125,7 @@ def cmd_failover(args: argparse.Namespace) -> int:
 def cmd_backup(args: argparse.Namespace) -> int:
     inv = load_inventory()
     if args.action == "sources":
-        rows = [{"name": n, "sync_api": o.sync_api} for n, o in inv.origins.items() if o.sync_api]
+        rows = [{"name": n, "sync_api": o.sync_api} for n, o in inv.sources().items()]
         _out(args, rows, "\n".join(f"{r['name']:<12} {r['sync_api']}" for r in rows))
         return 0
     if args.action == "list":
@@ -228,10 +227,48 @@ def cmd_tunnels(args: argparse.Namespace) -> int:
     if args.action == "ensure":
         r = tunnels.ensure(start=not args.no_start)
         _out(args, r, None if args.json else json.dumps(r, indent=2))
-        return 0 if all(v.get("ok") for k, v in r.items() if not k.startswith("_")) else 1
+        return 0 if all(v.get("ok") for k, v in r.items() if not k.startswith("_")) and not r.get("_compose") else 1
     rows = tunnels.status()
     _out(args, rows, "\n".join(f"{r['account']:<32} {r.get('tunnel') or 'MISSING':<40} {r.get('status', r.get('error', ''))} conns={r.get('connections', '-')}" for r in rows))
     return 0
+
+
+def cmd_stack(args: argparse.Namespace) -> int:
+    from . import provision
+    from .stacks import compose
+    if args.action == 'create':
+        result = provision.create(args.name, args.mode, args.domain, args.port,
+                                  args.login_path or '', not args.subdirectories, args.noindex)
+    elif args.action == 'init':
+        result = provision.initialise(args.name, args.admin_email, args.admin_user, args.scheme)
+    elif args.action == 'login':
+        result = provision.set_login(args.name, args.path, args.blog_id)
+    else:
+        inv, cfg = load_inventory(), node_config()
+        origin = inv.origin(cfg['node'])
+        if args.action == 'list':
+            result = origin.stacks
+        else:
+            if args.action == 'up':
+                provision.ensure_edge()
+            compose_args = {'up': ['up', '-d', '--wait'], 'stop': ['stop'],
+                            'compose': getattr(args, 'args', [])}[args.action]
+            if not compose_args:
+                raise ConfigError('compose arguments are required')
+            r = compose(origin, args.name, *compose_args)
+            result = {'stack': args.name, 'output': r.stdout.strip()}
+    _out(args, result)
+    return 0
+
+
+def cmd_routes(args: argparse.Namespace) -> int:
+    from . import routes
+    inv, cfg = load_inventory(), node_config()
+    if args.action == 'apply' and not args.yes:
+        raise ConfigError('run routes plan first, then routes apply --yes')
+    result = (routes.apply if args.action == 'apply' else routes.plan)(inv, cfg['node'])
+    _out(args, result)
+    return 2 if result['refused'] else 0
 
 
 def cmd_setup(args: argparse.Namespace) -> int:
@@ -245,13 +282,11 @@ def cmd_setup(args: argparse.Namespace) -> int:
         save_node_config({"node": args.node})
         print(f"wrote {NODE_CONFIG_FILE}")
     if not INVENTORY_FILE.exists():
-        example = CONFIG_DIR / "inventory.example.json"
-        if example.exists():
-            shutil.copyfile(example, INVENTORY_FILE)
-            print(f"copied {example} -> {INVENTORY_FILE}; edit it")
-        else:
-            print(f"{INVENTORY_FILE} missing and no example to copy", file=sys.stderr)
-            return 2
+        name = node_config()['node']
+        skeleton = {'origins': {name: {'kind': 'node', 'stacks': {}, 'tunnels': {}}},
+                    'sites': [], 'backup_sources': {}}
+        INVENTORY_FILE.write_text(json.dumps(skeleton, indent=2)+'\n', encoding='utf-8')
+        print(f'wrote empty inventory for {name}: {INVENTORY_FILE}; see inventory.example.json for site mappings')
     inv, cfg = load_inventory(), node_config()
     origin = inv.origin(cfg["node"])
     for name in origin.stacks:
@@ -278,7 +313,33 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--json", action="store_true", help="machine-readable output")
     sub = p.add_subparsers(dest="cmd", required=True)
 
+    stack = sub.add_parser('stack', help='independent production single-site or multisite deployments')
+    actions = stack.add_subparsers(dest='action', required=True)
+    s = actions.add_parser('create', help='write configuration; starts no containers and changes no DNS')
+    s.add_argument('name'); s.add_argument('--mode', required=True, choices=['single', 'multisite'])
+    s.add_argument('--domain', required=True); s.add_argument('--port', required=True, type=int)
+    s.add_argument('--login-path'); s.add_argument('--subdirectories', action='store_true')
+    s.add_argument('--noindex', action='store_true', help='standby/staging: send a noindex header')
+    s.set_defaults(fn=cmd_stack)
+    s = actions.add_parser('init', help='start and install an empty stack')
+    s.add_argument('name'); s.add_argument('--admin-email', required=True)
+    s.add_argument('--admin-user', default='admin'); s.add_argument('--scheme', choices=['http', 'https'], default='https')
+    s.set_defaults(fn=cmd_stack)
+    s = actions.add_parser('login', help='configure the default or a multisite blog login slug')
+    s.add_argument('name'); s.add_argument('--path', required=True); s.add_argument('--blog-id', type=int)
+    s.set_defaults(fn=cmd_stack)
+    for action in ('up', 'stop', 'list', 'compose'):
+        s = actions.add_parser(action)
+        if action != 'list':
+            s.add_argument('name')
+        if action == 'compose':
+            s.add_argument('args', nargs=argparse.REMAINDER)
+        s.set_defaults(fn=cmd_stack)
+
     s = sub.add_parser("status", help="node status"); s.add_argument("--live", action="store_true", help="also query Cloudflare DNS"); s.set_defaults(fn=cmd_status)
+    s = sub.add_parser('routes', help='publish native primary and standby hosts without taking over foreign DNS')
+    s.add_argument('action', choices=['plan', 'apply']); s.add_argument('--yes', action='store_true')
+    s.set_defaults(fn=cmd_routes)
     s = sub.add_parser("sites", help="inventory"); s.add_argument("--live", action="store_true"); s.set_defaults(fn=cmd_sites)
 
     s = sub.add_parser("failover", help="plan/apply/rollback DNS failover")
@@ -322,7 +383,8 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     try:
         return int(args.fn(args) or 0)
-    except (ConfigError, failover.FailoverError, bk.SyncError, restore.RestoreError, StackError, TimeoutError) as exc:
+    except (ConfigError, failover.FailoverError, bk.SyncError, restore.RestoreError, StackError, TimeoutError,
+            OSError, subprocess.CalledProcessError) as exc:
         if getattr(args, "json", False):
             print(json.dumps({"error": str(exc)}))
         else:

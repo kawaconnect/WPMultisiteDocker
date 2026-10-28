@@ -24,10 +24,10 @@ echo ""
 # ── Validate ──────────────────────────────────────────────────────────────────
 
 check_deps
-load_config
+load_config --read-only
 
-CLOUD_IP="$CF_CLOUD_IP"
-STANDBY_DOMAIN="$CF_STANDBY_DOMAIN"
+CLOUD_IP="${CF_CLOUD_IP:-}"
+STANDBY_DOMAIN="${CF_STANDBY_DOMAIN:-}"
 ACCOUNT_COUNT=$(get_account_count)
 
 # ── Tunnels ──────────────────────────────────────────────────────────────────
@@ -43,7 +43,7 @@ for ((n = 1; n <= ACCOUNT_COUNT; n++)); do
     is_standby=$(get_account_var "$n" STANDBY)
     tunnel_name="wp-docker-$name"
 
-    tunnel_json=$(get_tunnel_by_name "$account_id" "$api_token" "$tunnel_name" 2>/dev/null)
+    tunnel_json=$(get_configured_tunnel "$account_id" "$api_token" "$name" 2>/dev/null)
     if [ -z "$tunnel_json" ]; then
         printf "  %-20s %-38s %-10s %s\n" "$name" "(not created)" "-" "-"
         continue
@@ -114,11 +114,18 @@ cd "$PROJECT_DIR"
 printf "  %-35s %-12s %s\n" "CONTAINER" "STATUS" "UPTIME"
 printf "  %-35s %-12s %s\n" "---------" "------" "------"
 
-tunnel_containers=$(docker compose --profile tunnels ps --format '{{.Name}}\t{{.State}}\t{{.Status}}' 2>/dev/null | grep cloudflared || true)
+tunnel_compose=(docker compose --profile tunnels)
+start_hint="docker compose --profile tunnels up -d"
+if [ -f "$PROJECT_DIR/docker-compose.wpops-tunnels.json" ] && [ -f "$PROJECT_DIR/config/wpops.json" ]; then
+    node=$(jq -r '.node' "$PROJECT_DIR/config/wpops.json")
+    tunnel_compose=(docker compose -p "wpops-$node-tunnels" -f "$PROJECT_DIR/docker-compose.wpops-tunnels.json")
+    start_hint="wpops tunnels ensure"
+fi
+tunnel_containers=$("${tunnel_compose[@]}" ps --format '{{.Name}}\t{{.State}}\t{{.Status}}' 2>/dev/null | grep cloudflared || true)
 
 if [ -z "$tunnel_containers" ]; then
     echo "  (no tunnel containers running)"
-    echo "  Start with: docker compose --profile tunnels up -d"
+    echo "  Start with: $start_hint"
 else
     while IFS=$'\t' read -r cname cstate cstatus; do
         printf "  %-35s %-12s %s\n" "$cname" "$cstate" "$cstatus"

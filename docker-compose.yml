@@ -115,8 +115,9 @@ services:
       WORDPRESS_DB_USER: ${WORDPRESS_DB_USER}
       WORDPRESS_DB_PASSWORD: ${WORDPRESS_DB_PASSWORD}
       WORDPRESS_TABLE_PREFIX: ${WORDPRESS_TABLE_PREFIX}
-      WORDPRESS_CONFIG_EXTRA: |
+      WORDPRESS_CONFIG_EXTRA: &wp_config_extra |
         /* Multisite, always allow, activate only when DB tables exist */
+        if ('${WP_MODE:-multisite}' === 'multisite') {
         define('WP_ALLOW_MULTISITE', true);
 
         /* Detect if multisite tables are present (e.g. after DB sync from production) */
@@ -136,12 +137,12 @@ services:
                     $$__ms_result = $$__ms_check->query("SHOW TABLES LIKE '" . $$__ms_check->real_escape_string($$__ms_prefix) . "blogs'");
                     if ($$__ms_result && $$__ms_result->num_rows > 0) {
                         define('MULTISITE', true);
-                        define('SUBDOMAIN_INSTALL', ${WP_SUBDOMAIN_INSTALL});
-                        define('DOMAIN_CURRENT_SITE', '${WP_DOMAIN_CURRENT_SITE}');
+                        define('SUBDOMAIN_INSTALL', ${WP_SUBDOMAIN_INSTALL:-true});
+                        define('DOMAIN_CURRENT_SITE', '${WP_DOMAIN_CURRENT_SITE:-localhost}');
                         define('PATH_CURRENT_SITE', '/');
                         define('SITE_ID_CURRENT_SITE', 1);
                         define('BLOG_ID_CURRENT_SITE', 1);
-                        if ('${WP_SUNRISE}' === 'true') {
+                        if ('${WP_SUNRISE:-false}' === 'true') {
                             define('SUNRISE', true);
                         }
                     }
@@ -154,6 +155,8 @@ services:
                     $$__ms_check->close();
                 }
             }
+        }
+
         }
 
         /* Redis object cache */
@@ -263,6 +266,7 @@ services:
       WORDPRESS_DB_USER: ${WORDPRESS_DB_USER}
       WORDPRESS_DB_PASSWORD: ${WORDPRESS_DB_PASSWORD}
       WORDPRESS_TABLE_PREFIX: ${WORDPRESS_TABLE_PREFIX}
+      WORDPRESS_CONFIG_EXTRA: *wp_config_extra
     entrypoint: /bin/sh
     command:
       - -c

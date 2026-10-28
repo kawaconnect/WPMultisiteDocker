@@ -1,0 +1,379 @@
+"""Offline regression checks. No Docker daemon, Cloudflare writes or real site data."""
+import contextlib
+import copy
+import json
+import os
+from pathlib import Path
+import shutil
+import subprocess
+import sys
+import tempfile
+import unittest
+from unittest.mock import patch
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / 'scripts/wpops'))
+from wpops import backup, config, failover, provision, restore, routes, stacks, state, tunnels
+
+
+class DeploymentTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        (self.root / 'config').mkdir()
+        self.file = self.root / 'config/inventory.json'
+        self.raw = {'origins': {'primary': {'kind':'external', 'targets':[{'type':'A','content':'192.0.2.1'}]},
+                               'backup': {'kind':'node', 'stacks':{}, 'tunnels':{'customer':'tid', 'standby':'sid'}}}, 'sites':[]}
+        self.save()
+        shutil.copy(ROOT / 'docker-compose.stack.yml', self.root)
+        self.patches = contextlib.ExitStack()
+        self.addCleanup(self.patches.close)
+        for obj, key, val in [
+            (provision,'REPO_DIR',self.root), (provision,'INVENTORY_FILE',self.file),
+            (tunnels,'REPO_DIR',self.root), (tunnels,'INVENTORY_FILE',self.file),
+            (config,'NODE_CONFIG_FILE',self.root/'config/wpops.json'),
+            (state,'STATE_DIR',self.root/'state'), (state,'LOCK_DIR',self.root/'state/locks'),
+            (state,'OVERRIDES_FILE',self.root/'state/overrides.json'), (state,'AUDIT_LOG',self.root/'state/audit.log')]:
+            self.patches.enter_context(patch.object(obj,key,val))
+        (self.root/'config/wpops.json').write_text(json.dumps({'node':'backup'}))
+        for obj in (provision,tunnels):
+            self.patches.enter_context(patch.object(obj,'load_inventory',lambda: config.load_inventory(self.file)))
+        self.patches.enter_context(patch('wpops.notify.notify'))
+
+    def save(self):
+        self.file.write_text(json.dumps(self.raw))
+
+    def add_stack(self, name, mode='single'):
+        self.raw['origins']['backup']['stacks'][name] = {
+            'path':str(self.root/name), 'mode':mode, 'service':f'http://wpops-{name}:80',
+            'ingress_network':'wpops-edge','managed':True}
+        (self.root/name/'data/wordpress/wp-content').mkdir(parents=True)
+
+    def add_site(self, slug, stack, blog_id=None):
+        host={'stack':stack,'host':f'{slug}.standby.example'}
+        if blog_id: host['blog_id']=blog_id
+        self.raw['sites'].append({'slug':slug,'primary':'primary','cf_account':'customer',
+                                 'domains':[f'{slug}.example',f'www.{slug}.example'],
+                                 'hosts':{'primary':{'host':f'{slug}.example'},'backup':host}})
+
+    def inventory(self):
+        self.save()
+        return config.load_inventory(self.file)
+
+    @unittest.skipUnless(shutil.which('docker'), 'needs the Docker CLI with Compose v2 (no daemon)')
+    def test_all_requested_topologies_and_compose(self):
+        for topology in [('single','single'), ('multisite',), ('single','multisite','multisite')]:
+            for index, mode in enumerate(topology):
+                name=f'{mode}-{len(topology)}-{index}'
+                # No Docker/network operations are needed to create configuration.
+                with patch.object(subprocess,'run',side_effect=AssertionError('create must be offline')):
+                    result=provision.create(name,mode,f'{name}.example',18080+len(list((self.root/'stacks').iterdir())) if (self.root/'stacks').exists() else 18080)
+                stack=Path(result['path'])
+                env={k:v for k,v in os.environ.items() if not k.startswith('COMPOSE_') and k!='WPOPS_REPO_DIR'}
+                r=subprocess.run(['docker','compose','config','--format','json'],cwd=stack,env=env,text=True,capture_output=True)
+                self.assertEqual(r.returncode,0,r.stderr)
+                doc=json.loads(r.stdout)
+                self.assertEqual(doc['name'],f'wps-{name}')
+                services=doc['services']
+                self.assertEqual(services['wordpress']['environment']['WP_MODE'],mode)
+                self.assertEqual(services['wordpress']['environment'], services['wp-cron']['environment'])
+                self.assertNotIn('edge',services['mariadb']['networks'])
+                self.assertNotIn('edge',services['wordpress']['networks'])
+                self.assertEqual(services['nginx']['networks']['edge']['aliases'],[f'wpops-{name}'])
+                self.assertTrue(any(v['target']=='/backups' and v['read_only'] for v in services['wp-cron']['volumes']))
+                self.assertTrue(any(v['target']=='/etc/nginx/wpops' for v in services['nginx']['volumes']))
+                self.assertFalse(any(v['target'].startswith('/var/www/html/wp-content/') for v in services['wordpress']['volumes']))
+                self.assertEqual((stack/'.env').stat().st_mode & 0o777,0o600)
+
+    def test_ports_names_and_modes_rejected(self):
+        for name,mode,domain,port in [('../x','single','x.example',18081),('x','other','x.example',18081),
+                                      ('x','single',"bad'host",18081),('x','single','x.example',80)]:
+            with self.assertRaises(config.ConfigError): provision.create(name,mode,domain,port)
+        provision.create('one','single','one.example',18081)
+        with self.assertRaises(config.ConfigError): provision.create('two','single','two.example',18081)
+
+    def test_examples_validate(self):
+        config.load_inventory(ROOT/'config/inventory.example.json')
+
+    def test_inventory_rejects_shared_single_and_duplicate_domains(self):
+        self.add_stack('one');self.add_site('one','one');self.add_site('two','one')
+        with self.assertRaisesRegex(config.ConfigError,'multiple sites'): self.inventory()
+        self.raw['sites'].pop()
+        self.add_stack('two');self.add_site('two','two')
+        self.raw['sites'][1]['domains']=['one.example']
+        with self.assertRaisesRegex(config.ConfigError,'multiple sites'): self.inventory()
+
+    def test_distinct_backup_endpoints_on_one_origin_and_legacy(self):
+        self.add_stack('one');self.add_stack('two','multisite')
+        self.raw['origins']['primary']['sync_api']='https://legacy.example'
+        self.raw['backup_sources']={n:{'origin':'backup','stack':n,'sync_api':f'https://{n}.example'} for n in ('one','two')}
+        inv=self.inventory()
+        with patch.object(backup,'source_key',return_value='secret'), patch.object(backup,'SyncClient') as client:
+            backup.client_for(inv,'one');backup.client_for(inv,'two');backup.client_for(inv,'primary')
+            self.assertEqual([c.args[0] for c in client.call_args_list],['https://one.example','https://two.example','https://legacy.example'])
+        with patch.object(backup,'node_config',return_value={'backup':{'sources':[]}}):
+            self.assertEqual(set(backup.sources_to_pull(inv)),{'one','two','primary'})
+
+    def test_batch_restore_cannot_target_wrong_stack(self):
+        self.add_stack('net','multisite');self.add_stack('other','multisite');self.add_site('one','net',3)
+        inv=self.inventory()
+        man={'source':'profile','source_origin':'primary','sites':[{'domain':'one.example','blog_id':10}]}
+        self.assertEqual(restore.build_batch_map(inv,man,'backup',['one'],'net')[0]['target_blog_id'],3)
+        with self.assertRaisesRegex(restore.RestoreError,'different target stack'):
+            restore.build_batch_map(inv,man,'backup',['one'],'other')
+
+    def test_custom_login_predeployment_and_per_blog_policy(self):
+        provision.create('net','multisite','net.example',18081)
+        with patch.object(provision,'install_login_plugin'):
+            provision.set_login('net','staff-entrance')
+            provision.set_login('net','shop-staff',2)
+        policy=json.loads((self.root/'stacks/net/policy/login-paths.json').read_text())
+        self.assertEqual(policy['default'],'staff-entrance')
+        self.assertEqual(policy['blogs']['2'],'shop-staff')
+        locations=(self.root/'stacks/net/nginx/login.conf').read_text()
+        self.assertIn('limit_req zone=wp_login',locations)
+        self.assertIn('shop',locations)
+        for bad in ['wp-admin','wp-login.php','x/y',"x';exit",'wp-json']:
+            with self.assertRaises(config.ConfigError): provision.login_slug(bad)
+
+    @unittest.skipUnless(os.environ.get('WPOPS_TEST_PHP') or shutil.which('php'), 'PHP CLI is optional for the policy hook check')
+    def test_php_policy_applies_defaults_overrides_and_activation(self):
+        policy=self.root/'policy.json'
+        policy.write_text(json.dumps({'enabled':True,'default':'staff-door','blogs':{'2':'news-editors'}}))
+        script=self.root/'policy-test.php'
+        script.write_text("<?php\n" +
+            "define('ABSPATH', '/'); define('WPOPS_LOGIN_POLICY_FILE', " + json.dumps(str(policy)) + ");\n" +
+            "function add_filter(...$args) {} function get_current_blog_id() { return $GLOBALS['blog']; } function is_multisite() { return false; }\n" +
+            "require " + json.dumps(str(ROOT/'plugin/wpops-policy.php')) + ";\n" +
+            "$GLOBALS['blog']=1; $one=wpops_login_slug(false); $GLOBALS['blog']=2; $two=wpops_login_slug(false); $GLOBALS['blog']=3; $new=wpops_login_slug(false);\n" +
+            "echo json_encode([$one,$two,$new,wpops_login_plugins(['existing/plugin.php'])]);")
+        r=subprocess.run([os.environ.get('WPOPS_TEST_PHP') or shutil.which('php'),'-n',str(script)],capture_output=True,text=True)
+        self.assertEqual(r.returncode,0,r.stderr)
+        self.assertEqual(json.loads(r.stdout),['staff-door','news-editors','staff-door',['existing/plugin.php','wps-hide-login/wps-hide-login.php']])
+
+    def test_sibling_failover_routes_before_dns_and_rollback_exactly(self):
+        self.add_stack('one');self.add_stack('net','multisite');self.add_site('one','one');self.add_site('shop','net',2)
+        inv=self.inventory();cfg={'node':'backup','failover':{'default_to':'backup','tunnel_service':'http://nginx:80'}}
+        dns={}
+        for s in inv.sites:
+            dns[s.domains[0]]=[{'id':s.slug+'-a','type':'A','content':'192.0.2.1','name':s.domains[0],'ttl':300,'proxied':True}]
+            dns[s.domains[1]]=[{'id':s.slug+'-w','type':'CNAME','content':s.domains[0],'name':s.domains[1],'ttl':300,'proxied':True}]
+        original=copy.deepcopy(dns);events=[];rolling_back=[False]
+        class CF:
+            def zone_id(self,d): return 'zone'
+            def dns_records(self,z,name): return copy.deepcopy(dns.get(name,[]))
+            def backup_zone(self,d): pass
+            def backup_tunnel(self,t): pass
+            def merge_tunnel_ingress(self,t,rules): events.append(('ingress',rules))
+            def remove_tunnel_ingress_hosts(self,t,hosts): events.append(("remove-ingress",hosts))
+            def delete_record(self,z,id):
+                aliases=json.loads(failover.alias_file(inv.origin('backup'),'one').read_text())['aliases']
+                if not rolling_back[0]:
+                    self_test.assertIn('www.one.example',aliases)
+                events.append(('delete',id))
+                for k in dns: dns[k]=[r for r in dns[k] if r['id']!=id]
+            def create_record(self,z,r):
+                item={**r,'id':'new-'+r['name']};dns.setdefault(r['name'],[]).append(item);return item
+        self_test=self
+        accounts={'customer':config.CfAccount(1,'customer','acct','secret')}
+        with patch.object(failover,'Cloudflare',return_value=CF()), patch.object(stacks,'ps',return_value=[{'service':x,'state':'running','health':'healthy'} for x in ('wordpress','nginx')]):
+            p=failover.plan(inv,inv.sites,cfg=cfg,accounts=accounts)
+            self.assertEqual(len(p.changes),4)
+            self.assertEqual({c.service for c in p.changes},{'http://wpops-one:80','http://wpops-net:80'})
+            result=failover.apply(inv,p,'test','backup',accounts,log=lambda _:None)
+            self.assertEqual(result['failed'],[])
+            self.assertEqual(events[0][0],'ingress')
+            aliases=json.loads(failover.alias_file(inv.origin('backup'),'net').read_text())['aliases']
+            self.assertEqual(aliases['www.shop.example']['blog_id'],2)
+            events.append(('rollback',None))
+            rolling_back[0]=True
+            partial=failover.rollback(inv,'test','backup',domains=['www.one.example'],accounts=accounts,log=lambda _:None)
+            self.assertEqual(partial['failed'],[])
+            self.assertFalse(any(e[0]=='remove-ingress' for e in events))
+            result=failover.rollback(inv,'test','backup',all_sites=True,accounts=accounts,log=lambda _:None)
+            self.assertEqual(result['failed'],[])
+        self.assertEqual(state.overrides(),{})
+        for name,recs in dns.items():
+            self.assertEqual([{k:v for k,v in r.items() if k!='id'} for r in recs], [{k:v for k,v in r.items() if k!='id'} for r in original[name]])
+
+    def test_ingress_failure_does_not_change_dns(self):
+        self.add_stack('one');self.add_site('one','one');inv=self.inventory()
+        change=failover.Change('one','one.example','customer','zone','primary','backup','one','http://wpops-one:80','tid',[],{'type':'CNAME'})
+        from unittest.mock import MagicMock
+        cf=MagicMock();cf.merge_tunnel_ingress.side_effect=Exception('unreachable')
+        accounts={'customer':config.CfAccount(1,'customer','acct','secret')}
+        with patch.object(failover,'Cloudflare',return_value=cf), patch.object(stacks,'ps',return_value=[{'service':x,'state':'running','health':'healthy'} for x in ('wordpress','nginx')]):
+            result=failover.apply(inv,failover.Plan('backup',[change]),'test','backup',accounts,log=lambda _:None)
+            self.assertTrue(result['failed']);cf.delete_record.assert_not_called();cf.create_record.assert_not_called()
+        with self.assertRaises(failover.FailoverError):
+            failover.apply(inv,failover.Plan('backup',[change]),'test','other',accounts)
+
+    def test_failed_dns_creation_can_retry_without_losing_original_records(self):
+        self.add_stack('one');self.add_site('one','one');self.raw['sites'][0]['domains']=['one.example'];inv=self.inventory()
+        from unittest.mock import MagicMock
+        cf=MagicMock();cf.zone_id.return_value='zone'
+        record={'id':'original','type':'A','content':'192.0.2.1','name':'one.example','ttl':300,'proxied':True}
+        dns=[record.copy()]
+        cf.dns_records.side_effect=lambda *a,**kw:copy.deepcopy(dns)
+        cf.delete_record.side_effect=lambda *a:dns.clear()
+        def create(*args):
+            if not getattr(create,'failed',False):
+                create.failed=True
+                raise failover.CfError('simulated create failure')
+            dns.append({**args[1],'id':'new'})
+            return dns[-1]
+        cf.create_record.side_effect=create
+        accounts={'customer':config.CfAccount(1,'customer','acct','secret')}
+        cfg={'node':'backup','failover':{'default_to':'backup','tunnel_service':'http://nginx:80'}}
+        with patch.object(failover,'Cloudflare',return_value=cf), patch.object(stacks,'ps',return_value=[{'service':x,'state':'running','health':'healthy'} for x in ('wordpress','nginx')]):
+            p=failover.plan(inv,inv.sites,cfg=cfg,accounts=accounts)
+            result=failover.apply(inv,p,'test','backup',accounts,log=lambda _:None)
+            self.assertTrue(result['failed']);self.assertEqual(dns,[])
+            retry=failover.plan(inv,inv.sites,cfg=cfg,accounts=accounts)
+            self.assertEqual(len(retry.changes),1)
+            result=failover.apply(inv,retry,'test','backup',accounts,log=lambda _:None)
+            self.assertEqual(result['failed'],[])
+            self.assertEqual(state.overrides()['one.example']['original_records'],[record])
+
+    def test_restore_reapplies_login_runtime_and_preserves_destination_policy(self):
+        provision.create('one','single','one.example',18081)
+        inv=config.load_inventory(self.file);origin=inv.origin('backup');path=Path(origin.stacks['one']['path'])
+        wc=path/'data/wordpress/wp-content';wc.mkdir(parents=True)
+        source=path/'managed-plugins/wps-hide-login/wps-hide-login.php';source.write_text('<?php // verified fixture')
+        policy=path/'policy/login-paths.json';policy.write_text(json.dumps({'enabled':True,'default':'staff-door','blogs':{}}))
+        before=policy.read_bytes();setdir=self.root/'backup-set';setdir.mkdir()
+        man={'source':'shop-source','nonce':'abc','files':[],'pulled_at':1}
+        def wp_call(origin,name,*args,**kwargs):
+            if args[:2]==('siteguardbackup','restore'):
+                shutil.rmtree(wc/'plugins',ignore_errors=True)
+                (wc/'wpops-host-aliases.json').write_text('{"aliases":{"wrong.example":{}}}')
+                return subprocess.CompletedProcess([],0,'Restore complete','')
+            return subprocess.CompletedProcess([],0,'imported','')
+        job=type('Job',(),{'log':staticmethod(lambda _:None),'set_progress':lambda *a,**k:None,'actor':'test','id':'job'})()
+        with patch.object(backup,'manifest',return_value=(setdir,man)), patch.object(backup,'save_manifest'), patch.object(restore,'node_config',return_value={}), patch.object(restore.disk,'require'), patch.object(restore,'require_free'), patch.object(restore,'_fix_content_ownership'), patch.object(restore,'wp',side_effect=wp_call), patch.object(restore,'_parse_import_timestamp',return_value=123), patch.object(stacks,'compose'):
+            restore.apply(job,inv,'backup','shop-source/set','one',all_sites=True)
+        self.assertEqual(policy.read_bytes(),before)
+        self.assertEqual((wc/'plugins/wps-hide-login/wps-hide-login.php').read_bytes(),source.read_bytes())
+        self.assertEqual(json.loads((wc/'wpops-host-aliases.json').read_text())['aliases'],{})
+
+    @unittest.skipUnless(shutil.which('docker'), 'needs the Docker CLI with Compose v2 (no daemon)')
+    def test_tunnels_without_main_and_multiple_legacy_networks(self):
+        self.add_stack('one');self.add_stack('net','multisite')
+        self.raw['origins']['backup']['stacks']['legacy']={'path':str(self.root/'legacy'),'mode':'multisite','service':'http://nginx:80'}
+        self.save()
+        from unittest.mock import MagicMock
+        cf=MagicMock();cf.verify_token.return_value={'status':'active'};cf.tunnel.return_value={'id':'tid'};cf.tunnel_token.return_value='fake-token'
+        accounts={'customer':config.CfAccount(1,'customer','acct','secret')}
+        with patch.object(tunnels,'Cloudflare',return_value=cf), patch.object(tunnels,'cf_accounts',return_value=accounts),patch.object(tunnels,'load_env',return_value={}):
+            tunnels.ensure(start=False,log=lambda _:None)
+        file=self.root/'docker-compose.wpops-tunnels.json';doc=json.loads(file.read_text())
+        self.assertEqual({n['name'] for n in doc['networks'].values()},{'wpops-edge','legacy_frontend'})
+        self.assertIn('cf-backup',doc['services'])
+        self.assertEqual(file.stat().st_mode & 0o777,0o600)
+        r=subprocess.run(['docker','compose','-f',str(file),'config','--quiet'],capture_output=True,text=True)
+        self.assertEqual(r.returncode,0,r.stderr)
+
+    def test_routes_use_distinct_services_and_refuse_foreign_dns(self):
+        self.add_stack('one');self.add_stack('net','multisite');self.add_site('one','one');self.add_site('news','net',2)
+        inv=self.inventory()
+        from unittest.mock import MagicMock
+        cf=MagicMock();cf.zone_id.return_value='zone';cf.dns_records.return_value=[]
+        accounts={'customer':config.CfAccount(1,'customer','acct','secret'),
+                  'standby':config.CfAccount(2,'standby','acct2','secret2',True)}
+        with patch.object(routes,'Cloudflare',return_value=cf):
+            p=routes.plan(inv,'backup',accounts)
+            self.assertEqual(p['refused'],[])
+            self.assertEqual({r['service'] for r in p['routes']},{'http://wpops-one:80','http://wpops-net:80'})
+            self.assertTrue(all(r['account']=='standby' for r in p['routes']))
+            cf.create_record.assert_not_called()
+            cf.dns_records.return_value=[{'type':'A','content':'192.0.2.44'}]
+            with self.assertRaisesRegex(config.ConfigError,'routing refused'): routes.apply(inv,'backup',accounts)
+            cf.merge_tunnel_ingress.assert_not_called();cf.create_record.assert_not_called()
+
+    def test_legacy_stack_is_addressed_by_container_name_next_to_other_stacks(self):
+        # Alone on a node, the legacy stack keeps its configured service.
+        self.raw['origins']['backup']['stacks']['legacy']={'path':str(self.root/'WordPress.Multisite'),'mode':'multisite','service':'http://nginx:80'}
+        self.add_site('main','legacy',1)
+        inv=self.inventory()
+        self.assertEqual(stacks.ingress_service(inv.origin('backup'),'legacy'),'http://nginx:80')
+        # Next to a managed stack, every Nginx on the edge network answers to
+        # "nginx", so the legacy route must name its own container.
+        self.add_stack('one');self.add_site('one','one')
+        inv=self.inventory()
+        self.assertEqual(stacks.ingress_service(inv.origin('backup'),'legacy'),'http://wordpressmultisite-nginx-1:80')
+        self.assertEqual(stacks.ingress_service(inv.origin('backup'),'one'),'http://wpops-one:80')
+        from unittest.mock import MagicMock
+        cf=MagicMock();cf.zone_id.return_value='zone';cf.dns_records.return_value=[]
+        accounts={'customer':config.CfAccount(1,'customer','acct','secret'),
+                  'standby':config.CfAccount(2,'standby','acct2','secret2',True)}
+        with patch.object(routes,'Cloudflare',return_value=cf):
+            p=routes.plan(inv,'backup',accounts)
+        self.assertEqual({r['stack']:r['service'] for r in p['routes']},
+                         {'legacy':'http://wordpressmultisite-nginx-1:80','one':'http://wpops-one:80'})
+        cfg={'node':'backup','failover':{'default_to':'backup','tunnel_service':'http://nginx:80'}}
+        dns={'main.example':[{'id':'a','type':'A','content':'192.0.2.1','name':'main.example'}]}
+        cf.dns_records.side_effect=lambda z,name:copy.deepcopy(dns.get(name,[]))
+        with patch.object(failover,'Cloudflare',return_value=cf):
+            p=failover.plan(inv,[inv.site('main')],cfg=cfg,accounts={'customer':accounts['customer']})
+        self.assertEqual({c.service for c in p.changes},{'http://wordpressmultisite-nginx-1:80'})
+
+    @unittest.skipUnless(shutil.which('docker'), 'needs the Docker CLI with Compose v2 (no daemon)')
+    def test_legacy_root_config_is_shared_with_cli_in_both_modes(self):
+        for mode in ('single','multisite'):
+            r=subprocess.run(['docker','compose','-f',str(ROOT/'docker-compose.yml'),
+                              '--env-file',str(ROOT/'.env.example'),'config','--format','json'],
+                             env={**os.environ,'WP_MODE':mode},capture_output=True,text=True)
+            self.assertEqual(r.returncode,0,r.stderr)
+            doc=json.loads(r.stdout)['services']
+            self.assertEqual(doc['wordpress']['environment']['WORDPRESS_CONFIG_EXTRA'],
+                             doc['wp-cron']['environment']['WORDPRESS_CONFIG_EXTRA'])
+            self.assertIn("if ('"+mode+"' === 'multisite')",doc['wordpress']['environment']['WORDPRESS_CONFIG_EXTRA'])
+
+    def test_agent_accepts_backup_profile_names(self):
+        from wpops.agent import Agent
+        self.raw['backup_sources']={'shop-source':{'origin':'primary','sync_api':'https://shop.example'}}
+        inv=self.inventory();agent=Agent.__new__(Agent);agent.inv=inv
+        agent.cfg={'node':'backup'};agent.reload=lambda:None
+        from unittest.mock import MagicMock
+        with patch('wpops.agent.jobs.Job',return_value=MagicMock(id='job')) as job, patch('wpops.agent.jobs.start_background'), patch('wpops.agent.jobs.active',return_value=False):
+            result=agent.route('POST','/v1/backups/pull',{}, {'source':'shop-source'},'test')
+            self.assertEqual(result,{'job':'job'})
+            self.assertEqual(job.call_args.args[1]['source'],'shop-source')
+        with patch.object(backup,'set_schedule',return_value={'ok':True}) as schedule:
+            agent.route('POST','/v1/backups/schedule',{}, {'sources':['shop-source']},'test')
+            self.assertEqual(schedule.call_args.args[2],['shop-source'])
+
+    def test_setup_bootstraps_empty_inventory_for_chosen_node(self):
+        fresh=self.root/'fresh';fresh.mkdir()
+        r=subprocess.run([str(ROOT/'scripts/wpops/bin/wpops'),'setup','--node','fresh-node'],
+                         env={**os.environ,'WPOPS_REPO_DIR':str(fresh)},capture_output=True,text=True)
+        self.assertEqual(r.returncode,0,r.stderr)
+        self.assertEqual(json.loads((fresh/'config/inventory.json').read_text())['origins'],
+                         {'fresh-node':{'kind':'node','stacks':{},'tunnels':{}}})
+
+    @unittest.skipUnless(shutil.which('jq'), 'jq is optional for the shell backup check')
+    def test_shell_backup_resolves_inventory_tunnels_and_legacy_fallback(self):
+        script = r'''source "$1/scripts/cf-common.sh"
+PROJECT_DIR="$2"
+cf_api() { printf '{"result":{"id":"%s"}}\n' "$2"; }
+get_tunnel_by_name() { printf '{"id":"%s"}\n' "$3"; }
+get_configured_tunnel acct dummy customer
+'''
+        r=subprocess.run(['bash','-eu','-c',script,'test',str(ROOT),str(self.root)],capture_output=True,text=True)
+        self.assertEqual(r.returncode,0,r.stderr)
+        self.assertEqual(json.loads(r.stdout)['id'],'/accounts/acct/cfd_tunnel/tid')
+        (self.root/'config/wpops.json').unlink()
+        r=subprocess.run(['bash','-eu','-c',script,'test',str(ROOT),str(self.root)],capture_output=True,text=True)
+        self.assertEqual(r.returncode,0,r.stderr)
+        self.assertEqual(json.loads(r.stdout)['id'],'wp-docker-customer')
+
+    def test_parent_compose_settings_do_not_cross_stack_boundaries(self):
+        self.add_stack('one');inv=self.inventory()
+        with patch.dict(os.environ,{'COMPOSE_PROJECT_NAME':'wrong','COMPOSE_FILE':'wrong.yml'}), patch.object(stacks.subprocess,'run') as run:
+            stacks.compose(inv.origin('backup'),'one','ps')
+            self.assertNotIn('COMPOSE_FILE',run.call_args.kwargs['env'])
+            self.assertEqual(run.call_args.kwargs['cwd'],self.root/'one')
+
+
+if __name__=='__main__': unittest.main()

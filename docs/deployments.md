@@ -1,0 +1,289 @@
+# Independent WordPress deployments
+
+A node can run any number of independent single-site WordPress installations,
+multisite networks, or both, up to the host's available resources. A deployment
+is called a **stack**; a multisite stack can contain many blogs. Every stack
+owns its MariaDB, Redis, files, cron, credentials and private networks. Only its
+Nginx joins `wpops-edge`, using a unique name such as `wpops-shop`.
+Managed private networks allocate two /25s per stack from `10.214.0.0/16`
+(up to 254 managed stacks per checkout), avoiding Docker default-pool exhaustion.
+Adjust this range in the template if it overlaps your LAN or VPN.
+Cloudflare connectors and DNS backups are shared node services. WordPress
+containers do not receive Cloudflare credentials.
+
+The original root `docker-compose.yml` remains supported. It defaults to
+`WP_MODE=multisite`; set `WP_MODE=single` for a single-site root deployment.
+Changing that variable does **not** convert an existing database. The isolated
+`instance.sh` environments remain development tools; use the commands below
+for production stacks.
+
+## 1. Configure this node
+
+Requirements: Python 3.10+, Docker with Compose v2.20+ (or newer), and a user
+that can access Docker and write the checkout. Restoring root-owned content
+may require running the wpops agent as root, as with the existing agent.
+
+From the checkout root:
+
+```bash
+cp .env.example .env
+# Edit .env: CF_ACCOUNT_n_NAME, _ID, _TOKEN and _STANDBY.
+# Root-project DB credentials are unused if you deploy only managed stacks.
+# See cloudflare-token-setup.md for token permissions.
+wpops() { ./scripts/wpops/bin/wpops "$@"; }
+wpops setup --node node-a
+```
+
+First setup writes an empty `config/inventory.json` for your chosen node.
+It does not populate example sites or change DNS. The node name must be a slug.
+The inventory is local and gitignored. Keep a protected copy on each node and
+keep site/origin definitions consistent between nodes.
+
+## 2. Create and initialise stacks
+
+`create` writes configuration and registers the stack; it starts no containers
+and changes no DNS. Supply a different loopback HTTP port for each stack.
+A custom login path downloads WPS Hide Login 1.9.19 from WordPress.org and
+checks its pinned SHA-256. Its verified copy lives outside WordPress content.
+
+Two independent single sites:
+
+```bash
+wpops stack create shop --mode single --domain shop.example.com --port 18081 --login-path staff-door
+wpops stack create blog --mode single --domain blog.example.com --port 18082 --login-path editors
+```
+
+One multisite network (use just this command for a multisite-only node):
+
+```bash
+wpops stack create network --mode multisite --domain network.example.com --port 18083 --login-path network-staff
+```
+
+Running all three gives a mixed node. Add further single or multisite stacks in
+the same way. Multisite defaults to domain/subdomain mode; use
+`--subdirectories` for a path-based network. `init` creates only the main blog;
+add blogs explicitly with WP-CLI or Network Admin. For standby/staging stacks,
+use the standby hostname as `--domain` and add `--noindex` at creation.
+
+```bash
+wpops stack init shop --admin-email admin@example.com
+wpops stack init blog --admin-email admin@example.com
+wpops stack init network --admin-email admin@example.com
+wpops stack compose network exec -T wp-cron wp site create --slug=news --title=News --email=admin@example.com
+wpops stack list
+```
+
+Initial credentials are in `stacks/<name>/.env` (0600); passwords are passed to
+the installer via stdin. `init` refuses to install over a populated database.
+If you need HTTP-only local testing, pass `--scheme http` to `init` and visit the
+loopback port with the configured Host header. Production URLs default to HTTPS.
+Image tags match the existing production stack. `WORDPRESS_IMAGE` in a stack's
+`.env` can select a compatible FPM image; review upgrades against your plugins.
+
+Use `wpops stack up NAME`, `wpops stack stop NAME`, or
+`wpops stack compose NAME <compose arguments>`. The latter also supports normal
+Compose commands such as `logs`, `config`, `exec`, `pull` and `down`. There is no
+automatic destructive database migration when changing the deployment mode.
+
+## 3. Map sites to stacks and origins
+
+`stack create` writes the local `origins.node-a.stacks` entries automatically.
+Add logical sites and remote origins to `config/inventory.json`. A single-site
+stack takes one logical site, with any number of domain aliases. Each blog in a
+domain-based multisite can be a logical site with its own domain list and blog ID.
+For path-based blogs sharing a domain, DNS failover applies to the whole domain;
+represent that network as one logical site at its main blog. DNS cannot switch
+one URL path independently of another path on the same hostname.
+
+A site can use a different stack on each node. Example site fragment:
+
+```json
+{
+  "slug": "shop",
+  "primary": "primary",
+  "failover_to": "node-a",
+  "cf_account": "customer",
+  "domains": ["shop.example.com", "www.shop.example.com"],
+  "hosts": {
+    "primary": {"host": "shop.example.com"},
+    "node-a": {"stack": "shop", "host": "shop.standby.example.net"},
+    "node-b": {"stack": "shared-network", "blog_id": 7, "host": "shop.other-standby.example.net"}
+  }
+}
+```
+
+Define `primary` as an external origin with the A/CNAME targets that identify
+its production DNS. Define `node-b` as a node with its stacks and tunnels if
+using it. Omit unused origins/host entries. A node can itself be a site's
+`primary`, so this supports active primary stacks as well as standby copies.
+Set `host` to the site's actual installed hostname on that origin. Multisite
+hosts require a positive `blog_id`. All selected sites must have mappings for
+the destination node. `--stack` on failover cannot bypass that mapping.
+
+For an existing root stack, configure its absolute `path`, `mode`, and
+`service: "http://nginx:80"`. On a node with more than one stack, wpops routes
+that stack to its container (`<project>-nginx-1`, where the project is
+`project` from the inventory or the directory name), because every stack's
+Nginx answers to `nginx` on the shared networks. Set `ingress_network` explicitly if its Compose
+network name differs from `<directory>_frontend`. Enable `WP_SUNRISE=true` for
+multisite host aliases and recreate the WordPress/cron containers. Managed
+stacks enable the host-alias runtime automatically.
+
+## 4. Cloudflare routes and failover
+
+```bash
+wpops tunnels ensure
+wpops routes plan
+wpops routes apply --yes
+```
+
+`ensure` creates/reuses per-account tunnels and runs a standalone connector
+project plus the six-hourly Cloudflare DNS/config backup worker. It works
+without a root/main WordPress stack. Existing inventory tunnel IDs are reused;
+new tunnel names include the node name so different nodes do not accidentally
+share one tunnel. Start configured legacy stacks before starting connectors
+that need their external frontend networks.
+
+`routes` publishes this node's installed standby hostnames, plus production
+hostnames for sites whose `primary` is this node. The standby Cloudflare account
+must have access to the standby hostname's zone. Every hostname points to the
+correct stack's unique service address, including multisite blogs and aliases.
+The plan refuses existing DNS pointing elsewhere or domains with active
+failover overrides. It does not take production traffic away from another
+origin. Review the plan; use failover for temporary traffic moves, or migrate
+existing DNS explicitly for a permanent primary deployment.
+
+Do not run the legacy `cf-setup.sh`/`cf-failover.sh` scripts to manage this mixed
+fleet: those scripts assume the root Nginx service. If migrating an existing
+connector installation, stop the old connectors before starting the new
+standalone connector project, to avoid competing configurations on a shared
+tunnel. `cf-backup.sh`, `cf-status.sh` and the stored DNS backups remain usable.
+
+Before a failover, pull/apply a recent backup to the destination. Failover
+switches routing; it does not synchronise databases or merge writes.
+
+```bash
+# Run on node-a (the destination):
+wpops failover plan --sites shop --to node-a
+wpops failover apply --sites shop --to node-a --yes
+# Multiple sites keep their individual stack mappings:
+wpops failover plan --all --to node-a
+# Return traffic to the saved original DNS records:
+wpops failover rollback --sites shop --yes
+```
+
+Failover checks local stack readiness, backs up DNS/tunnel configuration, and
+prepares ingress and host aliases before changing DNS. `www` CNAME aliases are
+included and their original relationships are restored on rollback. Run apply
+and rollback on the node holding the local overrides. DNS and application
+readiness across real nodes still require a deployment smoke test.
+
+## 5. Backups for multiple installations on one origin
+
+SiteGuard Backup with its sync API and WP-CLI import/restore commands must be
+installed on the source and destination installations. It is an external
+plugin, not bundled in this repository. Existing `origins.<name>.sync_api`
+entries still work. For multiple endpoints on one origin, add named profiles:
+
+```json
+"backup_sources": {
+  "primary-shop": {
+    "origin": "primary",
+    "sync_api": "https://shop.example.com"
+  },
+  "primary-blog": {
+    "origin": "primary",
+    "sync_api": "https://blog.example.com"
+  },
+  "node-b-network": {
+    "origin": "node-b",
+    "stack": "shared-network",
+    "sync_api": "https://network.other-standby.example.net"
+  }
+}
+```
+
+Configure `.env` with `WPOPS_SYNC_KEY_PRIMARY_SHOP`,
+`WPOPS_SYNC_KEY_PRIMARY_BLOG`, etc. (uppercase profile name, hyphens become
+underscores). The legacy shared `WPOPS_SYNC_KEY` fallback also works. HTTPS is
+required except for loopback sources. Profile names must differ from origin
+names. Omit a legacy origin-level `sync_api` when profiles replace it, to avoid
+pulling the same source twice in an unrestricted schedule.
+
+```bash
+wpops backup sources
+wpops backup pull --source primary-shop
+wpops backup list --source primary-shop
+wpops restore apply --set primary-shop/SET_ID --stack shop --all --yes
+wpops backup schedule --set daily:03:30 --sources primary-shop,primary-blog --retain 4
+# For a selected domain-based blog in a multisite backup:
+wpops restore apply --set node-b-network/SET_ID --stack network --sites news --yes
+```
+
+Add the `news` site's source and destination host/blog mappings before a
+selected-blog restore. Backups are mounted read-only into every stack's cron/CLI
+container. Retention, checksums, disk reserves, notifications and the existing
+agent schedule apply to each source profile. Backup manifests record both the
+profile and its source origin/stack so restore mapping remains unambiguous.
+
+Topology support does not itself convert single-site databases into multisite
+or split networks into singles; cross-mode content migrations depend on the
+SiteGuard version and its supported migration options. Test those migrations
+separately. Use matching source/destination modes for ordinary full restores.
+
+## 6. Custom login paths
+
+The requested behaviour uses [WPS Hide Login](https://wordpress.org/plugins/wps-hide-login/):
+the login form moves to your slug, `/wp-login.php` and logged-out `/wp-admin`
+access are hidden, and the authenticated dashboard still uses `/wp-admin`.
+WordPress public AJAX/REST endpoints remain available to themes and plugins.
+A slug is a single segment containing lowercase letters, numbers and hyphens;
+reserved WordPress paths are rejected.
+
+```bash
+# Set before init, or change an existing deployment:
+wpops stack login shop --path staff-door
+# Per-blog overrides in a multisite network (including a subdirectory blog):
+wpops stack login network --path network-staff
+wpops stack login network --blog-id 2 --path news-editors
+# After changing paths on a RUNNING stack, reload custom-login rate-limit rules:
+wpops stack compose network exec -T nginx nginx -s reload
+```
+
+The default applies to every blog without an override, including newly created
+blogs. A path-based blog uses its own site prefix (e.g.
+`https://network.example.com/news/news-editors/`). Domain-mapped blogs use their
+own hostname. Login, reset-password and logout links are generated by the
+plugin. Custom login requests receive the same Nginx rate limit as the default
+login endpoint. Exclude every custom login path from Cloudflare/page caching.
+Do not create a WordPress page or another route using that slug.
+
+Deployment policy is in `stacks/<name>/policy/login-paths.json`, mounted outside
+wp-content. The deployment MU plugins also live outside restored content and
+continue to load site-provided MU plugins. After a wpops restore, destination
+host-alias files and the verified login plugin are reapplied. Do not activate a
+competing login-hiding plugin on the same installation.
+
+For emergency recovery, set `"enabled": false` in the policy file and deactivate
+WPS Hide Login through WP-CLI if it was separately activated in the database.
+This restores the normal WordPress login. Re-enable the policy after correcting
+the configured slug. This feature is not an authentication replacement; normal
+WordPress user permissions continue to apply.
+
+## Validation
+
+```bash
+# Optional: WPOPS_TEST_PHP=/path/to/php enables the PHP policy hook check.
+python3 -m unittest discover -s tests -v
+wpops stack compose shop config --quiet
+wpops stack compose shop exec -T nginx nginx -t
+```
+
+The offline suite covers all deployment combinations, Compose isolation,
+source profiles, destination mapping, login policy, connector generation and
+mocked Cloudflare failover/rollback. Before production use, run a live rehearsal
+with disposable domains: install single/multisite stacks, test login/reset/logout,
+pull and restore SiteGuard backups, switch apex and www, check the correct
+site content, and roll back. Cloudflare API calls and live containers require
+your credentials and Docker access; the offline suite does not simulate those
+external services completely.

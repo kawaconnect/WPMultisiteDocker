@@ -63,3 +63,7 @@ instances/
 
 # Client site provisioners and any per-client content live outside the repo (archive on the host)
 sites/
+
+# Managed production stacks: generated secrets, content and login policies
+stacks/
+docker-compose.wpops-tunnels.json

@@ -58,16 +58,21 @@ def _timestamp_from_history(origin, stack: str, nonce: str) -> int | None:
     return None
 
 
-def build_batch_map(inv: Inventory, man: dict[str, Any], node: str, sites: list[str]) -> list[dict[str, Any]]:
+def build_batch_map(inv: Inventory, man: dict[str, Any], node: str, sites: list[str], stack: str | None = None) -> list[dict[str, Any]]:
     src_sites = man.get("sites") or []
     by_domain = {str(s.get("domain", "")).lower(): s for s in src_sites}
     out = []
     for slug in sites:
         site = inv.site(slug)
-        src_host = (site.host_on(man["source"]) or {}).get("host", "").lower()
+        src_host = (site.host_on(man.get("source_origin", man["source"])) or {}).get("host", "").lower()
         dst = site.host_on(node) or {}
         if not src_host or src_host not in by_domain:
             raise RestoreError(f"site '{slug}': source host '{src_host}' is not in the backup's site list")
+        if stack and dst.get("stack") != stack:
+            raise RestoreError(f"site '{slug}' belongs to a different target stack")
+        src = site.host_on(man.get("source_origin", man["source"])) or {}
+        if man.get("source_stack") and src.get("stack") != man["source_stack"]:
+            raise RestoreError(f"site '{slug}' belongs to a different source stack")
         if not dst.get("blog_id"):
             raise RestoreError(f"site '{slug}': no blog_id on node '{node}'")
         out.append({
@@ -92,6 +97,10 @@ def apply(job: Job, inv: Inventory, node: str, set_ref: str, stack: str, sites: 
     missing = [f["name"] for f in man["files"] if not (set_dir / f["name"]).exists()]
     if missing:
         raise RestoreError(f"{set_ref} is missing files: {', '.join(missing[:5])}")
+    # Validate site-to-stack mapping before importing or changing files.
+    batch_map = build_batch_map(inv, man, node, sites, stack) if mode == "multisite" and sites else None
+    if all_sites and sites:
+        raise RestoreError("choose --all or --sites, not both")
     _fix_content_ownership(Path(origin.stacks[stack].get("path") or REPO_DIR) / "data" / "wordpress" / "wp-content", log)
     set_bytes = sum(int(f.get("size", 0)) for f in man["files"])
     stack_dir = Path(origin.stacks[stack].get("path") or REPO_DIR)
@@ -130,12 +139,22 @@ def apply(job: Job, inv: Inventory, node: str, set_ref: str, stack: str, sites: 
             if all_sites:
                 args.append("--subsite-mode=mirror")
             else:
-                bmap = build_batch_map(inv, man, node, sites or [])
+                bmap = batch_map
                 args += ["--subsite-mode=batch", "--batch-subsite-map=" + json.dumps(bmap)]
                 log("batch map: " + json.dumps(bmap))
         job.set_progress(phase="restore", timestamp=ts)
         log("restore: wp " + " ".join(a if not a.startswith("--batch-subsite-map") else "--batch-subsite-map=…" for a in args))
         r = wp(origin, stack, *args, timeout=4 * 3600)
+        # A content restore can replace sunrise, plugins and the alias map.
+        # Reapply this node's runtime policy even when the restore reports failure.
+        from .stacks import install_host_alias
+        if origin.stacks[stack].get('managed'):
+            from .provision import install_runtime
+            install_runtime(origin, stack)
+        else:
+            install_host_alias(origin, stack, log=log)
+        from .failover import write_aliases
+        write_aliases(inv, node)
         tail = (r.stdout or "").strip().splitlines()[-40:]
         for line in tail:
             log(line)

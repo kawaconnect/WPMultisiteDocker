@@ -64,11 +64,11 @@ load_config() {
     set +a
 
     # Validate required CF vars
-    if [ -z "${CF_STANDBY_DOMAIN:-}" ]; then
+    if [ "${1:-}" != "--read-only" ] && [ -z "${CF_STANDBY_DOMAIN:-}" ]; then
         log_error "CF_STANDBY_DOMAIN not set in .env"
         exit 1
     fi
-    if [ -z "${CF_CLOUD_IP:-}" ]; then
+    if [ "${1:-}" != "--read-only" ] && [ -z "${CF_CLOUD_IP:-}" ]; then
         log_error "CF_CLOUD_IP not set in .env"
         exit 1
     fi
@@ -101,7 +101,7 @@ load_config() {
         fi
     done
 
-    log_ok "Config loaded: $account_count account(s), standby=$CF_STANDBY_DOMAIN"
+    log_ok "Config loaded: $account_count account(s), standby=${CF_STANDBY_DOMAIN:-unset}"
 }
 
 # get_account_count, returns number of configured CF accounts
@@ -276,7 +276,7 @@ require_backup() {
 
         # Backup tunnel config if tunnel exists
         local tunnel_json
-        tunnel_json=$(get_tunnel_by_name "$account_id" "$api_token" "$tunnel_name" 2>/dev/null)
+        tunnel_json=$(get_configured_tunnel "$account_id" "$api_token" "$name" 2>/dev/null)
         if [ -n "$tunnel_json" ]; then
             local tunnel_id
             tunnel_id=$(echo "$tunnel_json" | jq -r '.id')
@@ -473,6 +473,24 @@ get_tunnel_by_name() {
     tunnel=$(echo "$response" | jq -r '.result[0] // empty')
     if [ -n "$tunnel" ] && [ "$tunnel" != "null" ]; then
         echo "$tunnel"
+    fi
+}
+
+# get_configured_tunnel ACCOUNT_ID TOKEN ACCOUNT_NAME
+# Prefer the wpops inventory; retain name lookup for legacy-only deployments.
+get_configured_tunnel() {
+    local account_id="$1" token="$2" account_name="$3" node="" tunnel_id=""
+    if [ -f "$PROJECT_DIR/config/wpops.json" ] && [ -f "$PROJECT_DIR/config/inventory.json" ]; then
+        node=$(jq -r '.node // empty' "$PROJECT_DIR/config/wpops.json") || return 1
+        tunnel_id=$(jq -r --arg node "$node" --arg account "$account_name" \
+            '.origins[$node].tunnels[$account] // empty' "$PROJECT_DIR/config/inventory.json") || return 1
+    fi
+    if [ -n "$tunnel_id" ]; then
+        local response
+        response=$(cf_api GET "/accounts/$account_id/cfd_tunnel/$tunnel_id" "$token") || return 1
+        echo "$response" | jq -c '.result // empty'
+    else
+        get_tunnel_by_name "$account_id" "$token" "wp-docker-$account_name"
     fi
 }
 

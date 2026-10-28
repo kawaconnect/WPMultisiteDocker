@@ -183,7 +183,7 @@ class Agent:
                 return {"job": job.id}
             if p == ["backups", "pull"]:
                 source = body.get("source") or ""
-                if source not in self.inv.origins:
+                if source not in self.inv.sources():
                     raise ApiError(400, "unknown source")
                 if jobs.active("backup.pull"):
                     raise ApiError(409, "a pull is already running")
@@ -204,8 +204,8 @@ class Agent:
                 sources = body.get("sources")
                 if sources is not None:
                     if not isinstance(sources, list) or not all(isinstance(s, str) for s in sources):
-                        raise ApiError(400, "sources must be a list of origin names")
-                    unknown = [s for s in sources if s not in self.inv.origins]
+                        raise ApiError(400, "sources must be a list of backup source names")
+                    unknown = [s for s in sources if s not in self.inv.sources()]
                     if unknown:
                         raise ApiError(400, f"unknown sources: {', '.join(unknown)}")
                 return bk.set_schedule(schedule, retain, sources)

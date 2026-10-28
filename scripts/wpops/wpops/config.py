@@ -206,10 +206,24 @@ class Site:
 
 
 @dataclass
+class BackupSource:
+    name: str
+    origin: str
+    sync_api: str
+    stack: str = ""
+
+
+@dataclass
 class Inventory:
     origins: dict[str, Origin]
     sites: list[Site]
     raw: dict[str, Any]
+    backup_sources: dict[str, BackupSource] = field(default_factory=dict)
+
+    def sources(self) -> dict[str, BackupSource]:
+        sources = {n: BackupSource(n, n, o.sync_api) for n, o in self.origins.items() if o.sync_api}
+        sources.update(self.backup_sources)
+        return sources
 
     def site(self, slug: str) -> Site:
         for s in self.sites:
@@ -245,6 +259,24 @@ def _checked_sync_api(origin: str, url: str) -> str:
 
 
 def _validate_inventory(inv: Inventory) -> None:
+    domains: set[str] = set()
+    single_sites: set[tuple[str, str]] = set()
+    for o in inv.origins.values():
+        if o.kind not in ("node", "external"):
+            raise ConfigError(f"origin '{o.name}': kind must be node or external")
+        for name, st in o.stacks.items():
+            if not _SLUG_RE.fullmatch(name) or st.get("mode", "multisite") not in ("single", "multisite"):
+                raise ConfigError(f"origin '{o.name}': invalid stack name or mode: {name}")
+            if not st.get("path") or not Path(st["path"]).is_absolute():
+                raise ConfigError(f"stack '{name}': path must be absolute")
+    for name, src in inv.backup_sources.items():
+        if not _SLUG_RE.fullmatch(name) or name in inv.origins:
+            raise ConfigError(f"backup source '{name}': use a unique slug distinct from origins")
+        origin = inv.origin(src.origin)
+        if src.stack and src.stack not in origin.stacks:
+            raise ConfigError(f"backup source '{name}': unknown stack '{src.stack}'")
+        if not src.sync_api:
+            raise ConfigError(f"backup source '{name}': sync_api is required")
     seen: set[str] = set()
     for s in inv.sites:
         if not _SLUG_RE.match(s.slug):
@@ -259,6 +291,9 @@ def _validate_inventory(inv: Inventory) -> None:
         for d in s.domains:
             if not _HOST_RE.match(d.lower()):
                 raise ConfigError(f"site '{s.slug}': domain '{d}' is invalid")
+            if d in domains:
+                raise ConfigError(f"domain '{d}' belongs to multiple sites")
+            domains.add(d)
         for oname, h in s.hosts.items():
             if oname not in inv.origins:
                 raise ConfigError(f"site '{s.slug}': hosts.{oname} is not a defined origin")
@@ -269,8 +304,19 @@ def _validate_inventory(inv: Inventory) -> None:
                     raise ConfigError(f"site '{s.slug}': hosts.{oname}.stack '{stack}' is not a stack of node '{oname}'")
                 if o.stacks[stack].get("mode", "multisite") == "multisite" and not h.get("blog_id"):
                     raise ConfigError(f"site '{s.slug}': hosts.{oname} needs blog_id (multisite stack)")
+                if o.stacks[stack].get("mode", "multisite") == "single":
+                    key = (oname, stack)
+                    if key in single_sites:
+                        raise ConfigError(f"single-site stack '{oname}/{stack}' has multiple sites")
+                    single_sites.add(key)
+                    if h.get("blog_id") not in (None, 1):
+                        raise ConfigError(f"single-site stack '{stack}': blog_id must be omitted or 1")
+                elif isinstance(h.get("blog_id"), bool) or not isinstance(h.get("blog_id"), int) or h['blog_id'] < 1:
+                    raise ConfigError(f"site '{s.slug}': blog_id must be a positive integer")
             if not h.get("host"):
                 raise ConfigError(f"site '{s.slug}': hosts.{oname}.host is required")
+            if not _HOST_RE.fullmatch(h['host'].lower()):
+                raise ConfigError(f"site '{s.slug}': invalid host '{h['host']}'")
 
 
 def load_inventory(path: Path = INVENTORY_FILE) -> Inventory:
@@ -302,7 +348,9 @@ def load_inventory(path: Path = INVENTORY_FILE) -> Inventory:
         )
         for s in raw.get("sites", [])
     ]
-    inv = Inventory(origins=origins, sites=sites, raw=raw)
+    sources = {name: BackupSource(name, src['origin'], _checked_sync_api(name, src.get('sync_api', '')),
+                                  src.get('stack', '')) for name, src in raw.get('backup_sources', {}).items()}
+    inv = Inventory(origins=origins, sites=sites, raw=raw, backup_sources=sources)
     _validate_inventory(inv)
     return inv
 
@@ -316,6 +364,8 @@ def public_inventory(inv: Inventory) -> dict[str, Any]:
                 "standby_domain": o.standby_domain, "stacks": o.stacks, "tunnels": o.tunnels,
             } for n, o in inv.origins.items()
         },
+        "backup_sources": {n: {"origin": src.origin, "stack": src.stack, "sync_api": bool(src.sync_api)}
+                           for n, src in inv.sources().items()},
         "sites": [
             {
                 "slug": s.slug, "name": s.name, "primary": s.primary, "cf_account": s.cf_account,

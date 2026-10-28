@@ -1,5 +1,11 @@
 # WordPress Multisite: Docker Infrastructure
 
+> **Multiple independent WordPress deployments:** See [the deployment guide](docs/deployments.md)
+> for multiple single sites, one or more multisite networks, mixed deployments,
+> per-site Cloudflare failover/backup routing, and custom login URLs. Use
+> `wpops stack create` for production stacks; `instance.sh` remains a test tool.
+
+
 Docker-based WordPress Multisite with Nginx reverse proxy, MariaDB, Redis object cache, WP-CLI cron, and Cloudflare tunnel support. Designed as standby/failover infrastructure with automatic multisite activation on DB sync.
 
 ## Architecture

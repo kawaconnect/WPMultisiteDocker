@@ -33,7 +33,7 @@ echo ""
 # ── Validate ──────────────────────────────────────────────────────────────────
 
 check_deps
-load_config
+load_config --read-only
 
 ACCOUNT_COUNT=$(get_account_count)
 ERRORS=0
@@ -61,7 +61,7 @@ for ((n = 1; n <= ACCOUNT_COUNT; n++)); do
     done
 
     # Backup tunnel config
-    tunnel_json=$(get_tunnel_by_name "$account_id" "$api_token" "$tunnel_name" 2>/dev/null)
+    tunnel_json=$(get_configured_tunnel "$account_id" "$api_token" "$name" 2>/dev/null)
     if [ -n "$tunnel_json" ]; then
         tunnel_id=$(echo "$tunnel_json" | jq -r '.id')
         backup_tunnel_config "$name" "$account_id" "$api_token" "$tunnel_id" || ERRORS=$((ERRORS + 1))

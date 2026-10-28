@@ -25,13 +25,17 @@ def stack_path(origin: Origin, name: str) -> Path:
 
 
 def compose(origin: Origin, name: str, *args: str, timeout: int = 3600, check: bool = True,
-            capture: bool = True) -> subprocess.CompletedProcess:
+            capture: bool = True, input_text: str | None = None) -> subprocess.CompletedProcess:
     path = stack_path(origin, name)
     cmd = ["docker", "compose", *args]
     env = dict(os.environ)
+    # A parent shell's Compose project must not select another stack's containers.
+    for key in list(env):
+        if key.startswith('COMPOSE_'):
+            env.pop(key)
     env.setdefault("COMPOSE_INTERACTIVE_NO_CLI", "1")
     return subprocess.run(cmd, cwd=path, env=env, text=True, timeout=timeout, check=check,
-                          capture_output=capture)
+                          capture_output=capture, input=input_text)
 
 
 def wp(origin: Origin, name: str, *args: str, timeout: int = 3600, url: str | None = None) -> subprocess.CompletedProcess:
@@ -109,8 +113,34 @@ def install_host_alias(origin: Origin, name: str, log=print) -> dict[str, Any]:
     aliases = wc / "wpops-host-aliases.json"
     if not aliases.exists():
         aliases.write_text('{"generated": 0, "aliases": {}}\n', encoding="utf-8")
+        aliases.chmod(0o644)
         changed.append(str(aliases))
     return {"changed": changed, "sunrise_required": mode == "multisite"}
+
+
+EDGE_NETWORK = "wpops-edge"
+
+
+def compose_project(stack_cfg: dict[str, Any]) -> str:
+    """Compose project name of a stack: inventory `project`, else its directory name."""
+    project = stack_cfg.get("project") or Path(stack_cfg["path"]).name.lower()
+    return "".join(ch for ch in project if ch.isalnum() or ch in "_-")
+
+
+def ingress_service(origin: Origin, name: str, default: str = "http://nginx:80") -> str:
+    """Tunnel service URL for a stack.
+
+    The connectors join every stack's ingress network. Each stack's Nginx also
+    answers to the plain name "nginx" there, so on a node with more than one
+    stack, http://nginx:80 could reach another stack's site. A legacy stack is
+    then addressed by its own container name instead.
+    """
+    st = origin.stacks[name]
+    service = st.get("service") or default
+    if (len(origin.stacks) > 1 and st.get("ingress_network") != EDGE_NETWORK
+            and service.startswith("http://nginx:")):
+        service = f"http://{compose_project(st)}-nginx-1:{service.split(':', 2)[2]}"
+    return service
 
 
 def env_flag(path: Path, key: str) -> str:

@@ -1,0 +1,259 @@
+# Production WordPress stack: generated .env in stacks/<name> selects this file.
+# Each project owns its database, Redis, content and cron; only nginx joins edge.
+networks:
+  frontend:
+    driver: bridge
+    ipam:
+      config:
+      - subnet: 10.214.${STACK_NET:?set STACK_NET}.0/25
+  backend:
+    driver: bridge
+    internal: true
+    ipam:
+      config:
+      - subnet: 10.214.${STACK_NET:?set STACK_NET}.128/25
+  edge:
+    external: true
+    name: ${WPOPS_EDGE_NETWORK:-wpops-edge}
+services:
+  mariadb:
+    image: mariadb:11.8.9
+    restart: unless-stopped
+    networks:
+    - backend
+    volumes:
+    - ${STACK_DIR:?set STACK_DIR}/data/mysql:/var/lib/mysql
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD}
+      MYSQL_DATABASE: wordpress
+      MYSQL_USER: wordpress
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD}
+      MARIADB_AUTO_UPGRADE: '1'
+    healthcheck:
+      test:
+      - CMD
+      - healthcheck.sh
+      - --connect
+      - --innodb_initialized
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+    security_opt:
+    - no-new-privileges:true
+    cap_drop:
+    - ALL
+    cap_add:
+    - SETUID
+    - SETGID
+    - DAC_OVERRIDE
+    - CHOWN
+    - FOWNER
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: '3'
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+  redis:
+    image: redis:8.10-alpine
+    restart: unless-stopped
+    networks:
+    - backend
+    volumes:
+    - ${STACK_DIR:?set STACK_DIR}/data/redis:/data
+    - ${WPOPS_REPO_DIR:?set WPOPS_REPO_DIR}/config/redis/redis.conf:/usr/local/etc/redis/redis.conf:ro
+    command: redis-server /usr/local/etc/redis/redis.conf --requirepass ${REDIS_PASSWORD}
+    healthcheck:
+      test:
+      - CMD
+      - redis-cli
+      - -a
+      - ${REDIS_PASSWORD}
+      - ping
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    security_opt:
+    - no-new-privileges:true
+    cap_drop:
+    - ALL
+    cap_add:
+    - SETUID
+    - SETGID
+    - CHOWN
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: '3'
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+  wordpress:
+    image: ${WORDPRESS_IMAGE:-wordpress:7.1.3-php8.3-fpm}
+    restart: unless-stopped
+    networks:
+    - frontend
+    - backend
+    depends_on:
+      mariadb:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    volumes:
+    - ${STACK_DIR:?set STACK_DIR}/data/wordpress:/var/www/html
+    - ${WPOPS_REPO_DIR:?set WPOPS_REPO_DIR}/config/php/uploads.ini:/usr/local/etc/php/conf.d/uploads.ini:ro
+    - ${WPOPS_REPO_DIR}/config/php/wordpress.php:/etc/wpops/wordpress.php:ro
+    - ${STACK_DIR}/policy:/etc/wpops/policy:ro
+    - ${WPOPS_REPO_DIR}/plugin:/etc/wpops/mu-plugins:ro
+    tmpfs:
+    - /tmp:noexec,nosuid,size=64m
+    environment:
+      WORDPRESS_DB_HOST: mariadb:3306
+      WORDPRESS_DB_NAME: wordpress
+      WORDPRESS_DB_USER: wordpress
+      WORDPRESS_DB_PASSWORD: ${MYSQL_PASSWORD}
+      WORDPRESS_TABLE_PREFIX: wp_
+      WORDPRESS_CONFIG_EXTRA: require '/etc/wpops/wordpress.php';
+      WP_MODE: ${WP_MODE:?set WP_MODE}
+      WP_DOMAIN_CURRENT_SITE: ${WP_DOMAIN_CURRENT_SITE:?set WP_DOMAIN_CURRENT_SITE}
+      WP_SUBDOMAIN_INSTALL: ${WP_SUBDOMAIN_INSTALL:-true}
+      WP_SUNRISE: 'true'
+      REDIS_PASSWORD: ${REDIS_PASSWORD}
+    healthcheck:
+      test:
+      - CMD-SHELL
+      - bash -c 'echo > /dev/tcp/127.0.0.1/9000'
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    security_opt:
+    - no-new-privileges:true
+    cap_drop:
+    - ALL
+    cap_add:
+    - SETUID
+    - SETGID
+    - DAC_OVERRIDE
+    - CHOWN
+    - FOWNER
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: '3'
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+  nginx:
+    image: nginx:1.31.6-alpine
+    restart: unless-stopped
+    networks:
+      frontend: {}
+      backend: {}
+      edge:
+        aliases:
+        - ${STACK_ALIAS:?set STACK_ALIAS}
+    depends_on:
+      wordpress:
+        condition: service_healthy
+    ports:
+    - 127.0.0.1:${HTTP_PORT:-8080}:80
+    volumes:
+    - ${STACK_DIR:?set STACK_DIR}/data/wordpress:/var/www/html:ro
+    - ${WPOPS_REPO_DIR:?set WPOPS_REPO_DIR}/config/nginx/nginx.production.conf:/etc/nginx/nginx.conf:ro
+    - ${WPOPS_REPO_DIR:?set WPOPS_REPO_DIR}/config/nginx/conf.d:/etc/nginx/conf.d:ro
+    - ${STACK_DIR}/logs/nginx:/var/log/nginx
+    - ${STACK_DIR}/nginx:/etc/nginx/wpops:ro
+    - ${STACK_DIR}/nginx/http:/etc/nginx/wpops-http:ro
+    tmpfs:
+    - /tmp:noexec,nosuid,size=64m
+    healthcheck:
+      test:
+      - CMD-SHELL
+      - wget -qO /dev/null http://127.0.0.1/nginx-health
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
+    security_opt:
+    - no-new-privileges:true
+    cap_drop:
+    - ALL
+    cap_add:
+    - NET_BIND_SERVICE
+    - SETUID
+    - SETGID
+    - CHOWN
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: '3'
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+  wp-cron:
+    image: wordpress:cli-2.12
+    restart: unless-stopped
+    user: '33:33'
+    networks:
+    - backend
+    - frontend
+    depends_on:
+      wordpress:
+        condition: service_healthy
+    volumes:
+    - ${STACK_DIR:?set STACK_DIR}/data/wordpress:/var/www/html
+    - ${WPOPS_REPO_DIR}/backups:/backups:ro
+    - ${WPOPS_REPO_DIR}/config/php/wordpress.php:/etc/wpops/wordpress.php:ro
+    - ${STACK_DIR}/policy:/etc/wpops/policy:ro
+    - ${WPOPS_REPO_DIR}/plugin:/etc/wpops/mu-plugins:ro
+    environment:
+      WORDPRESS_DB_HOST: mariadb:3306
+      WORDPRESS_DB_NAME: wordpress
+      WORDPRESS_DB_USER: wordpress
+      WORDPRESS_DB_PASSWORD: ${MYSQL_PASSWORD}
+      WORDPRESS_TABLE_PREFIX: wp_
+      WORDPRESS_CONFIG_EXTRA: require '/etc/wpops/wordpress.php';
+      WP_MODE: ${WP_MODE:?set WP_MODE}
+      WP_DOMAIN_CURRENT_SITE: ${WP_DOMAIN_CURRENT_SITE:?set WP_DOMAIN_CURRENT_SITE}
+      WP_SUBDOMAIN_INSTALL: ${WP_SUBDOMAIN_INSTALL:-true}
+      WP_SUNRISE: 'true'
+      REDIS_PASSWORD: ${REDIS_PASSWORD}
+    entrypoint: /bin/sh
+    command:
+    - -c
+    - |
+      while true; do
+        if [ "$$WP_MODE" = multisite ]; then
+          for url in $$(wp site list --field=url 2>/dev/null); do
+            wp cron event run --due-now --url="$$url" 2>&1 || true
+          done
+        else
+          wp cron event run --due-now --path=/var/www/html 2>&1 || true
+        fi
+        sleep 60
+      done
+    security_opt:
+    - no-new-privileges:true
+    cap_drop:
+    - ALL
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: '3'
+    deploy:
+      resources:
+        limits:
+          memory: 1G

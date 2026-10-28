@@ -28,6 +28,13 @@
           "path": "/opt/docker/wordpressmultisite",
           "mode": "multisite",
           "service": "http://nginx:80"
+        },
+        "single-site-demo": {
+          "path": "/opt/docker/wordpressmultisite/stacks/single-site-demo",
+          "mode": "single",
+          "service": "http://wpops-single-site-demo:80",
+          "ingress_network": "wpops-edge",
+          "managed": true
         }
       },
       "tunnels": {
@@ -75,5 +82,15 @@
         }
       }
     }
-  ]
+  ],
+  "backup_sources": {
+    "shop-primary": {
+      "origin": "azure",
+      "sync_api": "https://example-shop.com"
+    },
+    "single-primary": {
+      "origin": "azure",
+      "sync_api": "https://single-site-demo.com"
+    }
+  }
 }
