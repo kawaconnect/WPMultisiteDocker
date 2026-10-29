@@ -161,10 +161,12 @@ def apply(job: Job, inv: Inventory, node: str, set_ref: str, stack: str, sites: 
         ok = r.returncode == 0 and "Restore complete" in (r.stdout or "")
         if not ok:
             raise RestoreError("restore failed: " + ((r.stderr or r.stdout or "").strip())[-400:])
-        # reload PHP-FPM so opcache/mu-plugin changes from the restore take effect
+        # Restart PHP-FPM so opcache/mu-plugin changes from the restore take effect.
+        # Not a USR2 reload: Docker leaves a container whose php-fpm re-executed
+        # itself stopped after the next daemon or host restart.
         try:
             from .stacks import compose
-            compose(origin, stack, "kill", "-s", "USR2", "wordpress", check=False, timeout=60)
+            compose(origin, stack, "restart", "wordpress", check=False, timeout=120)
         except Exception:  # noqa: BLE001
             pass
         if cleanup:

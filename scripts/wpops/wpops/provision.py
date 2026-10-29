@@ -46,6 +46,16 @@ def install_login_plugin(path: Path) -> None:
         z.extractall(target)
 
 
+def port_in_use(port: int) -> bool:
+    import socket
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        try:
+            sock.bind(('127.0.0.1', port))
+        except OSError:
+            return True
+    return False
+
+
 def create(name: str, mode: str, domain: str, port: int, login_path: str = '',
            subdomains: bool = True, noindex: bool = False) -> dict:
     if not re.fullmatch(r'[a-z0-9][a-z0-9-]{0,30}', name):
@@ -70,6 +80,9 @@ def create(name: str, mode: str, domain: str, port: int, login_path: str = '',
             used_networks.add(existing.get("STACK_NET"))
             if existing.get("HTTP_PORT") == str(port):
                 raise ConfigError(f'port {port} is already assigned to another stack')
+        if port_in_use(port):
+            # e.g. the legacy root stack's 127.0.0.1:8080, or another service.
+            raise ConfigError(f'port {port} is already in use on 127.0.0.1')
         network = next((str(n) for n in range(1,255) if str(n) not in used_networks), None)
         if network is None:
             raise ConfigError("no free production network slots in 10.214.0.0/16")
@@ -146,7 +159,8 @@ def initialise(name: str, email: str, user: str = 'admin', scheme: str = 'https'
     if installed.returncode == 0:
         return {'stack': name, 'status': 'already-installed'}
     # Never replace a populated database or convert an existing single site implicitly.
-    tables = wp(origin, name, 'db', 'tables', '--all-tables', '--format=csv')
+    # `wp db tables` loads WordPress and fails on an empty database; ask MariaDB.
+    tables = wp(origin, name, 'db', 'query', 'SHOW TABLES', '--skip-column-names')
     if tables.returncode or tables.stdout.strip():
         raise StackError('database is not empty or cannot be inspected; refusing automatic install')
     args = ['core', 'multisite-install' if env['WP_MODE']=='multisite' else 'install',
@@ -162,7 +176,10 @@ def initialise(name: str, email: str, user: str = 'admin', scheme: str = 'https'
     rewrite = wp(origin, name, 'rewrite', 'structure', '/%postname%/')
     if rewrite.returncode:
         raise StackError(rewrite.stderr or rewrite.stdout)
-    return {'stack': name, 'status': 'installed', 'output': result.stdout.strip(),
+    # WP-CLI echoes prompted values (the password) back; keep them out of the output.
+    output = '\n'.join(line for line in result.stdout.splitlines()
+                       if env['WP_ADMIN_PASSWORD'] not in line).strip()
+    return {'stack': name, 'status': 'installed', 'output': output,
             'credentials': str(path / '.env')}
 
 

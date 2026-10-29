@@ -30,6 +30,11 @@ def ensure(start: bool = True, log=print) -> dict[str, Any]:
     results: dict[str, Any] = {}
     tokens: list[tuple[str, str]] = []
     changed = False
+    compose = REPO_DIR / "docker-compose.wpops-tunnels.json"
+    try:
+        previous = json.loads(compose.read_text(encoding="utf-8")).get("services") or {}
+    except (OSError, ValueError):
+        previous = {}
     for acct in cf_accounts(env).values():
         cf = Cloudflare(acct.token, acct.account_id, acct.name)
         from .config import _SLUG_RE, ConfigError
@@ -62,6 +67,11 @@ def ensure(start: bool = True, log=print) -> dict[str, Any]:
         except CfError as exc:
             log(f"{acct.name}: FAILED {exc}")
             results[acct.name] = {"ok": False, "error": str(exc)}
+            # A transient API error must not drop a working connector from the project.
+            old_token = ((previous.get(f"cloudflared-{acct.name}") or {}).get("environment") or {}).get("TUNNEL_TOKEN")
+            if old_token:
+                tokens.append((acct.name, old_token))
+                log(f"{acct.name}: keeping the existing connector")
     if changed:
         raw = inv.raw
         raw["origins"][node]["tunnels"] = origin.tunnels
@@ -100,7 +110,6 @@ def ensure(start: bool = True, log=print) -> dict[str, Any]:
                     "while true; do bash /app/scripts/cf-backup.sh; sleep 21600; done"],
         "logging": {"driver": "json-file", "options": {"max-size": "10m", "max-file": "3"}},
     }
-    compose = REPO_DIR / "docker-compose.wpops-tunnels.json"
     state.write_private_text(compose, json.dumps({"services": services, "networks": networks}, indent=2)+"\n")
     log(f"wrote {compose} ({len(tokens)} connector(s))")
     if start and tokens:

@@ -28,7 +28,6 @@ ENV_FILE = REPO_DIR / ".env"
 NODE_CONFIG_FILE = CONFIG_DIR / "wpops.json"
 INVENTORY_FILE = CONFIG_DIR / "inventory.json"
 
-CF_API = "https://api.cloudflare.com/client/v4"
 
 
 class ConfigError(Exception):
@@ -53,6 +52,12 @@ def load_env(path: Path = ENV_FILE) -> dict[str, str]:
             value = value[1:-1]
         env[key] = value
     return env
+
+
+# Cloudflare API base URL. CF_API_URL (environment, else .env) points wpops at
+# a test double such as tests/e2e/fake_cloudflare.py; leave it unset in production.
+CF_API = (os.environ.get("CF_API_URL") or load_env().get("CF_API_URL")
+          or "https://api.cloudflare.com/client/v4").rstrip("/")
 
 
 @dataclass

@@ -34,6 +34,20 @@ if (!defined('ABSPATH')) {
     if (!$blog) {
         return;
     }
+    // The alias stands for the blog's whole host: on a path-based network,
+    // <alias>/<path>/ is the blog at that path below the mapped blog (the
+    // longest match), as it is on the internal host.
+    $uri = isset($_SERVER['REQUEST_URI']) ? (string) parse_url((string) $_SERVER['REQUEST_URI'], PHP_URL_PATH) : '/';
+    $uri = rtrim(strtolower($uri), '/') . '/';
+    $siblings = $wpdb->get_results($wpdb->prepare(
+        "SELECT * FROM {$wpdb->blogs} WHERE domain = %s AND site_id = %d", $blog->domain, (int) $blog->site_id));
+    foreach ((array) $siblings as $candidate) {
+        $cpath = strtolower((string) $candidate->path);
+        if (strlen($cpath) > strlen((string) $blog->path) && 0 === strpos($cpath, strtolower((string) $blog->path))
+                && 0 === strpos($uri, $cpath)) {
+            $blog = $candidate;
+        }
+    }
     $network = $wpdb->get_row($wpdb->prepare("SELECT * FROM {$wpdb->site} WHERE id = %d LIMIT 1", (int) $blog->site_id));
     if (!$network) {
         return;

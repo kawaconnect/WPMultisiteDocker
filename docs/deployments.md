@@ -42,7 +42,9 @@ keep site/origin definitions consistent between nodes.
 ## 2. Create and initialise stacks
 
 `create` writes configuration and registers the stack; it starts no containers
-and changes no DNS. Supply a different loopback HTTP port for each stack.
+and changes no DNS. Supply a different loopback HTTP port for each stack; `create`
+refuses a port that another stack has or that is in use on 127.0.0.1 (the legacy
+root stack publishes 127.0.0.1:8080).
 A custom login path downloads WPS Hide Login 1.9.19 from WordPress.org and
 checks its pinned SHA-256. Its verified copy lives outside WordPress content.
 
@@ -62,7 +64,8 @@ wpops stack create network --mode multisite --domain network.example.com --port 
 Running all three gives a mixed node. Add further single or multisite stacks in
 the same way. Multisite defaults to domain/subdomain mode; use
 `--subdirectories` for a path-based network. `init` creates only the main blog;
-add blogs explicitly with WP-CLI or Network Admin. For standby/staging stacks,
+add blogs explicitly with WP-CLI or Network Admin. New blogs get the main site's
+`https://` scheme (WordPress itself would give subdomain blogs `http://`). For standby/staging stacks,
 use the standby hostname as `--domain` and add `--noindex` at creation.
 
 ```bash
@@ -81,8 +84,9 @@ Image tags match the existing production stack. `WORDPRESS_IMAGE` in a stack's
 `.env` can select a compatible FPM image; review upgrades against your plugins.
 
 Use `wpops stack up NAME`, `wpops stack stop NAME`, or
-`wpops stack compose NAME <compose arguments>`. The latter also supports normal
-Compose commands such as `logs`, `config`, `exec`, `pull` and `down`. There is no
+`wpops stack compose NAME <compose arguments>`. The latter runs any Compose
+command in the stack's project, such as `logs -f`, `config`, `exec`, `pull` and
+`down`, with Compose's own output and exit status (`--json` captures it instead). There is no
 automatic destructive database migration when changing the deployment mode.
 
 ## 3. Map sites to stacks and origins
@@ -92,8 +96,10 @@ Add logical sites and remote origins to `config/inventory.json`. A single-site
 stack takes one logical site, with any number of domain aliases. Each blog in a
 domain-based multisite can be a logical site with its own domain list and blog ID.
 For path-based blogs sharing a domain, DNS failover applies to the whole domain;
-represent that network as one logical site at its main blog. DNS cannot switch
-one URL path independently of another path on the same hostname.
+represent that network as one logical site at its main blog. Every blog below it
+then follows: with `example.org` mapped to the main blog of a network installed
+as `paths.example.net`, `https://example.org/alpha/` serves the `/alpha/` blog.
+DNS cannot switch one URL path independently of another path on the same hostname.
 
 A site can use a different stack on each node. Example site fragment:
 
@@ -127,7 +133,9 @@ that stack to its container (`<project>-nginx-1`, where the project is
 Nginx answers to `nginx` on the shared networks. Set `ingress_network` explicitly if its Compose
 network name differs from `<directory>_frontend`. Enable `WP_SUNRISE=true` for
 multisite host aliases and recreate the WordPress/cron containers. Managed
-stacks enable the host-alias runtime automatically.
+stacks enable the host-alias runtime automatically. After updating the checkout,
+run `docker compose up -d` in the root directory as well, so the legacy
+containers pick up changed Compose settings.
 
 ### Visitor IPs behind the tunnel
 
@@ -215,7 +223,11 @@ wpops failover rollback --sites shop --yes
 
 Failover checks local stack readiness, backs up DNS/tunnel configuration, and
 prepares ingress and host aliases before changing DNS. `www` CNAME aliases are
-included and their original relationships are restored on rollback. Run apply
+included and their original relationships are restored on rollback. The tunnel
+CNAME is always proxied (a tunnel only works through Cloudflare's proxy), also
+for DNS-only records; rollback restores the original proxy setting and TTL. If
+Cloudflare rejects the new record, the deleted one is put back, so the name keeps
+resolving; re-run apply (or rollback) once the cause is fixed. Run apply
 and rollback on the node holding the local overrides. DNS and application
 readiness across real nodes still require a deployment smoke test.
 
@@ -262,7 +274,9 @@ wpops restore apply --set node-b-network/SET_ID --stack network --sites news --y
 ```
 
 Add the `news` site's source and destination host/blog mappings before a
-selected-blog restore. Backups are mounted read-only into every stack's cron/CLI
+selected-blog restore. SiteGuard's migrate mode keeps the destination's own
+WordPress users, so log in with the destination stack's credentials afterwards.
+After a restore wpops restarts the stack's WordPress container (PHP-FPM). Backups are mounted read-only into every stack's cron/CLI
 container. Retention, checksums, disk reserves, notifications and the existing
 agent schedule apply to each source profile. Backup manifests record both the
 profile and its source origin/stack so restore mapping remains unambiguous.
@@ -322,7 +336,23 @@ wpops stack compose shop exec -T nginx nginx -t
 
 The offline suite covers all deployment combinations, Compose isolation,
 source profiles, destination mapping, login policy, connector generation and
-mocked Cloudflare failover/rollback. Before production use, run a live rehearsal
+mocked Cloudflare failover/rollback.
+
+`tests/e2e/e2e.py` is an opt-in end-to-end run on a real Docker daemon (not run
+in CI). It builds a fresh node in a new directory and drives it through the
+commands above against an in-memory Cloudflare API (`tests/e2e/fake_cloudflare.py`;
+wpops and the `cf-*.sh` scripts use it through `CF_API_URL`), with an HTTPS
+stand-in for the Cloudflare edge and connectors (`tests/e2e/cf_edge.py`). Use
+a disposable Docker host, one run per host: it takes 127.0.0.1:18181-18190 (and
+8080), the `wpops-edge` network and 10.214.0.0/16, and leaves the containers
+running for inspection.
+
+```bash
+python3 tests/e2e/e2e.py singles   /tmp/e2e-singles     # two single sites
+python3 tests/e2e/e2e.py multisite /tmp/e2e-multisite   # one subdomain network
+python3 tests/e2e/e2e.py networks  /tmp/e2e-networks    # subdomain + subdirectory networks
+python3 tests/e2e/e2e.py mixed     /tmp/e2e-mixed --siteguard /path/to/siteguardbackup
+``` Before production use, run a live rehearsal
 with disposable domains: install single/multisite stacks, test login/reset/logout,
 pull and restore SiteGuard backups, switch apex and www, check the correct
 site content, and roll back. Cloudflare API calls and live containers require

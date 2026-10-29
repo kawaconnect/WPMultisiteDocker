@@ -324,7 +324,7 @@ def pull(job: Job, inv: Inventory, source: str, label: str = "", fresh: bool = T
     log(f"source {source}: SiteGuard {info.get('version')} at {info.get('site_url')} ({info.get('mode')})")
     try:
         return _pull_locked(job, inv, source, label, fresh, nonce, entities, db, cfg, cli, log,
-                            lambda n: _note_created(job, n))
+                            lambda n: _note_created(job, n), info)
     except Exception:
         # A fresh backup we created on the source but could not pull would sit
         # there forever, eating the primary's storage. Remove it (best effort).
@@ -344,7 +344,7 @@ def _note_created(job: Job, nonce: str) -> None:
 
 def _pull_locked(job: Job, inv: Inventory, source: str, label: str, fresh: bool, nonce: str | None,
                  entities: list[str] | None, db: bool, cfg: dict[str, Any], cli: "SyncClient", log,
-                 note_created) -> dict[str, Any]:
+                 note_created, info: dict[str, Any]) -> dict[str, Any]:
     with state.locked(f"pull-{source}", timeout=5):
         if fresh and not nonce:
             label = label or f"wpops {time.strftime('%Y-%m-%d')}"

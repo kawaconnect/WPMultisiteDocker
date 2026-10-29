@@ -44,6 +44,9 @@ services:
       - SETUID
       - SETGID
       - DAC_OVERRIDE
+      # The entrypoint hands a new ./data/mysql (created by Docker as root) to mysql.
+      - CHOWN
+      - FOWNER
     logging:
       driver: json-file
       options:
@@ -79,6 +82,9 @@ services:
     cap_add:
       - SETUID
       - SETGID
+      # Hands a new ./data/redis to redis; without it RDB saves fail and
+      # stop-writes-on-bgsave-error rejects every write.
+      - CHOWN
     logging:
       driver: json-file
       options:
@@ -187,6 +193,9 @@ services:
       - DAC_OVERRIDE
       - CHOWN
       - FOWNER
+      # php-fpm runs as root and signals its www-data workers: without KILL a
+      # reload (USR2) never finishes and every stop waits for a force kill.
+      - KILL
     logging:
       driver: json-file
       options:
@@ -253,6 +262,10 @@ services:
     user: "33:33"
     networks:
       - backend
+      # Not only the internal network: there, names Docker cannot answer get
+      # SERVFAIL, and musl then stops at the host's search domain before
+      # trying "mariadb" itself (same as the managed stack template).
+      - frontend
     depends_on:
       wordpress:
         condition: service_healthy

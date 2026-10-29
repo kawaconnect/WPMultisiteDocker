@@ -16,8 +16,9 @@ ENV_FILE="$PROJECT_DIR/.env"
 BACKUP_DIR="$PROJECT_DIR/data/cloudflare/backups"
 _CF_RUNTIME_CACHE="/tmp/.cf-runtime-cache-$$"
 
-# CF API base URL
-CF_API="https://api.cloudflare.com/client/v4"
+# CF API base URL. CF_API_URL (environment or .env) is for test doubles only,
+# e.g. tests/e2e/fake_cloudflare.py.
+CF_API="${CF_API_URL:-https://api.cloudflare.com/client/v4}"
 
 # Zone ID cache (associative array)
 declare -A _ZONE_CACHE
@@ -62,6 +63,7 @@ load_config() {
     set -a
     source "$ENV_FILE"
     set +a
+    CF_API="${CF_API_URL:-$CF_API}"
 
     # Validate required CF vars
     if [ "${1:-}" != "--read-only" ] && [ -z "${CF_STANDBY_DOMAIN:-}" ]; then

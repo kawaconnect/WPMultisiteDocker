@@ -144,6 +144,9 @@ services:
     - DAC_OVERRIDE
     - CHOWN
     - FOWNER
+    # php-fpm runs as root and signals its www-data workers: without KILL a
+    # reload (USR2) never finishes and every stop waits for a force kill.
+    - KILL
     logging:
       driver: json-file
       options:

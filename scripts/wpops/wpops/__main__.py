@@ -11,6 +11,7 @@ import sys
 from typing import Any
 
 from . import __version__, backup as bk, failover, jobs, notify, restore, state
+from .cf import CfError
 from .config import (CONFIG_DIR, INVENTORY_FILE, NODE_CONFIG_FILE, REPO_DIR, ConfigError, load_inventory,
                      node_config, public_inventory, save_node_config)
 from .ops import node_status
@@ -150,7 +151,11 @@ def cmd_backup(args: argparse.Namespace) -> int:
         return 0
     if args.action == "schedule":
         if args.set or args.retain is not None or args.sources is not None:
-            info = bk.set_schedule(args.set, args.retain, args.sources.split(",") if args.sources else None)
+            sources = [x.strip() for x in args.sources.split(",") if x.strip()] if args.sources else None
+            unknown = [x for x in sources or [] if x not in inv.sources()]
+            if unknown:
+                raise ConfigError(f"unknown backup sources: {', '.join(unknown)} (see wpops backup sources)")
+            info = bk.set_schedule(args.set, args.retain, sources)
         else:
             info = bk.schedule_info()
         _out(args, info, json.dumps(info, indent=2, default=str))
@@ -255,6 +260,9 @@ def cmd_stack(args: argparse.Namespace) -> int:
                             'compose': getattr(args, 'args', [])}[args.action]
             if not compose_args:
                 raise ConfigError('compose arguments are required')
+            if args.action == 'compose' and not args.json:
+                # Plain Compose: its own output, prompts and exit status (logs -f, exec, nginx -t).
+                return compose(origin, args.name, *compose_args, check=False, capture=False, timeout=None).returncode
             r = compose(origin, args.name, *compose_args)
             result = {'stack': args.name, 'output': r.stdout.strip()}
     _out(args, result)
@@ -292,7 +300,8 @@ def cmd_setup(args: argparse.Namespace) -> int:
     for name in origin.stacks:
         try:
             r = install_host_alias(origin, name)
-            if r["sunrise_required"]:
+            # Managed stacks always run with WP_SUNRISE=true (docker-compose.stack.yml).
+            if r["sunrise_required"] and not origin.stacks[name].get("managed"):
                 env_path = stack_path(origin, name) / ".env"
                 txt = env_path.read_text(encoding="utf-8") if env_path.exists() else ""
                 if "WP_SUNRISE=true" not in txt:
@@ -384,11 +393,14 @@ def main(argv: list[str] | None = None) -> int:
     try:
         return int(args.fn(args) or 0)
     except (ConfigError, failover.FailoverError, bk.SyncError, restore.RestoreError, StackError, TimeoutError,
-            OSError, subprocess.CalledProcessError) as exc:
+            OSError, subprocess.CalledProcessError, CfError) as exc:
+        detail = ""
+        if isinstance(exc, subprocess.CalledProcessError) and exc.stderr:
+            detail = str(exc.stderr).strip()[-2000:]
         if getattr(args, "json", False):
-            print(json.dumps({"error": str(exc)}))
+            print(json.dumps({"error": str(exc), **({"stderr": detail} if detail else {})}))
         else:
-            print(f"error: {exc}", file=sys.stderr)
+            print(f"error: {exc}" + (f"\n{detail}" if detail else ""), file=sys.stderr)
         return 1
 
 

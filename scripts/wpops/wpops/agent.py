@@ -258,6 +258,15 @@ class Agent:
                     raise ApiError(400, "set and stack are required")
                 sel = self._selection(body)
                 entities = _str_list(body.get("entities"), "entities")
+                # Reject bad input here, not as a failed job that holds the restore slot.
+                if stack not in self.inv.origin(self.node()).stacks:
+                    raise ApiError(400, f"unknown stack '{stack}'")
+                try:
+                    bk.manifest(set_ref)
+                except bk.SyncError as exc:
+                    raise ApiError(400, str(exc)) from None
+                for slug in sel["sites"]:
+                    self.inv.site(slug)
                 if jobs.active("restore.apply"):
                     raise ApiError(409, "a restore is already running")
                 job = jobs.Job("restore.apply", {"set": set_ref, "stack": stack, **{k: v for k, v in sel.items() if v}}, actor)

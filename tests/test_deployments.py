@@ -15,6 +15,8 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / 'scripts/wpops'))
 from wpops import backup, config, failover, provision, restore, routes, stacks, state, tunnels
 
+REAL_PORT_IN_USE = provision.port_in_use
+
 
 class DeploymentTests(unittest.TestCase):
     def setUp(self):
@@ -40,6 +42,8 @@ class DeploymentTests(unittest.TestCase):
         for obj in (provision,tunnels):
             self.patches.enter_context(patch.object(obj,'load_inventory',lambda: config.load_inventory(self.file)))
         self.patches.enter_context(patch('wpops.notify.notify'))
+        # Tests must not depend on which loopback ports this machine happens to use.
+        self.patches.enter_context(patch.object(provision,'port_in_use',return_value=False))
 
     def save(self):
         self.file.write_text(json.dumps(self.raw))
@@ -144,7 +148,7 @@ class DeploymentTests(unittest.TestCase):
         script=self.root/'policy-test.php'
         script.write_text("<?php\n" +
             "define('ABSPATH', '/'); define('WPOPS_LOGIN_POLICY_FILE', " + json.dumps(str(policy)) + ");\n" +
-            "function add_filter(...$args) {} function get_current_blog_id() { return $GLOBALS['blog']; } function is_multisite() { return false; }\n" +
+            "function add_filter(...$args) {} function add_action(...$args) {} function get_current_blog_id() { return $GLOBALS['blog']; } function is_multisite() { return false; }\n" +
             "require " + json.dumps(str(ROOT/'plugin/wpops-policy.php')) + ";\n" +
             "$GLOBALS['blog']=1; $one=wpops_login_slug(false); $GLOBALS['blog']=2; $two=wpops_login_slug(false); $GLOBALS['blog']=3; $new=wpops_login_slug(false);\n" +
             "echo json_encode([$one,$two,$new,wpops_login_plugins(['existing/plugin.php'])]);")
@@ -229,7 +233,9 @@ class DeploymentTests(unittest.TestCase):
         with patch.object(failover,'Cloudflare',return_value=cf), patch.object(stacks,'ps',return_value=[{'service':x,'state':'running','health':'healthy'} for x in ('wordpress','nginx')]):
             p=failover.plan(inv,inv.sites,cfg=cfg,accounts=accounts)
             result=failover.apply(inv,p,'test','backup',accounts,log=lambda _:None)
-            self.assertTrue(result['failed']);self.assertEqual(dns,[])
+            # The name never stays empty: the deleted record is put back.
+            self.assertTrue(result['failed'])
+            self.assertEqual([(r['type'],r['content']) for r in dns],[('A','192.0.2.1')])
             retry=failover.plan(inv,inv.sites,cfg=cfg,accounts=accounts)
             self.assertEqual(len(retry.changes),1)
             result=failover.apply(inv,retry,'test','backup',accounts,log=lambda _:None)
@@ -251,8 +257,13 @@ class DeploymentTests(unittest.TestCase):
                 return subprocess.CompletedProcess([],0,'Restore complete','')
             return subprocess.CompletedProcess([],0,'imported','')
         job=type('Job',(),{'log':staticmethod(lambda _:None),'set_progress':lambda *a,**k:None,'actor':'test','id':'job'})()
-        with patch.object(backup,'manifest',return_value=(setdir,man)), patch.object(backup,'save_manifest'), patch.object(restore,'node_config',return_value={}), patch.object(restore.disk,'require'), patch.object(restore,'require_free'), patch.object(restore,'_fix_content_ownership'), patch.object(restore,'wp',side_effect=wp_call), patch.object(restore,'_parse_import_timestamp',return_value=123), patch.object(stacks,'compose'):
+        with patch.object(backup,'manifest',return_value=(setdir,man)), patch.object(backup,'save_manifest'), patch.object(restore,'node_config',return_value={}), patch.object(restore.disk,'require'), patch.object(restore,'require_free'), patch.object(restore,'_fix_content_ownership'), patch.object(restore,'wp',side_effect=wp_call), patch.object(restore,'_parse_import_timestamp',return_value=123), patch.object(stacks,'compose') as compose:
             restore.apply(job,inv,'backup','shop-source/set','one',all_sites=True)
+        # PHP-FPM is restarted, not reloaded with USR2: Docker does not bring a
+        # re-executed php-fpm back after a daemon or host restart.
+        calls=[c.args[2:] for c in compose.call_args_list]
+        self.assertIn(('restart','wordpress'),calls)
+        self.assertFalse(any('USR2' in c for c in calls))
         self.assertEqual(policy.read_bytes(),before)
         self.assertEqual((wc/'plugins/wps-hide-login/wps-hide-login.php').read_bytes(),source.read_bytes())
         self.assertEqual(json.loads((wc/'wpops-host-aliases.json').read_text())['aliases'],{})
@@ -615,6 +626,279 @@ done
         for src,rows in (('10.214.255.1',gateway),('10.214.1.5',php)):
             self.assertEqual({a for a,_ in rows},{src})
             self.assertIn('429',[s for _,s in rows])
+
+
+    # ---------------------------------------------------------- 2026-10-29 end-to-end findings
+
+    def test_init_installs_on_an_empty_database_without_echoing_the_password(self):
+        provision.create('one','single','one.example',18081)
+        password=json.loads((self.root/'stacks/one/.env').read_text().split('WP_ADMIN_PASSWORD=',1)[1].splitlines()[0])
+        calls=[]
+        def wp(origin,name,*args,**kw):
+            calls.append(args)
+            if args[:2]==('core','is-installed'): return subprocess.CompletedProcess(args,1,'','')
+            if args[:2]==('db','tables'):   # needs an installed WordPress: fails on an empty database
+                return subprocess.CompletedProcess(args,1,'','Error: The site you have requested is not installed.')
+            if args[:2]==('db','query'): return subprocess.CompletedProcess(args,0,tables[0],'')
+            return subprocess.CompletedProcess(args,0,'','')
+        def compose(origin,name,*args,**kw):
+            out=f'2/3 [--admin_password=<password>]: {password}\nwp core install --admin_password=\'{password}\'\nSuccess: WordPress installed successfully.' if 'exec' in args else ''
+            return subprocess.CompletedProcess(args,0,out,'')
+        tables=['']
+        with patch.object(provision,'wp',side_effect=wp), patch.object(provision,'compose',side_effect=compose), \
+             patch.object(provision,'ensure_edge'), patch.object(provision,'install_runtime'):
+            result=provision.initialise('one','admin@example.com')
+            self.assertEqual(result['status'],'installed')
+            self.assertNotIn(password,json.dumps(result))
+            self.assertIn('Success: WordPress installed successfully.',result['output'])
+            tables[0]='wp_options\n'
+            with self.assertRaisesRegex(stacks.StackError,'not empty'):
+                provision.initialise('one','admin@example.com')
+
+    def test_new_stack_refuses_a_loopback_port_in_use(self):
+        import socket
+        with socket.socket() as busy, patch.object(provision,'port_in_use',side_effect=REAL_PORT_IN_USE):
+            busy.bind(('127.0.0.1',0));busy.listen(1);port=busy.getsockname()[1]
+            with self.assertRaisesRegex(config.ConfigError,f'port {port} is already in use'):
+                provision.create('one','single','one.example',port)
+        self.assertFalse((self.root/'stacks/one').exists())
+
+    def test_failover_to_a_tunnel_is_proxied_even_for_dns_only_records(self):
+        self.add_stack('one');self.add_site('one','one');self.raw['sites'][0]['domains']=['one.example'];inv=self.inventory()
+        from unittest.mock import MagicMock
+        cf=MagicMock();cf.zone_id.return_value='zone'
+        cf.dns_records.return_value=[{'id':'a','type':'A','content':'192.0.2.1','name':'one.example','ttl':300,'proxied':False},
+                                     {'id':'b','type':'AAAA','content':'2001:db8::1','name':'one.example','ttl':300,'proxied':False}]
+        cfg={'node':'backup','failover':{'default_to':'backup','tunnel_service':'http://nginx:80'}}
+        with patch.object(failover,'Cloudflare',return_value=cf):
+            p=failover.plan(inv,inv.sites,cfg=cfg,accounts={'customer':config.CfAccount(1,'customer','acct','secret')})
+        self.assertEqual(p.changes[0].create['proxied'],True)
+        self.assertEqual([r['proxied'] for r in p.changes[0].original_records],[False,False])
+
+    def test_failed_rollback_create_keeps_the_name_resolving(self):
+        self.add_stack('one');self.add_site('one','one');self.raw['sites'][0]['domains']=['one.example'];inv=self.inventory()
+        original={'id':'orig','type':'A','content':'192.0.2.1','name':'one.example','ttl':300,'proxied':False}
+        tunnel={'id':'new','type':'CNAME','content':'tid.cfargotunnel.com','name':'one.example','ttl':1,'proxied':True}
+        state.save_overrides({'one.example':{'site':'one','from':'primary','to':'backup','stack':'one','cf_account':'customer',
+                                             'zone_id':'zone','tunnel_id':'tid','original_records':[original],'status':'active'}})
+        dns=[dict(tunnel)];fail=[True]
+        from unittest.mock import MagicMock
+        cf=MagicMock()
+        cf.dns_records.side_effect=lambda *a,**k:copy.deepcopy(dns)
+        cf.delete_record.side_effect=lambda z,rid:dns.__setitem__(slice(None),[r for r in dns if r['id']!=rid])
+        def create(z,r):
+            if r['type']=='A' and fail[0]:
+                fail[0]=False;raise failover.CfError('simulated create failure')
+            dns.append({**r,'id':'x'+r['type']});return dns[-1]
+        cf.create_record.side_effect=create
+        accounts={'customer':config.CfAccount(1,'customer','acct','secret')}
+        with patch.object(failover,'Cloudflare',return_value=cf):
+            result=failover.rollback(inv,'test','backup',all_sites=True,accounts=accounts,log=lambda _:None)
+            self.assertTrue(result['failed'])
+            self.assertEqual([(r['type'],r['content']) for r in dns],[('CNAME','tid.cfargotunnel.com')])
+            self.assertEqual(state.overrides()['one.example']['status'],'rollback-failed')
+            cf.remove_tunnel_ingress_hosts.assert_not_called()
+            result=failover.rollback(inv,'test','backup',all_sites=True,accounts=accounts,log=lambda _:None)
+            self.assertEqual(result['failed'],[])
+        self.assertEqual([(r['type'],r['content'],r['proxied'],r['ttl']) for r in dns],[('A','192.0.2.1',False,300)])
+        self.assertEqual(state.overrides(),{})
+
+    def test_tunnels_keep_an_existing_connector_when_its_account_fails(self):
+        from unittest.mock import MagicMock
+        cf=MagicMock();cf.verify_token.return_value={'status':'active'};cf.tunnel.return_value={'id':'tid'}
+        cf.tunnel_token.side_effect=['token-1',tunnels.CfError('CF GET token -> HTTP 500')]
+        accounts={'customer':config.CfAccount(1,'customer','acct','secret')}
+        with patch.object(tunnels,'Cloudflare',return_value=cf), patch.object(tunnels,'cf_accounts',return_value=accounts), \
+             patch.object(tunnels,'load_env',return_value={}):
+            self.assertTrue(tunnels.ensure(start=False,log=lambda _:None)['customer']['ok'])
+            self.assertFalse(tunnels.ensure(start=False,log=lambda _:None)['customer']['ok'])
+        doc=json.loads((self.root/'docker-compose.wpops-tunnels.json').read_text())
+        self.assertEqual(doc['services']['cloudflared-customer']['environment']['TUNNEL_TOKEN'],'token-1')
+
+    def test_cli_reports_cloudflare_errors_and_passes_compose_through(self):
+        from wpops import __main__ as cli
+        import io
+        err=io.StringIO()
+        with patch.object(cli,'load_inventory',return_value=self.inventory()), patch.object(cli,'node_config',return_value={'node':'backup'}), \
+             patch.object(routes,'plan',side_effect=cli.CfError('CF GET /zones -> HTTP 403: denied')), contextlib.redirect_stderr(err):
+            self.assertEqual(cli.main(['routes','plan']),1)
+        self.assertIn('HTTP 403',err.getvalue());self.assertNotIn('Traceback',err.getvalue())
+        self.add_stack('one')
+        with patch.object(cli,'load_inventory',return_value=self.inventory()), patch.object(cli,'node_config',return_value={'node':'backup'}), \
+             patch.object(stacks,'compose',return_value=subprocess.CompletedProcess([],3,None,None)) as compose:
+            self.assertEqual(cli.main(['stack','compose','one','exec','-T','nginx','nginx','-t']),3)
+        self.assertEqual(compose.call_args.args[2:],('exec','-T','nginx','nginx','-t'))
+        self.assertFalse(compose.call_args.kwargs['capture'])
+        err=io.StringIO()
+        failure=subprocess.CalledProcessError(1,['docker','compose','up'],'','container wps-one-nginx-1 is unhealthy')
+        with patch.object(cli,'load_inventory',return_value=self.inventory()), patch.object(cli,'node_config',return_value={'node':'backup'}), \
+             patch.object(provision,'ensure_edge'), patch.object(stacks,'compose',side_effect=failure), contextlib.redirect_stderr(err):
+            self.assertEqual(cli.main(['stack','up','one']),1)
+        self.assertIn('is unhealthy',err.getvalue())
+
+    def test_cli_schedule_rejects_unknown_backup_sources(self):
+        from wpops import __main__ as cli
+        import io
+        self.raw['backup_sources']={'shop-source':{'origin':'primary','sync_api':'https://shop.example'}}
+        err=io.StringIO()
+        with patch.object(cli,'load_inventory',return_value=self.inventory()), patch.object(backup,'set_schedule') as schedule, \
+             contextlib.redirect_stderr(err):
+            self.assertEqual(cli.main(['backup','schedule','--sources','shop-source,nope']),1)
+            schedule.assert_not_called()
+        self.assertIn('nope',err.getvalue())
+
+    def test_agent_validates_restore_requests_before_starting_a_job(self):
+        from wpops.agent import Agent, ApiError
+        self.add_stack('one');self.add_site('one','one')
+        agent=Agent.__new__(Agent);agent.inv=self.inventory();agent.cfg={'node':'backup'};agent.reload=lambda:None
+        with patch('wpops.agent.jobs.Job') as job, patch('wpops.agent.jobs.start_background'), patch('wpops.agent.jobs.active',return_value=[]), \
+             patch.object(backup,'BACKUPS_DIR',self.root/'backups'):
+            for body in ({'set':'../../etc/x','stack':'one','all':True},
+                         {'set':'src/20260101-0000-abcd','stack':'../one','all':True},
+                         {'set':'src/20260101-0000-abcd','stack':'one','all':True},
+                         {'set':'src/20260101-0000-abcd','stack':'one','sites':['nope']}):
+                with self.assertRaises(ApiError) as e: agent.route('POST','/v1/restore/apply',{},body,'t')
+                self.assertEqual(e.exception.status,400,body)
+            job.assert_not_called()
+            d=self.root/'backups/src/20260101-0000-abcd';d.mkdir(parents=True);(d/'manifest.json').write_text('{}')
+            agent.route('POST','/v1/restore/apply',{},{'set':'src/20260101-0000-abcd','stack':'one','sites':['one']},'t')
+            job.assert_called_once()
+
+    def test_backup_pull_completes_and_records_the_source_version(self):
+        import hashlib
+        payload=b'database dump'
+        name='backup_2026-10-29-0342_site_ABCD1234-db.gz'
+        listing={'mode':'single','site_url':'https://shop.example','sites':[{'blog_id':1,'domain':'shop.example'}],
+                 'sets':[{'nonce':'ABCD1234','timestamp':1793245320,'label':'t','full':True,
+                          'files':[{'name':name,'size':len(payload)}]}]}
+        class Client:
+            deleted=[]
+            def ping(self): return {'version':'1.6.3','site_url':'https://shop.example','mode':'single'}
+            def start_backup(self,label,entities=None,db=True): return {'nonce':'ABCD1234'}
+            def job(self,nonce): return {'status':'complete','terminal':True,'succeeded':True}
+            def sets(self): return copy.deepcopy(listing)
+            def download(self,nonce,fname,dest,size,log): dest.write_bytes(payload)
+            def hashes(self,nonce,log): return {name:hashlib.sha256(payload).hexdigest()}
+            def delete_remote(self,nonce): Client.deleted.append(nonce)
+        self.raw['backup_sources']={'shop-source':{'origin':'primary','sync_api':'https://shop.example'}}
+        inv=self.inventory()
+        job=type('Job',(),{'log':staticmethod(lambda _:None),'set_progress':lambda *a,**k:None,'progress':{},'id':'j','actor':'t'})()
+        cfg={'backup':{'retain_sets':4,'entities':[],'delete_on_source':True,'max_set_gb':1,'pull_timeout_min':1}}
+        with patch.object(backup,'client_for',return_value=Client()), patch.object(backup,'node_config',return_value=cfg), \
+             patch.object(backup,'BACKUPS_DIR',self.root/'backups'), patch.object(backup.disk,'require'), \
+             patch.object(backup.state,'locked',return_value=contextlib.nullcontext()):
+            result=backup.pull(job,inv,'shop-source')
+            _,man=backup.manifest(result['set'])
+        self.assertEqual(man['plugin_version'],'1.6.3')
+        self.assertTrue(man['pulled_at'])
+        self.assertEqual(Client.deleted,['ABCD1234'])
+
+    def test_setup_notes_sunrise_only_for_unmanaged_multisite_stacks(self):
+        node=self.root/'node';(node/'config').mkdir(parents=True);(node/'plugin').symlink_to(ROOT/'plugin')
+        (node/'config/wpops.json').write_text(json.dumps({'node':'n'}))
+        stacks_cfg={}
+        for name,managed in (('managed',True),('legacy',False)):
+            (node/name/'data/wordpress/wp-content').mkdir(parents=True)
+            stacks_cfg[name]={'path':str(node/name),'mode':'multisite','managed':managed}
+        (node/'legacy/.env').write_text('WP_SUNRISE=false\n')
+        (node/'config/inventory.json').write_text(json.dumps({'origins':{'n':{'kind':'node','stacks':stacks_cfg,'tunnels':{}}},'sites':[]}))
+        r=subprocess.run([str(ROOT/'scripts/wpops/bin/wpops'),'setup'],env={**os.environ,'WPOPS_REPO_DIR':str(node)},
+                         capture_output=True,text=True)
+        self.assertEqual(r.returncode,0,r.stderr)
+        notes=[l for l in r.stdout.splitlines() if 'WP_SUNRISE' in l]
+        self.assertEqual(len(notes),1);self.assertIn(str(node/'legacy'),notes[0])
+
+    def test_cf_api_url_points_both_tools_at_a_test_double(self):
+        env={**os.environ,'CF_API_URL':'http://127.0.0.1:8999/client/v4'}
+        r=subprocess.run([sys.executable,'-c','import sys;sys.path.insert(0,sys.argv[1]);from wpops import config;print(config.CF_API)',
+                          str(ROOT/'scripts/wpops')],env=env,capture_output=True,text=True)
+        self.assertEqual(r.stdout.strip(),'http://127.0.0.1:8999/client/v4',r.stderr)
+        r=subprocess.run(['bash','-c','source "$1/scripts/cf-common.sh"; echo "$CF_API"','t',str(ROOT)],env=env,capture_output=True,text=True)
+        self.assertEqual(r.stdout.strip(),'http://127.0.0.1:8999/client/v4',r.stderr)
+        env.pop('CF_API_URL')
+        r=subprocess.run(['bash','-c','source "$1/scripts/cf-common.sh"; echo "$CF_API"','t',str(ROOT)],env=env,capture_output=True,text=True)
+        self.assertEqual(r.stdout.strip(),'https://api.cloudflare.com/client/v4')
+
+    @unittest.skipUnless(shutil.which('docker'), 'needs the Docker CLI with Compose v2 (no daemon)')
+    def test_compose_capabilities_and_legacy_cli_network(self):
+        r=subprocess.run(['docker','compose','-f',str(ROOT/'docker-compose.yml'),'--env-file',str(ROOT/'.env.example'),
+                          'config','--format','json'],capture_output=True,text=True)
+        self.assertEqual(r.returncode,0,r.stderr)
+        legacy=json.loads(r.stdout)['services']
+        self.assertTrue({'CHOWN','FOWNER'} <= set(legacy['mariadb']['cap_add']))   # fresh ./data/mysql
+        self.assertIn('CHOWN',legacy['redis']['cap_add'])                           # fresh ./data/redis
+        self.assertIn('KILL',legacy['wordpress']['cap_add'])                        # php-fpm reload/stop
+        self.assertIn('frontend',legacy['wp-cron']['networks'])                     # not only the internal network
+        result=provision.create('one','single','one.example',18081)
+        env={k:v for k,v in os.environ.items() if not k.startswith('COMPOSE_') and k!='WPOPS_REPO_DIR'}
+        r=subprocess.run(['docker','compose','config','--format','json'],cwd=result['path'],env=env,text=True,capture_output=True)
+        self.assertEqual(r.returncode,0,r.stderr)
+        self.assertIn('KILL',json.loads(r.stdout)['services']['wordpress']['cap_add'])
+
+    def _php(self, code):
+        php=os.environ.get('WPOPS_TEST_PHP') or shutil.which('php')
+        script=self.root/'t.php';script.write_text('<?php\n'+code)
+        r=subprocess.run([php,'-n',str(script)],capture_output=True,text=True)
+        self.assertEqual(r.returncode,0,r.stdout+r.stderr)
+        return json.loads(r.stdout.strip().splitlines()[-1])
+
+    @unittest.skipUnless(os.environ.get('WPOPS_TEST_PHP') or shutil.which('php'), 'PHP CLI is optional for the PHP checks')
+    def test_php_new_subdomain_blogs_follow_the_main_site_scheme(self):
+        out=self._php("""define('ABSPATH','/');
+$GLOBALS['hooks']=[]; $GLOBALS['opts']=[2=>['home'=>'http://news.net.example','siteurl'=>'http://news.net.example']]; $GLOBALS['blog']=1;
+function add_filter(...$a) {} function add_action($h,$cb,$p=10,$n=1) { $GLOBALS['hooks'][$h]=$cb; }
+function is_subdomain_install() { return $GLOBALS['subdomain']; } function get_main_site_id($n=null) { return 1; }
+function get_home_url($id) { return 'https://net.example'; } function wp_parse_url($u,$c=-1) { return parse_url($u,$c); }
+function switch_to_blog($id) { $GLOBALS['blog']=$id; } function restore_current_blog() { $GLOBALS['blog']=1; }
+function get_option($o) { return $GLOBALS['opts'][$GLOBALS['blog']][$o]; }
+function update_option($o,$v) { $GLOBALS['opts'][$GLOBALS['blog']][$o]=$v; }
+require '"""+str(ROOT/'plugin/wpops-policy.php')+"""';
+$GLOBALS['subdomain']=false; $GLOBALS['hooks']['wp_initialize_site']((object)['blog_id'=>2,'network_id'=>1]); $path=$GLOBALS['opts'][2];
+$GLOBALS['subdomain']=true; $GLOBALS['hooks']['wp_initialize_site']((object)['blog_id'=>2,'network_id'=>1]);
+echo json_encode([$path,$GLOBALS['opts'][2],$GLOBALS['blog']]);""")
+        self.assertEqual(out[0],{'home':'http://news.net.example','siteurl':'http://news.net.example'})
+        self.assertEqual(out[1],{'home':'https://news.net.example','siteurl':'https://news.net.example'})
+        self.assertEqual(out[2],1)
+
+    @unittest.skipUnless(os.environ.get('WPOPS_TEST_PHP') or shutil.which('php'), 'PHP CLI is optional for the PHP checks')
+    def test_php_alias_of_a_path_based_network_serves_every_blog_below_it(self):
+        content=self.root/'wp-content';content.mkdir()
+        (content/'wpops-host-aliases.json').write_text(json.dumps({'aliases':{
+            'example.org':{'blog_id':1,'host':'paths.example','site':'org'},
+            'news.example':{'blog_id':2,'host':'news.net.example','site':'news'}}}))
+        sunrise=ROOT/'plugin/kc-host-alias/sunrise.php';alias=ROOT/'plugin/kc-host-alias/kc-host-alias.php'
+        out=self._php("""define('ABSPATH','/'); define('WP_CONTENT_DIR','"""+str(content)+"""');
+class DB { public $blogs='wp_blogs'; public $site='wp_site'; public $rows;
+  function __construct() { $this->rows=[
+    (object)['blog_id'=>1,'site_id'=>1,'domain'=>'paths.example','path'=>'/','public'=>1],
+    (object)['blog_id'=>2,'site_id'=>1,'domain'=>'paths.example','path'=>'/alpha/','public'=>1],
+    (object)['blog_id'=>3,'site_id'=>1,'domain'=>'paths.example','path'=>'/beta/','public'=>1],
+    (object)['blog_id'=>4,'site_id'=>2,'domain'=>'news.net.example','path'=>'/','public'=>1]]; }
+  function prepare($q,...$a) { return [$q,$a]; }
+  function get_row($p) { [$q,$a]=$p; if (strpos($q,'wp_site')!==false) return (object)['id'=>$a[0],'domain'=>'net','path'=>'/','blog_id'=>1];
+    foreach ($this->rows as $r) if ($r->blog_id==$a[0]) return $r; return null; }
+  function get_results($p) { [$q,$a]=$p; return array_values(array_filter($this->rows,fn($r)=>$r->domain===$a[0]&&$r->site_id==$a[1])); }
+  function set_blog_id($b,$s) {} }
+$out=[];
+foreach ([['example.org','/'],['example.org','/alpha/'],['example.org','/alpha/some-post/?x=1'],['example.org','/beta'],
+          ['example.org','/alphabet/'],['news.example','/alpha/']] as [$h,$u]) {
+  $GLOBALS['wpdb']=new DB(); $GLOBALS['current_blog']=null; $_SERVER['HTTP_HOST']=$h; $_SERVER['REQUEST_URI']=$u;
+  (function() { require '"""+str(sunrise)+"""'; })();
+  $out[]=[$h.$u,$GLOBALS['current_blog']->blog_id ?? null,$GLOBALS['path'] ?? null];
+}
+// The alias plugin keeps the selected blog's path in home/siteurl.
+$GLOBALS['filters']=[]; $GLOBALS['cur']=2;
+function add_filter($h,$cb,$p=10,$n=1) { $GLOBALS['filters'][$h]=$cb; } function add_action(...$a) {}
+function is_multisite() { return true; } function get_current_blog_id() { return $GLOBALS['cur']; }
+$GLOBALS['current_blog']=(object)['blog_id'=>2,'path'=>'/alpha/']; $_SERVER['HTTP_HOST']='example.org';
+require '"""+str(alias)+"""';
+$home=$GLOBALS['filters']['pre_option_home'](false); $GLOBALS['cur']=3;
+$other=[$GLOBALS['filters']['pre_option_home'](false), $GLOBALS['filters']['option_home']('https://paths.example/beta')];
+echo json_encode([$out,$home,$other]);""")
+        blogs,home,other=out
+        self.assertEqual([b[1] for b in blogs],[1,2,2,3,1,2])
+        self.assertEqual(home,'https://example.org/alpha')
+        self.assertEqual(other,[False,'https://example.org/beta'])
 
 
 if __name__=='__main__': unittest.main()

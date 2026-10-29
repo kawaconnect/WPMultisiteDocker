@@ -40,3 +40,21 @@ add_filter('site_option_active_sitewide_plugins', static function ($plugins) {
     }
     return $plugins;
 });
+
+/* Subdomain networks: core gives a new blog http:// URLs (it only copies the
+ * main site's https scheme for path-based networks), so blogs created with
+ * WP-CLI or the network admin would link to http. Follow the main site. */
+add_action('wp_initialize_site', static function ($site) {
+    if (!is_subdomain_install()
+            || 'https' !== wp_parse_url(get_home_url(get_main_site_id($site->network_id)), PHP_URL_SCHEME)) {
+        return;
+    }
+    switch_to_blog((int) $site->blog_id);
+    foreach (['home', 'siteurl'] as $option) {
+        $url = get_option($option);
+        if (is_string($url) && 0 === strpos($url, 'http://')) {
+            update_option($option, 'https://' . substr($url, 7));
+        }
+    }
+    restore_current_blog();
+}, 20);

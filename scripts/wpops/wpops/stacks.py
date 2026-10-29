@@ -24,7 +24,7 @@ def stack_path(origin: Origin, name: str) -> Path:
         raise StackError(f"stack '{name}' is not defined on node '{origin.name}'") from None
 
 
-def compose(origin: Origin, name: str, *args: str, timeout: int = 3600, check: bool = True,
+def compose(origin: Origin, name: str, *args: str, timeout: int | None = 3600, check: bool = True,
             capture: bool = True, input_text: str | None = None) -> subprocess.CompletedProcess:
     path = stack_path(origin, name)
     cmd = ["docker", "compose", *args]

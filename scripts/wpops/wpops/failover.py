@@ -182,18 +182,29 @@ def plan(inv: Inventory, sites: list[Site], to: str | None = None, stack: str | 
                                       "reason": "record points somewhere not in the inventory: " +
                                                 ", ".join(f"{r['type']} {r['content']}" for r in recs)})
                     continue
-                proxied = any(r.get("proxied") for r in recs)
                 p.changes.append(Change(
                     site=site.slug, domain=domain, cf_account=site.cf_account, zone_id=zone_id,
                     from_origin=current, to_origin=target, stack=stack_name, service=service,
                     tunnel_id=tunnel_id, original_records=[_public_record(r) for r in recs],
                     create={"type": "CNAME", "name": domain, "content": f"{tunnel_id}.cfargotunnel.com",
-                            "proxied": True if not recs else proxied, "ttl": 1,
+                            # A tunnel CNAME only works proxied, even when the
+                            # original records were DNS-only (restored on rollback).
+                            "proxied": True, "ttl": 1,
                             "comment": f"wpops failover from {current}"},
                 ))
         except (FailoverError, ConfigError) as exc:
             p.refused.append({"site": site.slug, "domain": "*", "reason": str(exc)})
     return p
+
+
+def _recreate(cf: Cloudflare, zone_id: str, records: list[dict[str, Any]], domain: str, log) -> None:
+    """Best effort: put records back after a failed replacement."""
+    for r in records:
+        try:
+            cf.create_record(zone_id, r)
+            log(f"put back {r.get('type')} {domain} -> {r.get('content')}")
+        except Exception as exc:  # noqa: BLE001
+            log(f"could not put back {r.get('type')} {domain} -> {r.get('content')}: {exc}")
 
 
 # ---------------------------------------------------------------- aliases
@@ -317,7 +328,13 @@ def apply(inv: Inventory, p: Plan, actor: str, this_node: str, accounts: dict | 
                 for r in current_records:
                     if r.get('type') in SWITCHABLE_TYPES:
                         cf.delete_record(c.zone_id, r['id'])
-                created = cf.create_record(c.zone_id, c.create)
+                try:
+                    created = cf.create_record(c.zone_id, c.create)
+                except Exception:
+                    # Put the deleted records back so the name keeps resolving;
+                    # the override keeps the originals and a retry switches again.
+                    _recreate(cf, c.zone_id, current_records, c.domain, log)
+                    raise
                 ovs[c.domain].update(record_id=created.get('id'), status='active')
                 ovs[c.domain].pop('error', None)
                 state.save_overrides(ovs)
@@ -373,11 +390,19 @@ def rollback(inv: Inventory, actor: str, this_node: str, sites: list[str] | None
                 ov["status"] = "rolling-back"
                 state.save_overrides(ovs)
                 # delete whatever currently sits on the name (our CNAME, or anything left half-way)
-                for r in cf.dns_records(ov["zone_id"], name=domain):
-                    if r.get("type") in SWITCHABLE_TYPES:
-                        cf.delete_record(ov["zone_id"], r["id"])
-                for r in ov["original_records"]:
-                    cf.create_record(ov["zone_id"], r)
+                current = [r for r in cf.dns_records(ov["zone_id"], name=domain) if r.get("type") in SWITCHABLE_TYPES]
+                for r in current:
+                    cf.delete_record(ov["zone_id"], r["id"])
+                restored_any = False
+                try:
+                    for r in ov["original_records"]:
+                        cf.create_record(ov["zone_id"], r)
+                        restored_any = True
+                except Exception:
+                    if not restored_any:
+                        # Nothing of the original came back: keep serving from this node.
+                        _recreate(cf, ov["zone_id"], current, domain, log)
+                    raise
                 removed.setdefault((ov["cf_account"], ov["tunnel_id"]), []).extend(inv.site(ov["site"]).domains)
                 del ovs[domain]
                 state.save_overrides(ovs)

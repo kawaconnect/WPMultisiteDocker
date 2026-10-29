@@ -108,7 +108,17 @@ final class KC_Host_Alias {
         }, 0);
         $alias = self::$alias;
         $url = 'https://' . $alias;
-        $to_alias = static function ($value) use ($url) {
+        $blog = 0;
+        if (is_multisite() && isset($GLOBALS['current_blog']->blog_id)) {
+            // sunrise.php picked the blog; keep its path (path-based networks).
+            $blog = (int) $GLOBALS['current_blog']->blog_id;
+            $url .= rtrim((string) $GLOBALS['current_blog']->path, '/');
+        }
+        $to_alias = static function ($value) use ($url, $blog) {
+            if ($blog && get_current_blog_id() !== $blog) {
+                // Another blog (switch_to_blog): only map the internal host.
+                return is_string($value) ? self::replace_host($value) : $value;
+            }
             return $url;
         };
         add_filter('pre_option_home', $to_alias, 1);
