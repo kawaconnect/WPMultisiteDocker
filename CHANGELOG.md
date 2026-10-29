@@ -2,6 +2,37 @@
 
 Versions are git tags (`vX.Y.Z`). This repo has no build; tags mark reviewed states of the stack and scripts.
 
+## [0.0.5] - 2026-10-29
+
+Every topology (two single sites, one multisite network, a subdomain plus a subdirectory network, and a node mixing all of them with the legacy root stack) was run for real on Docker, with a stand-in for the Cloudflare API and edge. These are the problems that run found.
+
+### Added
+- `tests/e2e/`: an opt-in end-to-end run on a real Docker daemon (`e2e.py`), an in-memory Cloudflare API (`fake_cloudflare.py`) and an HTTPS stand-in for the Cloudflare edge and connectors (`cf_edge.py`). Not run in CI; see `docs/deployments.md`, "Validation".
+- `CF_API_URL` (environment or `.env`) points wpops and the `cf-*.sh` scripts at such a test API. Leave it unset in production.
+- Regression tests for every fix below.
+
+### Fixed
+- `wpops stack init` refused every new stack ("database is not empty or cannot be inspected"): its empty-database check used `wp db tables`, which fails until WordPress is installed. It now asks MariaDB directly.
+- `wpops stack init` printed the generated admin password (WP-CLI echoes the prompted value back). It is now left out of the output.
+- `wpops backup pull` always failed at the end of the download with `name 'info' is not defined`, so no backup set could be pulled (CLI, API or schedule).
+- After a database restore wpops reloaded PHP-FPM with `USR2`. Docker does not restart a container whose PHP-FPM re-executed itself that way, so after the next Docker or host restart that stack's WordPress stayed down. wpops now restarts the WordPress container instead.
+- PHP-FPM could not signal its own workers (no `KILL` capability in the WordPress containers), so a reload never finished and every stop waited for a forced kill. Added to the managed, legacy and instance Compose files.
+- Failing over a DNS-only (grey cloud) record created an unproxied CNAME to the tunnel, which does not work, so the site went offline. The tunnel CNAME is now always proxied; rollback still restores the original setting.
+- When Cloudflare rejected the new record during failover or rollback, the old one had already been deleted and the name was left without any record (and a `www` CNAME pointing at it failed too). The deleted records are now put back; re-running apply or rollback finishes the job.
+- After failing over the domain of a subdirectory network, only the main blog worked: `example.org/alpha/` showed the main blog's 404 page. The alias now covers every blog below the mapped one, with links that keep the blog's path.
+- Blogs created with WP-CLI on a subdomain network got `http://` URLs. New blogs now follow the main site's `https://`.
+- A Cloudflare error for one account during `wpops tunnels ensure` removed that account's connector from the generated connector project. The existing connector is now kept.
+- Legacy root stack on a new node: MariaDB could not take ownership of its new data directory and never started, and Redis could not save, so it refused every write. Added the missing capabilities.
+- Legacy root stack: its WP-CLI/cron container was only on the internal network, where name lookups fail on hosts with a DNS search domain, so `wp` commands (and wpops restores) could not reach the database. It now also joins the frontend network, like the managed stacks.
+- `wpops stack create` accepted a port already in use on 127.0.0.1 (such as the legacy stack's 8080); the stack then could not start.
+- `wpops stack compose` swallowed Compose's output: `nginx -t` (from the docs) printed nothing, `logs -f` could not stream and failures did not say why. It now runs Compose directly and returns its exit status. Failed `stack up`/`stop` show Compose's error.
+- Cloudflare API errors in `wpops routes`, `failover` and other commands ended in a Python traceback instead of an error message.
+- The agent accepted restore requests for unknown stacks, sets or sites and failed them later as jobs (holding the restore slot meanwhile); they are now rejected with 400. `wpops backup schedule --sources` rejects unknown sources, as the API already did.
+- `wpops setup` told operators to set `WP_SUNRISE=true` in managed stacks' `.env`, which they already have.
+
+### Not changed
+- The legacy `cf-failover.sh` still copies the original record's proxied flag to the tunnel CNAME (the problem fixed above for wpops): its rollback has no record of the original setting, so making the CNAME proxied would silently change grey-cloud records on rollback. Use `wpops failover` for DNS-only records.
+
 ## [0.0.4] - 2026-10-28
 
 ### Added
