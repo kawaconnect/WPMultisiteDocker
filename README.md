@@ -236,7 +236,21 @@ wpops failover rollback --sites a | --all --yes     # exact original records res
 wpops backup pull --source azure                    # SiteGuard sync API: fresh full backup, resumable download
 wpops backup list | prune | schedule --set weekly:sun:03:30 --retain 4
 wpops restore apply --set azure/<set> --stack main --all | --sites a,b --yes   # never automatic
+wpops registry [--live] / registry show <site> / registry changes --since N   # every site on the node
+wpops site add <slug> --stack S [--blog-id N] / site remove <slug> --yes      # map sites; stack remove NAME --yes
+wpops siteguard status / siteguard enroll [STACK]   # per-stack SiteGuard health keys held by the agent
 ```
+
+**Site registry.** The agent tracks every WordPress deployment on the node:
+each single-site stack and each blog of every multisite stack, mapped in the
+inventory or not. Per site it reports slug, domains, stack and mode, health
+(the stack's SiteGuard health API through a node key the agent enrols itself,
+or a direct HTTP check), WordPress/PHP/plugin versions, last backup, disk usage
+and tunnel/override state. `GET /v1/registry`, `GET /v1/registry/changes?since=<rev>`
+and `GET /v1/siteguard/health` (the whole node in SiteGuard's health format)
+use the node's one agent token, so the bot registers a node once and sites
+appear and disappear as stacks and blogs are added or removed. Details:
+[docs/wpops-design.md](docs/wpops-design.md), section 2.6.
 
 - `config/inventory.json` (per node, **not committed**; copy from `inventory.example.json`): origins (external like Azure, or
   nodes), sites (slug, primary, Cloudflare account, production domains, how

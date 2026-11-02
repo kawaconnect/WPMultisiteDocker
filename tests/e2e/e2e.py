@@ -23,7 +23,9 @@ restore between stacks.
 
 What it does, through the wpops CLI as an operator would (docs/deployments.md):
 setup, stack create/init (with custom login paths), blogs with WP-CLI,
-stack list/stop/up/compose, tunnels ensure and routes plan/apply against
+stack list/stop/up/compose/remove, the site registry (CLI and agent API:
+every stack and blog, health, versions, disk, change feed; with --siteguard
+also a SiteGuard node key), tunnels ensure and routes plan/apply against
 tests/e2e/fake_cloudflare.py, then checks over HTTPS through
 tests/e2e/cf_edge.py (Cloudflare edge + cloudflared stand-in on the
 connector networks) that every routed hostname reaches the right site, that
@@ -476,11 +478,90 @@ def run(node: Node, work: Path, args, stacks: list[str], sites: list, legacy: bo
     native = {d for s in sites if s[5] == "node" for d in s[4]}
     check(left - {None} == native, "rollback removes only the failover ingress rules", str(left))
 
+    registry_checks(node, stacks, sites, legacy)
     if args.siteguard and "shop" in stacks:
         backups(node, edge, Path(args.siteguard))
 
     log(f"\n{len(FAILS)} failure(s)" + (": " + "; ".join(FAILS) if FAILS else ""))
     return 1 if FAILS else 0
+
+
+def registry_checks(node: Node, stacks: list[str], sites: list, legacy: bool) -> None:
+    """The node's site registry (CLI and API): every stack and blog, health, changes."""
+    r = node.wpops("--json", "registry", "refresh", "--facts", check_rc=False, timeout=900)
+    check(r.returncode == 0, "registry refresh --facts", r.stderr[-300:])
+    snap = json.loads(node.wpops("--json", "registry").stdout)
+    blogs = {"shop": 1, "blog": 1, "network": 3, "paths": 3}
+    expected = sum(blogs[s] for s in stacks) + (2 if legacy else 0)
+    check(len(snap["sites"]) == expected, f"registry lists every site of every stack ({expected})",
+          str([x["uid"] for x in snap["sites"]]))
+    by_slug = {x["slug"]: x for x in snap["sites"] if x["slug"]}
+    for slug, stack, bid, host, domains, primary in sites:
+        x = by_slug.get(slug, {})
+        check(x.get("stack") == stack and x.get("blog_id") == (bid or 1) and x.get("domains") == domains,
+              f"registry maps {slug} to {stack}/{bid or 1}", json.dumps({k: x.get(k) for k in ("uid", "domains")}))
+    check(all(x["health"].get("status") == "operational" for x in snap["sites"]), "every site is operational (direct checks)",
+          str([(x["uid"], x["health"].get("error")) for x in snap["sites"] if x["health"].get("status") != "operational"]))
+    check(all(st["versions"].get("wordpress") and st["versions"].get("php") for st in snap["stacks"]),
+          "registry reports WordPress and PHP versions per stack")
+    check(all(st["disk"].get("stack_bytes", 0) > 0 for st in snap["stacks"]), "registry reports disk usage per stack")
+    rev = snap["revision"]
+
+    node.wpops("stack", "stop", stacks[0])
+    node.wpops("registry", "refresh")
+    down = [x for x in json.loads(node.wpops("--json", "registry").stdout)["sites"] if x["stack"] == stacks[0]]
+    check(all(x["health"]["status"] == "down" for x in down), f"sites of stopped stack {stacks[0]} are down")
+    node.wpops("stack", "up", stacks[0], timeout=900)
+    node.wpops("registry", "refresh")
+    up = [x for x in json.loads(node.wpops("--json", "registry").stdout)["sites"] if x["stack"] == stacks[0]]
+    check(all(x["health"]["status"] == "operational" for x in up), f"{stacks[0]} is operational again")
+
+    multi = next((s for s in stacks if STACKS[s][0] == "multisite"), None)
+    if multi:
+        node.wp(multi, "site", "create", "--slug=late", "--title=MARK-late", "--email=admin@example.com")
+        node.wpops("registry", "refresh", "--facts", "--stacks", multi, timeout=900)
+        feed = json.loads(node.wpops("--json", "registry", "changes", "--since", str(rev)).stdout)
+        check([c["op"] for c in feed["changes"]] == ["added"] and feed["changes"][0]["site"]["stack"] == multi,
+              "a new blog appears in the change feed", json.dumps(feed["changes"])[:400])
+        rev = feed["revision"]
+
+    node.wpops("stack", "create", "tmp", "--mode", "single", "--domain", "tmp.example.net", "--port", "18189")
+    r = node.wpops("stack", "remove", "tmp", "--yes", check_rc=False)
+    check(r.returncode == 0 and "tmp" not in json.loads(node.wpops("stack", "list").stdout), "stack remove unregisters it",
+          r.stderr[-300:])
+    check(any(p.name.startswith("tmp-") for p in (node.root / "stacks/_removed").iterdir()),
+          "stack remove keeps its files under stacks/_removed")
+    feed = json.loads(node.wpops("--json", "registry", "changes", "--since", str(rev)).stdout)
+    check([c["op"] for c in feed["changes"]] == ["added", "removed"], "stack create/remove reach the change feed",
+          json.dumps(feed["changes"])[:400])
+
+    # The same over the agent API with the node token.
+    token = node.wpops("token", "rotate").stdout.strip()
+    cfg = json.loads((node.root / "config/wpops.json").read_text())
+    cfg.setdefault("agent", {})["port"] = 18780
+    (node.root / "config/wpops.json").write_text(json.dumps(cfg))
+    env = {k: v for k, v in os.environ.items() if not k.startswith("COMPOSE_")}
+    agent = subprocess.Popen([str(node.root / "scripts/wpops/bin/wpops"), "serve"], cwd=node.root, env=env,
+                             stdout=open(node.root.parent / "agent.log", "w"), stderr=subprocess.STDOUT)
+    try:
+        def api(path: str) -> dict:
+            req = urllib.request.Request(f"http://127.0.0.1:18780{path}", headers={"Authorization": f"Bearer {token}"})
+            with urllib.request.urlopen(req, timeout=60) as resp:
+                return json.load(resp)
+        for _ in range(40):
+            try:
+                api("/v1/registry")
+                break
+            except OSError:
+                time.sleep(0.5)
+        reg = api("/v1/registry")
+        sgp = api("/v1/siteguard/health")
+        check(len(reg["sites"]) == sgp["summary"]["total"] == len(snap["sites"]) + (1 if multi else 0),
+              "API registry and SiteGuard view list every site", f"{len(reg['sites'])} {sgp['summary']}")
+        check(len({x["site_id"] for x in sgp["sites"]}) == len(sgp["sites"]), "SiteGuard view ids are unique per node")
+    finally:
+        agent.terminate()
+        agent.wait(10)
 
 
 def backups(node: Node, edge: Edge, siteguard: Path) -> None:
@@ -506,6 +587,12 @@ def backups(node: Node, edge: Edge, siteguard: Path) -> None:
     if "shop.example.net" not in hosts:
         with open("/etc/hosts", "a") as fh:
             fh.write(f"{edge_ip} shop.example.net\n")
+    r = node.wpops("--json", "siteguard", "enroll", "shop", check_rc=False)
+    check(r.returncode == 0 and json.loads(r.stdout)["shop"].get("verified"), "SiteGuard node key enrolled for shop",
+          r.stdout[-300:])
+    node.wpops("registry", "refresh")
+    shop = json.loads(node.wpops("--json", "registry", "show", "shop").stdout)
+    check(shop["health"].get("source") == "siteguard", "shop health comes from its SiteGuard", json.dumps(shop["health"]))
     node.wp("shop", "post", "create", "--post_title=RESTORE-MARK", "--post_status=publish")
     r = node.wpops("backup", "pull", "--source", "primary-shop", check_rc=False, timeout=1800)
     check(r.returncode == 0, "backup pull from a source profile", r.stdout[-500:])

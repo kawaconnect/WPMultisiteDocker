@@ -2,6 +2,22 @@
 
 Versions are git tags (`vX.Y.Z`). This repo has no build; tags mark reviewed states of the stack and scripts.
 
+## [0.0.7] - 2026-11-02
+
+Every WordPress deployment on a node, single site or multisite, is now tracked one site at a time, so monitoring no longer depends on one key for one multisite.
+
+### Added
+- Site registry in the wpops agent (wpops 0.2.0): every single-site stack and every blog of every multisite stack, with slug, domains, stack, mode, health, WordPress/PHP/plugin versions, last backup, disk usage and tunnel/override state. Sites are identified by `<node>:<stack>:<blog id>` and a numeric id that is never reused.
+- API with the existing agent token: `GET /v1/registry`, `GET /v1/registry/sites/<id>`, `GET /v1/registry/changes?since=<rev>` (change feed), `GET /v1/siteguard/health` (the whole node in SiteGuard's health format), `POST /v1/registry/refresh`, `POST /v1/registry/sites/add|remove`, `POST /v1/siteguard/enroll`. `GET /v1/status` reports registry counts.
+- Events `registry.site_added`, `registry.site_removed`, `registry.site_changed` and `siteguard.enrolled` (event log and webhook). Every event now has a sequence number; `GET /v1/events?after=<seq>` pages by it.
+- Health per site from the stack's own SiteGuard health API, read with a key the agent enrols itself (a node key on SiteGuard 1.6.4+, so the site's own key is never replaced), or a direct HTTP check through the stack's loopback port. Stale SiteGuard data triggers one fresh check.
+- CLI: `wpops registry [list|show|changes|refresh]`, `wpops site add|remove`, `wpops siteguard status|enroll`, `wpops stack remove` (stops the stack, unregisters it and moves its files to `stacks/_removed/`; nothing is deleted, DNS is not touched).
+- `config/wpops.json` `registry` settings; docs: design section 2.6, deployment guide section 7.
+- Tests: `tests/test_registry.py` (including `wpops serve` run as a process against stand-in stacks) and a registry stage in `tests/e2e/e2e.py`.
+
+### Changed
+- A restore schedules a registry refresh of the stack and a check of the agent's SiteGuard key.
+
 ## [0.0.6] - 2026-11-02
 
 ### Added

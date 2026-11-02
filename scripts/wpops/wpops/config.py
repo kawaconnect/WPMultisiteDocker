@@ -136,6 +136,16 @@ NODE_DEFAULTS: dict[str, Any] = {
         "default_to": "",                 # origin to use when a caller does not say --to
         "tunnel_service": "http://nginx:80",
     },
+    "registry": {
+        "enabled": True,                  # keep the site registry (GET /v1/registry) up to date
+        "facts_interval_min": 360,        # WP/PHP/plugin versions, blogs and disk usage (WP-CLI, du)
+        "health_timeout": 15,             # seconds per local health request
+        # Give SiteGuard on each stack a node key so the agent can read its
+        # health API: "auto" (node key; the site's own key is never replaced)
+        # or "off" (direct HTTP checks only, or keys set with wpops siteguard enroll).
+        "siteguard_enroll": "auto",
+        "stale_after_min": 30,            # SiteGuard data older than this: ask for a fresh check
+    },
 }
 
 
@@ -357,6 +367,21 @@ def load_inventory(path: Path = INVENTORY_FILE) -> Inventory:
                                   src.get('stack', '')) for name, src in raw.get('backup_sources', {}).items()}
     inv = Inventory(origins=origins, sites=sites, raw=raw, backup_sources=sources)
     _validate_inventory(inv)
+    return inv
+
+
+def save_inventory(raw: dict[str, Any], path: Path | None = None) -> Inventory:
+    """Validate and atomically replace the inventory. Raises ConfigError (and
+    leaves the file untouched) when the new content is invalid."""
+    path = path or INVENTORY_FILE
+    tmp = path.with_name(path.name + ".new")
+    tmp.write_text(json.dumps(raw, indent=2) + "\n", encoding="utf-8")
+    try:
+        inv = load_inventory(tmp)
+    except (ConfigError, KeyError, TypeError) as exc:
+        tmp.replace(path.with_name(path.name + ".rejected"))
+        raise ConfigError(f"inventory change rejected: {exc}") from None
+    tmp.replace(path)
     return inv
 
 

@@ -177,6 +177,13 @@ def apply(job: Job, inv: Inventory, node: str, set_ref: str, stack: str, sites: 
             "entities": entities or "all", "actor": job.actor, "job": job.id,
         })
         bk.save_manifest(set_dir, man)
+    # The database (and SiteGuard's keys in it) changed: collect facts and
+    # check the agent's SiteGuard key on the next registry pass.
+    try:
+        from . import registry
+        registry.invalidate(stack)
+    except Exception:  # noqa: BLE001
+        pass
     result = {"set": set_ref, "stack": stack, "sites": sites or "all", "timestamp": ts}
     state.audit(job.actor, "restore.apply", result)
     notify.notify("restore.applied", f"[wpops] backup applied on {node}/{stack}: {set_ref}",

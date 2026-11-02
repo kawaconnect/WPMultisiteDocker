@@ -22,6 +22,18 @@ def tunnel_status(inv: Inventory, node: str) -> list[dict[str, Any]]:
     return out
 
 
+def registry_summary() -> dict[str, Any]:
+    """Counts from the site registry (state files only, no network)."""
+    reg = state.read_json(state.STATE_DIR / "registry.json", {}) or {}
+    health = state.read_json(state.STATE_DIR / "registry-health.json", {}) or {}
+    counts: dict[str, int] = {}
+    for uid in (reg.get("sites") or {}):
+        st = (health.get(uid) or {}).get("status") or "unknown"
+        counts[st] = counts.get(st, 0) + 1
+    return {"revision": int(reg.get("revision") or 0), "sites": len(reg.get("sites") or {}),
+            "status": counts, "health_updated": health.get("updated")}
+
+
 def node_status(inv: Inventory, cfg: dict[str, Any], live: bool = False) -> dict[str, Any]:
     node = cfg["node"]
     origin = inv.origin(node)
@@ -50,6 +62,7 @@ def node_status(inv: Inventory, cfg: dict[str, Any], live: bool = False) -> dict
         "disk": disk.report(inv, node),
         "jobs": {"active": jobs.active(), "recent": jobs.list_jobs(5)},
         "sites": len(inv.sites),
+        "registry": registry_summary(),
     }
     if live:
         out["dns"] = failover.live_status(inv)

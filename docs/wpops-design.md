@@ -175,12 +175,93 @@ configured in the bot (`/setup smtp`). The agent can also e-mail directly
   Kuma expiry thresholds set to 21/14/7 days. SiteGuard's own SSL days are
   shown on `/sg-monitors`; the bot alerts at the same thresholds.
 
+### 2.6 Site registry (one node, many deployments)
+
+With every site in its own stack, a single SiteGuard key no longer covers the
+estate: each stack is its own WordPress install with its own SiteGuard and
+its own health key. The agent therefore keeps a registry of every deployment
+on its node and is the one thing a client (the bot, SiteGuard tooling) talks
+to. A client registers a node once, with the node's agent token, and learns
+its sites from it.
+
+**What is a site.** Every single-site stack, and every live blog (not
+archived, deleted or spam) of every multisite stack, mapped in the inventory
+or not. Identity: `uid` = `<node>:<stack>:<blog id>` (blog id 1 for a single
+site), plus a numeric `site_id` that is unique on the node and never reused.
+Mapped sites carry their inventory slug, production domains, primary and
+Cloudflare account; unmapped blogs carry their own hostname.
+
+**Per site:** slug, name, URL, host, domains, stack, mode, blog id; health
+(status, HTTP code, response time, SSL days/issuer, consecutive failures,
+`source` siteguard|direct); WordPress, PHP and SiteGuard versions and the
+plugin list (per stack); last SiteGuard backup and backup count, latest set
+pulled from it and latest set restored onto it; disk usage (stack data,
+uploads of that blog, the filesystem's free space); tunnel for its
+Cloudflare account and any failover override of its domains (`?live=1`
+adds where DNS points now).
+
+**How it is collected.**
+
+| Data | Source | When |
+|---|---|---|
+| Membership | inventory + facts | every minute, and at once after `stack create/init/remove`, `site add/remove` |
+| Health | the stack's SiteGuard `/health` over its loopback port with the agent's key; otherwise `GET /` (or the blog's path) with the site's Host | every minute |
+| Versions, plugins, blogs, last SiteGuard backup | one `wp eval` per stack | `registry.facts_interval_min` (360), after a restore, on `registry refresh --facts` |
+| Disk usage | walk of `stacks/<name>/data` | with the facts |
+
+Requests to a stack go to `127.0.0.1:<HTTP_PORT>` (legacy root stack: 8080,
+or `http_port` in its inventory entry) with `X-Forwarded-Proto: https`.
+SiteGuard data older than `registry.stale_after_min` (30) triggers one
+`POST /health/check` (at most every 10 minutes); data older than four times
+that is not trusted and the site is checked directly.
+
+**SiteGuard keys.** With `registry.siteguard_enroll: "auto"` (default) the
+agent enrols a key in every stack where SiteGuard is active: SiteGuard 1.6.4+
+gets a *node key* (`wp siteguardbackup health_api_key --set-node`, read from
+stdin), accepted next to the site's own key, which stays as it is. Older
+SiteGuard gets `--set` only when the site has no key at all; otherwise the
+site is checked directly until SiteGuard is updated (or `wpops siteguard
+enroll <stack> --replace`). The monitor is switched on if it was off. Keys
+live in `state/siteguard-keys.json` (0600) and never leave the node. A key
+the site stops accepting (a restore replaced its options) is enrolled again,
+at most every 30 minutes; a restore also schedules a facts refresh.
+
+**API** (bearer agent token, as every other route):
+
+| Route | |
+|---|---|
+| `GET /v1/registry[?live=1]` | `{node, revision, stacks[], sites[]}` with everything above |
+| `GET /v1/registry/sites/<uid \| stack:blog \| slug>` | one site |
+| `GET /v1/registry/changes?since=<rev>&limit=` | `{revision, reset, changes: [{rev, ts, op: added\|removed\|changed, uid, site}]}`; `reset: true` means the feed no longer reaches back that far: fetch `/v1/registry` |
+| `GET /v1/siteguard/health` | every site in SiteGuard's health format (`api_version` 2: `summary`, `alerts`, `sites[]`), each row with `uid`, `node`, `stack`, `blog_id`, `slug`, `check_source`, versions and `last_backup` |
+| `GET /v1/events?after=<seq>` | events now carry a monotonic `seq`; `after` pages forward from it (`since=<unix time>` still works) |
+| `POST /v1/registry/refresh {facts?, stacks?}` | health pass now; with `facts` a `registry.refresh` job |
+| `POST /v1/registry/sites/add {slug, stack, blog_id?, host?, domains?, cf_account?, primary?, name?, failover_to?}` | map a site (new, or this node's host of an existing one) |
+| `POST /v1/registry/sites/remove {slug, everywhere?}` | unmap it from this node (refused while a failover override is active) |
+| `POST /v1/siteguard/enroll {stack, replace?}` | enrol a key now |
+
+`GET /v1/status` gains `registry: {revision, sites, status counts}`.
+
+**Events** (`state/events.jsonl`, webhook; no e-mail): `registry.site_added`,
+`registry.site_removed`, `registry.site_changed` (`uid`, `site_id`, `slug`,
+`stack`, `url`, `rev`), `siteguard.enrolled`.
+
+**Adding and removing.** `wpops stack create/init` add a stack (and its
+blogs once facts are in), `wp site create` in a network adds a blog on the
+next facts refresh, `wpops site add/remove` maps sites, and `wpops stack
+remove NAME --yes [--detach-sites] [--keep-files]` stops a stack (`compose
+down`, data kept), drops it from the inventory and moves `stacks/<name>` to
+`stacks/_removed/<name>-<time>`. Nothing is deleted, and DNS records and
+tunnel ingress for its hostnames are left alone. Every one of these shows up
+in the change feed, so clients follow without any configuration of their own.
+
 ## 3. Scenarios covered
 
 | Scenario | How |
 |---|---|
 | Azure primary, one docker standby (today) | Inventory as above. |
 | Two docker nodes, either primary | Both are `node` origins with agents; `primary:` per site picks one; failover `--to` the other; rollback returns to primary. The sync schedule can point at either node as source. |
+| Many single-site stacks on one node, monitored per site | Site registry (2.6): one agent token per node; each stack's SiteGuard read with a node key; sites appear and disappear through the change feed. |
 | Single-site stacks | `stacks/<name>/` compose project generated by `wpops stack create <name> --mode single --domain x`; the tunnel ingress maps the hostname to that stack's nginx; inventory `hosts.<node>.stack = <name>` with no `blog_id`. Restore on a single-site stack restores the whole site. See [deployment guide](deployments.md). |
 | Site on both a multisite and a single-site stack | Allowed; `hosts` lists both; failover `--to` uses that origin's configured stack mapping. `--stack` must match it. |
 | Bot cannot reach the LAN | Agent transport `https` through the node's tunnel; SSH is only an optional fallback. |

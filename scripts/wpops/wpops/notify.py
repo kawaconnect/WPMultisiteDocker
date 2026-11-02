@@ -25,16 +25,34 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
 _OPENER = urllib.request.build_opener(_NoRedirect())
 
 
+def _next_seq() -> int:
+    """Monotonic event number (state/events.seq). Timestamps alone cannot be a
+    cursor: several events can share one second."""
+    path = EVENTS_FILE.with_name("events.seq")
+    try:
+        cur = int(path.read_text(encoding="utf-8").strip() or 0)
+    except (OSError, ValueError):
+        cur = 0
+    if not cur and EVENTS_FILE.exists():
+        # First numbered event on a node with older, unnumbered events.
+        cur = len(EVENTS_FILE.read_text(encoding="utf-8").splitlines())
+    cur += 1
+    state.write_private_text(path, f"{cur}\n")
+    return cur
+
+
 def record_event(kind: str, data: dict[str, Any]) -> dict[str, Any]:
     """Append to state/events.jsonl; the bot reads these through the API."""
     state.ensure_dirs()
-    ev = {"ts": int(time.time()), "kind": kind, **data}
-    with open(EVENTS_FILE, "a", encoding="utf-8") as fh:
-        fh.write(json.dumps(ev, sort_keys=True) + "\n")
+    with state.locked("events", timeout=30):
+        ev = {"ts": int(time.time()), "seq": _next_seq(), "kind": kind, **data}
+        with open(EVENTS_FILE, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps(ev, sort_keys=True) + "\n")
     return ev
 
 
-def recent_events(since: int = 0, limit: int = 100) -> list[dict[str, Any]]:
+def recent_events(since: int = 0, limit: int = 100, after: int | None = None) -> list[dict[str, Any]]:
+    """Events newer than `since` (unix time) or, when given, with seq > `after`."""
     if not EVENTS_FILE.exists():
         return []
     out = []
@@ -43,9 +61,12 @@ def recent_events(since: int = 0, limit: int = 100) -> list[dict[str, Any]]:
             ev = json.loads(line)
         except json.JSONDecodeError:
             continue
-        if ev.get("ts", 0) > since:
+        if after is not None:
+            if int(ev.get("seq") or 0) > after:
+                out.append(ev)
+        elif ev.get("ts", 0) > since:
             out.append(ev)
-    return out[-limit:]
+    return out[:limit] if after is not None else out[-limit:]
 
 
 def send_email(subject: str, body: str, to: list[str] | None = None) -> dict[str, Any]:
@@ -103,6 +124,17 @@ def post_webhook(event: dict[str, Any]) -> dict[str, Any]:
             return {"posted": True, "status": resp.status}
     except Exception as exc:  # noqa: BLE001
         return {"posted": False, "reason": str(exc)}
+
+
+def event(kind: str, data: dict[str, Any]) -> dict[str, Any]:
+    """Record the event and post it to the webhook (no e-mail): routine changes
+    such as a site joining or leaving the registry."""
+    ev = record_event(kind, data)
+    try:
+        post_webhook(ev)
+    except Exception:  # noqa: BLE001
+        pass
+    return ev
 
 
 def notify(kind: str, subject: str, body: str, data: dict[str, Any] | None = None) -> dict[str, Any]:

@@ -253,3 +253,58 @@ def install_runtime(origin, name: str) -> None:
     source = path / 'managed-plugins' / 'wps-hide-login'
     if (source / 'wps-hide-login.php').exists():
         shutil.copytree(source, wp_content(origin, name) / 'plugins' / 'wps-hide-login', dirs_exist_ok=True)
+
+
+def remove(name: str, detach_sites: bool = False, keep_files: bool = False) -> dict:
+    """Unregister a stack: stop it (managed stacks: compose down, data stays on
+    disk), drop it from the inventory and the registry, and move a managed
+    stack's directory to stacks/_removed/<name>-<time>. Nothing is deleted.
+    DNS records and tunnel ingress rules for its hostnames are not touched."""
+    import time
+    from .config import save_inventory
+    from . import siteguard
+    with state.locked('provision'):
+        inv, cfg = load_inventory(), node_config()
+        node = cfg['node']
+        origin = inv.origin(node)
+        if name not in origin.stacks:
+            raise ConfigError(f'unknown stack {name}')
+        st = origin.stacks[name]
+        ovs = state.overrides()
+        busy = sorted(d for d, o in ovs.items() if o.get('status') == 'active' and o.get('stack') == name)
+        if busy:
+            raise ConfigError(f'stack {name} serves active failover overrides ({", ".join(busy)}); roll them back first')
+        mapped = [s.slug for s in inv.sites if (s.host_on(node) or {}).get('stack') == name]
+        if mapped and not detach_sites:
+            raise ConfigError(f'sites mapped to stack {name}: {", ".join(mapped)} '
+                              '(remove them with wpops site remove, or pass --detach-sites)')
+        refs = [n for n, src in inv.backup_sources.items() if src.origin == node and src.stack == name]
+        if refs:
+            raise ConfigError(f'backup sources use stack {name}: {", ".join(refs)}; edit backup_sources first')
+        raw = json.loads(json.dumps(inv.raw))
+        for s in raw.get('sites', []):
+            if (s.get('hosts') or {}).get(node, {}).get('stack') == name:
+                s['hosts'].pop(node)
+        raw['sites'] = [s for s in raw.get('sites', []) if s.get('hosts')]
+        raw['origins'][node]['stacks'].pop(name)
+        path = Path(st['path'])
+        stopped = None
+        if st.get('managed') and path.exists():
+            r = compose(origin, name, 'down', check=False, timeout=600)
+            stopped = r.returncode == 0
+            if not stopped:
+                raise StackError(f'compose down failed for {name}: {(r.stderr or r.stdout or "").strip()[-300:]}')
+        save_inventory(raw, INVENTORY_FILE)
+        archived = None
+        if st.get('managed') and path.exists() and not keep_files and path.parent == REPO_DIR / 'stacks':
+            dest = REPO_DIR / 'stacks' / '_removed' / f'{name}-{time.strftime("%Y%m%d-%H%M%S")}'
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            path.rename(dest)
+            archived = str(dest)
+        siteguard.save_key(name, None)
+        state.audit('local', 'stack.remove', {'stack': name, 'detached': mapped, 'archived': archived})
+    from . import registry
+    r = registry.refresh()
+    return {'stack': name, 'stopped': stopped, 'detached_sites': mapped if detach_sites else [],
+            'archived_to': archived, 'revision': r['revision'],
+            'note': 'DNS records and tunnel ingress for its hostnames are unchanged'}

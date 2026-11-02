@@ -4,5 +4,6 @@
   "backup": {"schedule": "weekly:sun:03:30", "retain_sets": 4, "sources": [], "pull_timeout_min": 180, "entities": ["plugins", "themes", "uploads", "others"], "auto_apply": false},
   "restore": {"cleanup_imported": true},
   "notify": {"email_to": [], "email_from": "", "webhook_url": ""},
-  "failover": {"default_to": "", "tunnel_service": "http://nginx:80"}
+  "failover": {"default_to": "", "tunnel_service": "http://nginx:80"},
+  "registry": {"enabled": true, "facts_interval_min": 360, "health_timeout": 15, "siteguard_enroll": "auto", "stale_after_min": 30}
 }

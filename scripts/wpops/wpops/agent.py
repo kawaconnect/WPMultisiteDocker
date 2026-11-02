@@ -22,7 +22,7 @@ from collections import defaultdict, deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Callable
 
-from . import __version__, backup as bk, failover, jobs, notify, restore, state, disk
+from . import __version__, backup as bk, failover, jobs, notify, registry, restore, siteguard, state, disk
 from .config import _HOST_RE, ConfigError, load_inventory, node_config, public_inventory
 from .ops import node_status
 
@@ -181,7 +181,19 @@ class Agent:
                     raise ApiError(400, "bad job id")
                 return {"log": jobs.tail(p[1], max(1, min(_int_arg(q1, "lines", 80), 2000)))}
             if p == ["events"]:
-                return {"events": notify.recent_events(_int_arg(q1, "since", 0), _int_arg(q1, "limit", 100))}
+                after = _int_arg(q1, "after", -1) if "after" in q1 else None
+                return {"events": notify.recent_events(_int_arg(q1, "since", 0), _int_arg(q1, "limit", 100), after)}
+            if p == ["registry"]:
+                return registry.snapshot(live=q1.get("live") == "1")
+            if p == ["registry", "changes"]:
+                return registry.changes(_int_arg(q1, "since", 0), max(1, min(_int_arg(q1, "limit", 500), 2000)))
+            if len(p) == 3 and p[:2] == ["registry", "sites"]:
+                found = registry.site(urllib.parse.unquote(p[2]))
+                if not found:
+                    raise ApiError(404, "no such site")
+                return found
+            if p == ["siteguard", "health"]:
+                return registry.siteguard_payload(self.cfg["agent"].get("public_url") or "")
             raise ApiError(404, "not found")
         if method == "POST":
             if p == ["failover", "plan"]:
@@ -274,6 +286,48 @@ class Agent:
                     j, self.inv, self.node(), set_ref, stack, sites=sel["sites"], all_sites=sel["all"],
                     entities=entities))
                 return {"job": job.id}
+            if p == ["registry", "refresh"]:
+                stacks = _str_list(body.get("stacks"), "stacks")
+                if stacks:
+                    unknown = [x for x in stacks if x not in self.inv.origin(self.node()).stacks]
+                    if unknown:
+                        raise ApiError(400, f"unknown stacks: {', '.join(unknown)}")
+                if body.get("facts"):
+                    if jobs.active("registry.refresh"):
+                        raise ApiError(409, "a registry refresh is already running")
+                    job = jobs.Job("registry.refresh", {"stacks": stacks or "all"}, actor)
+                    jobs.start_background(job, lambda j: registry.refresh_facts(stacks, log=j.log))
+                    return {"job": job.id}
+                return {**registry.refresh_health(), "revision": registry.changes(0, 1)["revision"]}
+            if p == ["registry", "sites", "add"]:
+                slug, stack = body.get("slug"), body.get("stack")
+                if not isinstance(slug, str) or not isinstance(stack, str) or not slug or not stack:
+                    raise ApiError(400, "slug and stack are required")
+                blog_id = body.get("blog_id")
+                if blog_id is not None and (not isinstance(blog_id, int) or isinstance(blog_id, bool) or blog_id < 1):
+                    raise ApiError(400, "blog_id must be a positive integer")
+                fields = {k: body.get(k) or "" for k in ("host", "cf_account", "primary", "name", "failover_to")}
+                if not all(isinstance(v, str) for v in fields.values()):
+                    raise ApiError(400, "host, cf_account, primary, name and failover_to must be strings")
+                return registry.site_add(slug, stack, domains=_str_list(body.get("domains"), "domains"),
+                                         blog_id=blog_id, **fields)
+            if p == ["registry", "sites", "remove"]:
+                slug = body.get("slug")
+                if not isinstance(slug, str) or not slug:
+                    raise ApiError(400, "slug is required")
+                return registry.site_remove(slug, everywhere=bool(body.get("everywhere")))
+            if p == ["siteguard", "enroll"]:
+                stack = body.get("stack")
+                origin = self.inv.origin(self.node())
+                if not isinstance(stack, str) or stack not in origin.stacks:
+                    raise ApiError(400, "unknown stack")
+                facts = registry.collect_facts(origin, stack)
+                if "error" in facts:
+                    raise ApiError(409, f"WordPress in stack {stack} does not answer: {facts['error']}")
+                host = registry._stack_host(origin, stack, facts)
+                result = siteguard.enroll(origin, stack, facts.get("siteguard"), host, replace=bool(body.get("replace")))
+                state.audit(actor, "siteguard.enroll", {"stack": stack, "result": {k: v for k, v in result.items() if k != "key"}})
+                return result
             if p == ["notify", "test"]:
                 return notify.notify("test", "[wpops] test notification", "This is a test from the wpops agent.", {})
             raise ApiError(404, "not found")
@@ -316,6 +370,30 @@ class Agent:
                     last_housekeeping = time.time()
             except Exception as exc:  # noqa: BLE001
                 notify.record_event("scheduler.error", {"error": str(exc)})
+
+    def registry_loop(self) -> None:
+        """Site health every minute; facts (versions, blogs, disk) and SiteGuard
+        keys when due, in a thread of their own (WP-CLI and disk walks are slow)."""
+        facts_thread: threading.Thread | None = None
+        last_error = ""
+        while True:
+            try:
+                cfg = node_config()
+                if (cfg.get("registry") or {}).get("enabled", True):
+                    registry.refresh_health()
+                    due = sorted(set(registry.facts_due(cfg)) | set(registry.enrolment_due(cfg)))
+                    if due and not (facts_thread and facts_thread.is_alive()):
+                        facts_thread = threading.Thread(target=registry.refresh_facts, args=(due,),
+                                                        name="registry-facts", daemon=True)
+                        facts_thread.start()
+                last_error = ""
+            except Exception as exc:  # noqa: BLE001
+                # Once per distinct error, not every minute while it lasts.
+                if str(exc) != last_error:
+                    last_error = str(exc)
+                    notify.record_event("scheduler.error", {"error": f"registry: {exc}"})
+            if self._stop.wait(60):
+                return
 
     def stop(self) -> None:
         self._stop.set()
@@ -444,6 +522,7 @@ def serve(extra_binds: list[str] | None = None) -> None:
         threading.Thread(target=srv.serve_forever, name=f"http-{b}", daemon=True).start()
         print(f"wpops agent {__version__} listening on {b}:{port}", flush=True)
     threading.Thread(target=agent.scheduler, name="scheduler", daemon=True).start()
+    threading.Thread(target=agent.registry_loop, name="registry", daemon=True).start()
     state.audit("local", "agent.start", {"binds": binds, "port": port})
     try:
         while True:

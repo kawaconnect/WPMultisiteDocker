@@ -325,6 +325,33 @@ This restores the normal WordPress login. Re-enable the policy after correcting
 the configured slug. This feature is not an authentication replacement; normal
 WordPress user permissions continue to apply.
 
+## 7. Site registry and monitoring
+
+Every stack and every blog of a multisite stack is tracked by the agent
+(design: [wpops-design.md](wpops-design.md), section 2.6). Nothing needs to be
+registered by hand: `stack create/init` and new blogs are picked up, and the
+bot follows through the agent API with the node's one token.
+
+```bash
+wpops registry                         # every site: health, source, URL
+wpops registry show shop               # one site: versions, plugins, backups, disk, tunnel
+wpops registry refresh --facts         # collect versions/blogs/disk and SiteGuard keys now
+wpops registry changes --since 0       # change feed
+wpops siteguard status                 # which stacks the agent reads SiteGuard on
+wpops siteguard enroll shop            # enrol now (SiteGuard 1.6.4+: node key; site key untouched)
+wpops site add shop --stack shop --cf-account customer --domains shop.example.com,www.shop.example.com
+wpops site add news --stack network --blog-id 2 --cf-account customer --domains news.example.com
+wpops site remove news --yes           # unmap from this node (refused during a failover)
+wpops stack remove tmp --yes           # compose down, unregister, move to stacks/_removed/
+```
+
+Health comes from the stack's own SiteGuard when the agent has a key there,
+otherwise from a direct request through the stack's loopback port. Install
+SiteGuard Backup 1.6.4 or later in each stack for SSL data and SiteGuard's own
+checks. `config/wpops.json` `registry`: `enabled`, `facts_interval_min` (360),
+`health_timeout` (15), `siteguard_enroll` (`auto` or `off`),
+`stale_after_min` (30).
+
 ## Validation
 
 ```bash
@@ -335,8 +362,11 @@ wpops stack compose shop exec -T nginx nginx -t
 ```
 
 The offline suite covers all deployment combinations, Compose isolation,
-source profiles, destination mapping, login policy, connector generation and
-mocked Cloudflare failover/rollback.
+source profiles, destination mapping, login policy, connector generation,
+mocked Cloudflare failover/rollback, and the site registry
+(`tests/test_registry.py`: membership and change feed, SiteGuard and direct
+health against local stand-ins for each stack, key enrolment, site and stack
+add/remove, the API, and `wpops serve` run as a process with a fake `docker`).
 
 `tests/e2e/e2e.py` is an opt-in end-to-end run on a real Docker daemon (not run
 in CI). It builds a fresh node in a new directory and drives it through the

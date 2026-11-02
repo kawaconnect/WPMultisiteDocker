@@ -239,13 +239,23 @@ def cmd_tunnels(args: argparse.Namespace) -> int:
 
 
 def cmd_stack(args: argparse.Namespace) -> int:
-    from . import provision
+    from . import provision, registry
     from .stacks import compose
     if args.action == 'create':
         result = provision.create(args.name, args.mode, args.domain, args.port,
                                   args.login_path or '', not args.subdirectories, args.noindex)
+        result['registry_revision'] = registry.refresh()['revision']
     elif args.action == 'init':
         result = provision.initialise(args.name, args.admin_email, args.admin_user, args.scheme)
+        # Versions, blogs and the SiteGuard key for the registry (best effort).
+        try:
+            result['registry'] = registry.refresh_facts([args.name]).get(args.name)
+        except Exception as exc:  # noqa: BLE001
+            result['registry'] = {'error': str(exc)}
+    elif args.action == 'remove':
+        if not args.yes:
+            raise ConfigError('stack remove stops the stack and unregisters it; add --yes')
+        result = provision.remove(args.name, detach_sites=args.detach_sites, keep_files=args.keep_files)
     elif args.action == 'login':
         result = provision.set_login(args.name, args.path, args.blog_id)
     else:
@@ -267,6 +277,92 @@ def cmd_stack(args: argparse.Namespace) -> int:
             result = {'stack': args.name, 'output': r.stdout.strip()}
     _out(args, result)
     return 0
+
+
+def _health_flag(h: dict[str, Any]) -> str:
+    return {"operational": "up", "degraded": "DEGRADED", "down": "DOWN"}.get(h.get("status") or "", "?")
+
+
+def cmd_registry(args: argparse.Namespace) -> int:
+    from . import registry
+    if args.action == "changes":
+        data = registry.changes(args.since, args.limit)
+        _out(args, data, "\n".join(f"rev {c['rev']:<5} {c['op']:<8} {c['uid']:<40} {c['site'].get('url')}"
+                                   for c in data["changes"]) or f"no changes after revision {args.since} (now {data['revision']})")
+        return 0
+    if args.action == "refresh":
+        stacks = [x.strip() for x in (args.stacks or "").split(",") if x.strip()] or None
+        result: dict[str, Any] = {}
+        if args.facts:
+            result["facts"] = registry.refresh_facts(stacks, log=lambda m: print(m, file=sys.stderr))
+        result["health"] = registry.refresh_health()
+        _out(args, result, json.dumps(result, indent=2, default=str))
+        return 0
+    if args.action == "show":
+        if not args.id:
+            raise ConfigError("registry show needs a site uid, <stack>:<blog id> or slug")
+        site = registry.site(args.id)
+        if not site:
+            print("no such site", file=sys.stderr)
+            return 1
+        _out(args, site, json.dumps(site, indent=2, default=str))
+        return 0
+    snap = registry.snapshot(live=args.live)
+    lines = [f"node {snap['node']}  revision {snap['revision']}  {len(snap['sites'])} sites"]
+    for st in snap["stacks"]:
+        v = st["versions"]
+        lines.append(f"  stack {st['name']} ({st['mode']}{', managed' if st['managed'] else ''}): WordPress {v.get('wordpress') or '?'}, "
+                     f"PHP {v.get('php') or '?'}, SiteGuard {v.get('siteguard') or '-'} [{st['siteguard']['status'] or 'no data'}]"
+                     + (f"  facts error: {st['facts_error']}" if st["facts_error"] else ""))
+    for s in snap["sites"]:
+        h = s["health"]
+        lines.append(f"  {s['uid']:<36} {_health_flag(h):<8} {s['slug'] or '(unmapped)':<20} {s['url']}  [{h.get('source')}]"
+                     + (f" {h.get('error')}" if h.get("error") else ""))
+    _out(args, snap, "\n".join(lines))
+    return 0
+
+
+def cmd_site(args: argparse.Namespace) -> int:
+    from . import registry
+    if args.action == "add":
+        domains = [d.strip().lower() for d in (args.domains or "").split(",") if d.strip()] or None
+        result = registry.site_add(args.slug, args.stack, host=args.host or "", domains=domains, blog_id=args.blog_id,
+                                   cf_account=args.cf_account or "", primary=args.primary or "", name=args.name or "",
+                                   failover_to=args.failover_to or "")
+    else:
+        if not args.yes:
+            raise ConfigError("site remove changes the inventory; add --yes")
+        result = registry.site_remove(args.slug, everywhere=args.everywhere)
+    _out(args, result)
+    return 0
+
+
+def cmd_siteguard(args: argparse.Namespace) -> int:
+    from . import registry, siteguard
+    inv, cfg = load_inventory(), node_config()
+    origin = inv.origin(cfg["node"])
+    if args.action == "status":
+        keys = siteguard.load_keys()
+        snap = {s["name"]: s["siteguard"] for s in registry.snapshot()["stacks"]}
+        rows = [{"stack": n, "key": (keys.get(n) or {}).get("fp"), "kind": (keys.get(n) or {}).get("kind"),
+                 **{k: v for k, v in (snap.get(n) or {}).items() if k not in ("key", "key_kind")}} for n in origin.stacks]
+        _out(args, rows, "\n".join(f"{r['stack']:<24} key={r['key'] or '-':<18} {r['kind'] or '':<5} {r['status'] or 'no data'} {r['error']}"
+                                   for r in rows))
+        return 0
+    names = [args.stack] if args.stack else list(origin.stacks)
+    results = {}
+    for name in names:
+        if name not in origin.stacks:
+            raise ConfigError(f"unknown stack '{name}'")
+        facts = registry.collect_facts(origin, name)
+        if "error" in facts:
+            results[name] = {"enrolled": False, "reason": facts["error"]}
+            continue
+        results[name] = siteguard.enroll(origin, name, facts.get("siteguard"), registry._stack_host(origin, name, facts),
+                                         replace=args.replace, log=lambda m: print(m, file=sys.stderr))
+    _out(args, results, "\n".join(f"{n}: {'enrolled (' + r['kind'] + ' key ' + r['fp'] + ')' if r.get('enrolled') else 'not enrolled: ' + r.get('reason', '')}"
+                                  for n, r in results.items()))
+    return 0 if all(r.get("enrolled") for r in results.values()) else 1
 
 
 def cmd_routes(args: argparse.Namespace) -> int:
@@ -337,6 +433,11 @@ def build_parser() -> argparse.ArgumentParser:
     s = actions.add_parser('login', help='configure the default or a multisite blog login slug')
     s.add_argument('name'); s.add_argument('--path', required=True); s.add_argument('--blog-id', type=int)
     s.set_defaults(fn=cmd_stack)
+    s = actions.add_parser('remove', help='stop and unregister a stack (data is kept; DNS is not touched)')
+    s.add_argument('name'); s.add_argument('--yes', action='store_true')
+    s.add_argument('--detach-sites', action='store_true', help="also unmap sites that use it on this node")
+    s.add_argument('--keep-files', action='store_true', help='leave stacks/<name> in place (default: move to stacks/_removed/)')
+    s.set_defaults(fn=cmd_stack)
     for action in ('up', 'stop', 'list', 'compose'):
         s = actions.add_parser(action)
         if action != 'list':
@@ -350,6 +451,34 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument('action', choices=['plan', 'apply']); s.add_argument('--yes', action='store_true')
     s.set_defaults(fn=cmd_routes)
     s = sub.add_parser("sites", help="inventory"); s.add_argument("--live", action="store_true"); s.set_defaults(fn=cmd_sites)
+
+    s = sub.add_parser("registry", help="every WordPress site on this node: health, versions, backups, disk, tunnel")
+    s.add_argument("action", nargs="?", default="list", choices=["list", "show", "changes", "refresh"])
+    s.add_argument("id", nargs="?", help="show: site uid, <stack>:<blog id> or slug")
+    s.add_argument("--live", action="store_true", help="list: also query Cloudflare DNS")
+    s.add_argument("--since", type=int, default=0, help="changes: after this revision")
+    s.add_argument("--limit", type=int, default=500)
+    s.add_argument("--facts", action="store_true", help="refresh: also versions, blogs, disk and SiteGuard keys (WP-CLI)")
+    s.add_argument("--stacks", help="refresh: comma-separated stacks (default all)")
+    s.set_defaults(fn=cmd_registry)
+
+    s = sub.add_parser("site", help="map or unmap a site of this node in the inventory")
+    acts = s.add_subparsers(dest="action", required=True)
+    a = acts.add_parser("add", help="map a site (new, or this node's host of an existing site)")
+    a.add_argument("slug"); a.add_argument("--stack", required=True); a.add_argument("--blog-id", type=int)
+    a.add_argument("--host", help="installed hostname (default: from the stack)")
+    a.add_argument("--domains", help="comma-separated production domains (default: the host)")
+    a.add_argument("--cf-account", help="Cloudflare account of the site's zones (required for a new site)")
+    a.add_argument("--primary", help="primary origin (default: this node)"); a.add_argument("--name")
+    a.add_argument("--failover-to"); a.set_defaults(fn=cmd_site)
+    a = acts.add_parser("remove", help="unmap a site from this node")
+    a.add_argument("slug"); a.add_argument("--everywhere", action="store_true", help="drop the site from the inventory")
+    a.add_argument("--yes", action="store_true"); a.set_defaults(fn=cmd_site)
+
+    s = sub.add_parser("siteguard", help="SiteGuard health keys held by the agent, one per stack")
+    s.add_argument("action", choices=["status", "enroll"]); s.add_argument("stack", nargs="?")
+    s.add_argument("--replace", action="store_true", help="SiteGuard before 1.6.4: replace the site's own key")
+    s.set_defaults(fn=cmd_siteguard)
 
     s = sub.add_parser("failover", help="plan/apply/rollback DNS failover")
     s.add_argument("action", choices=["plan", "apply", "rollback"])
