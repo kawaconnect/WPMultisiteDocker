@@ -568,8 +568,9 @@ class AgentProcessTests(unittest.TestCase):
                 time.sleep(0.5)
             self.fail(f'{what}: {json.dumps(last)[:1500]}')
         # The registry loop collects facts and enrols SiteGuard on its own.
-        reg = wait_for(lambda r: any(s['name'] == 'shop' and s['siteguard']['key'] for s in r['stacks']),
-                       'shop gets a SiteGuard node key')
+        # Facts are collected one stack after the other: wait for both.
+        reg = wait_for(lambda r: any(s['name'] == 'shop' and s['siteguard']['key'] for s in r['stacks'])
+                       and len(r['sites']) == 3, 'shop gets a SiteGuard node key and every blog is listed')
         self.assertEqual(sorted(s['uid'] for s in reg['sites']), ['node-a:net:1', 'node-a:net:2', 'node-a:shop:1'])
         call('/v1/registry/refresh', {})
         reg = call('/v1/registry')

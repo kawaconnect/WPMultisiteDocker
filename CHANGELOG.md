@@ -2,6 +2,11 @@
 
 Versions are git tags (`vX.Y.Z`). This repo has no build; tags mark reviewed states of the stack and scripts.
 
+## [0.0.8] - 2026-11-02
+
+### Fixed
+- `tests/test_registry.py`: the agent process test waited for the first stack's facts only and failed in CI when the second stack's blogs were not listed yet. No change to wpops itself; 0.0.7 had the same code.
+
 ## [0.0.7] - 2026-11-02
 
 Every WordPress deployment on a node, single site or multisite, is now tracked one site at a time, so monitoring no longer depends on one key for one multisite.
