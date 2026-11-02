@@ -2,6 +2,10 @@
 
 Versions are git tags (`vX.Y.Z`). This repo has no build; tags mark reviewed states of the stack and scripts.
 
+## [0.0.6] - 2026-11-02
+
+### Added
+
 ## [0.0.5] - 2026-10-29
 
 Every topology (two single sites, one multisite network, a subdomain plus a subdirectory network, and a node mixing all of them with the legacy root stack) was run for real on Docker, with a stand-in for the Cloudflare API and edge. These are the problems that run found.
