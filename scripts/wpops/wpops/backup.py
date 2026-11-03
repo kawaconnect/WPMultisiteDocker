@@ -460,14 +460,9 @@ def _pull_locked(job: Job, inv: Inventory, source: str, label: str, fresh: bool,
         removed = prune(source, log=log)
         result = {"set": f"{source}/{set_id}", "files": len(files), "bytes": total, "sites": len(man["sites"]),
                   "pruned": removed, "label": man["label"]}
-        notify.notify(
-            "backup.pulled",
-            f"[wpops] backup pulled from {source}: {set_id}",
-            f"Backup set {source}/{set_id} ({total // 2**20} MB, {len(files)} files, {len(man['sites'])} sites)\n"
-            f"was downloaded to this node and is ready to apply with: wpops restore apply --set {source}/{set_id}\n"
-            f"Pruned: {', '.join(removed) or 'nothing'}\n",
-            result,
-        )
+        # Recorded for the event log only: no e-mail or webhook per pull. A
+        # scheduled run is summarised once by the scheduler, on failure only.
+        notify.record_event("backup.pulled", {"subject": f"[wpops] backup pulled from {source}: {set_id}", **result})
         return result
 
 

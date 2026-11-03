@@ -356,15 +356,27 @@ class Agent:
                 self.reload()
                 disk.watch_tick(self.inv, self.node())
                 if bk.due() and not jobs.active("backup.pull"):
+                    # Mark the slot first: a restart in the middle of a run must not
+                    # start the whole run again.
+                    bk.mark_run({"note": "run started"})
                     results = {}
-                    for src in bk.sources_to_pull(self.inv):
+                    sources = bk.sources_to_pull(self.inv)
+                    for src in sources:
+                        if bk.parse_schedule(node_config()["backup"].get("schedule", "off"))["kind"] == "off":
+                            results["_stopped"] = {"status": "stopped", "error": "schedule turned off during the run"}
+                            break
                         job = jobs.Job("backup.pull", {"source": src, "label": "scheduled", "scheduled": True}, "scheduler")
                         job.run(lambda j, s=src: bk.pull(j, self.inv, s, "scheduled " + time.strftime("%Y-%m-%d")))
-                        results[src] = {"status": job.status, "error": job.error, "result": job.result}
-                        if job.status != "succeeded":
-                            notify.notify("backup.failed", f"[wpops] scheduled backup from {src} FAILED",
-                                          f"Job {job.id}: {job.error}\n\n{jobs.tail(job.id, 40)}", {"source": src, "job": job.id})
+                        results[src] = {"status": job.status, "error": job.error, "job": job.id}
                     bk.mark_run(results)
+                    failed = [{"source": s, "error": (r.get("error") or "")[:300], "job": r.get("job")}
+                              for s, r in results.items() if not s.startswith("_") and r["status"] != "succeeded"]
+                    if failed:
+                        # One summary per run, only when something failed.
+                        body = "\n".join(f"{f['source']}: {f['error']} (job {f['job']})" for f in failed)
+                        notify.notify("backup.run_failed",
+                                      f"[wpops] nightly backup: {len(failed)} of {len(sources)} source(s) failed",
+                                      body, {"failed": failed, "total": len(sources)})
                 if time.time() - last_housekeeping > 86400:
                     jobs.prune_jobs()
                     last_housekeeping = time.time()

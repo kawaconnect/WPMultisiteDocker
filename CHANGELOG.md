@@ -2,6 +2,12 @@
 
 Versions are git tags (`vX.Y.Z`). This repo has no build; tags mark reviewed states of the stack and scripts.
 
+## [0.0.12] - 2026-11-03
+
+### Changed
+- Backup notifications are aggregated (wpops 0.2.4). A pull no longer e-mails or posts to the webhook; it is only recorded in the event log (`backup.pulled`). A scheduled run sends one summary, `backup.run_failed`, and only when at least one source failed. It lists every failed source and its job.
+- The scheduler marks its slot when a run starts, so restarting the agent during a run does not start the run again. Turning the schedule off during a run stops it before the next source.
+
 ## [0.0.11] - 2026-11-03
 
 ### Added
