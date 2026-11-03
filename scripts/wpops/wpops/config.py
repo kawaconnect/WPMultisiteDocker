@@ -184,9 +184,25 @@ class Origin:
     targets: list[dict[str, str]] = field(default_factory=list)   # external: DNS records that mean "here"
     sync_api: str = ""                          # SiteGuard sync API base URL (https://site)
     agent: str = ""                             # node: agent URL for the bot
-    standby_domain: str = ""                    # node
+    standby_domain: str = ""                    # node: zone that carries its staging names
+    staging_suffix: str = ""                    # node: label suffix of its staging names (default: node name)
     stacks: dict[str, dict[str, Any]] = field(default_factory=dict)   # node: name -> {path, mode, service}
     tunnels: dict[str, str] = field(default_factory=dict)             # node: cf account name -> tunnel id
+
+    def suffix(self) -> str:
+        return (self.staging_suffix or self.name).lower()
+
+    def default_host(self, domain: str) -> str:
+        """Default staging name of a site whose production domain is `domain`:
+        domain without "www.", dots removed, "-<suffix>", in the standby zone.
+        example-store.com on a node with suffix "node1" and standby domain
+        standby.example.net -> examplestorecom-node1.standby.example.net."""
+        if not self.standby_domain or not domain:
+            return ""
+        d = domain.lower().rstrip(".")
+        if d.startswith("www."):
+            d = d[4:]
+        return f"{d.replace('.', '')}-{self.suffix()}.{self.standby_domain.lower().rstrip('.')}"
 
     def tunnel_target(self, account: str) -> str | None:
         tid = self.tunnels.get(account)
@@ -212,7 +228,7 @@ class Site:
     primary: str
     cf_account: str
     domains: list[str]
-    hosts: dict[str, dict[str, Any]]            # origin -> {host, stack?, blog_id?, site_host?}
+    hosts: dict[str, dict[str, Any]]            # origin -> {host, stack?, blog_id?, site_host?, host_default?}
     failover_to: str = ""                       # preferred node for this site (optional)
     enabled: bool = True
 
@@ -293,6 +309,10 @@ def _validate_inventory(inv: Inventory) -> None:
                 raise ConfigError(f"origin '{o.name}': invalid stack name or mode: {name}")
             if not st.get("path") or not Path(st["path"]).is_absolute():
                 raise ConfigError(f"stack '{name}': path must be absolute")
+        if o.staging_suffix and not _SLUG_RE.fullmatch(o.staging_suffix.lower()):
+            raise ConfigError(f"origin '{o.name}': staging_suffix must be a lower-case slug")
+        if o.standby_domain and not _HOST_RE.fullmatch(o.standby_domain.lower()):
+            raise ConfigError(f"origin '{o.name}': invalid standby_domain '{o.standby_domain}'")
     for name, src in inv.backup_sources.items():
         if not _SLUG_RE.fullmatch(name) or name in inv.origins:
             raise ConfigError(f"backup source '{name}': use a unique slug distinct from origins")
@@ -302,6 +322,7 @@ def _validate_inventory(inv: Inventory) -> None:
         if not src.sync_api:
             raise ConfigError(f"backup source '{name}': sync_api is required")
     seen: set[str] = set()
+    published: dict[tuple[str, str], str] = {}
     for s in inv.sites:
         if not _SLUG_RE.match(s.slug):
             raise ConfigError(f"site slug '{s.slug}' is invalid")
@@ -338,11 +359,41 @@ def _validate_inventory(inv: Inventory) -> None:
                 elif isinstance(h.get("blog_id"), bool) or not isinstance(h.get("blog_id"), int) or h['blog_id'] < 1:
                     raise ConfigError(f"site '{s.slug}': blog_id must be a positive integer")
             if not h.get("host"):
-                raise ConfigError(f"site '{s.slug}': hosts.{oname}.host is required")
+                raise ConfigError(f"site '{s.slug}': hosts.{oname}.host is required (node '{oname}' has no "
+                                  "standby_domain to derive the default staging name from, or the site has no domains)")
+            label = h['host'].lower().split(".")[0]
+            if len(label) > 63:
+                what = "default staging name" if h.get("host_default") else "host"
+                raise ConfigError(f"site '{s.slug}': {what} label '{label}' is longer than 63 characters; "
+                                  f"set hosts.{oname}.host explicitly")
             if not _HOST_RE.fullmatch(h['host'].lower()):
                 raise ConfigError(f"site '{s.slug}': invalid host '{h['host']}'")
+            if o.kind == "node":
+                pkey = (oname, h['host'].lower())
+                if pkey in published:
+                    raise ConfigError(f"site '{s.slug}': host '{h['host']}' on '{oname}' collides with site "
+                                      f"'{published[pkey]}'; set hosts.{oname}.host explicitly on one of them")
+                published[pkey] = s.slug
             if h.get("site_host") is not None and not _HOST_RE.fullmatch(str(h['site_host']).lower()):
                 raise ConfigError(f"site '{s.slug}': invalid site_host '{h['site_host']}'")
+
+
+def _with_default_hosts(origins: dict[str, Origin], s: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    """Host entries of a site, with the default staging name filled in on nodes
+    where the inventory gives none. The raw inventory is not changed, so an
+    explicit `host` stays an override and a missing one follows the rule."""
+    domains = [d.lower().rstrip(".") for d in s.get("domains", [])]
+    out: dict[str, dict[str, Any]] = {}
+    for oname, h in (s.get("hosts") or {}).items():
+        h = dict(h) if isinstance(h, dict) else {}
+        o = origins.get(oname)
+        if not h.get("host") and o is not None and o.kind == "node" and domains:
+            default = o.default_host(domains[0])
+            if default:
+                h["host"] = default
+                h["host_default"] = True
+        out[oname] = h
+    return out
 
 
 def load_inventory(path: Path = INVENTORY_FILE) -> Inventory:
@@ -358,6 +409,7 @@ def load_inventory(path: Path = INVENTORY_FILE) -> Inventory:
             sync_api=_checked_sync_api(name, o.get("sync_api", "")),
             agent=o.get("agent", "").rstrip("/"),
             standby_domain=o.get("standby_domain", ""),
+            staging_suffix=o.get("staging_suffix", ""),
             stacks=o.get("stacks", {}),
             tunnels=o.get("tunnels", {}),
         )
@@ -368,7 +420,7 @@ def load_inventory(path: Path = INVENTORY_FILE) -> Inventory:
             primary=s["primary"],
             cf_account=s["cf_account"],
             domains=[d.lower().rstrip(".") for d in s.get("domains", [])],
-            hosts=s.get("hosts", {}),
+            hosts=_with_default_hosts(origins, s),
             failover_to=s.get("failover_to", ""),
             enabled=s.get("enabled", True),
         )
@@ -402,7 +454,8 @@ def public_inventory(inv: Inventory) -> dict[str, Any]:
         "origins": {
             n: {
                 "kind": o.kind, "targets": o.targets, "sync_api": bool(o.sync_api), "agent": o.agent,
-                "standby_domain": o.standby_domain, "stacks": o.stacks, "tunnels": o.tunnels,
+                "standby_domain": o.standby_domain, "staging_suffix": o.suffix() if o.kind == "node" else "",
+                "stacks": o.stacks, "tunnels": o.tunnels,
             } for n, o in inv.origins.items()
         },
         "backup_sources": {n: {"origin": src.origin, "stack": src.stack, "sync_api": bool(src.sync_api)}

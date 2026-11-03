@@ -338,10 +338,61 @@ class DeploymentTests(unittest.TestCase):
         with patch.object(routes,'Cloudflare',return_value=cf):
             p=routes.plan(inv,'backup',accounts)
         names={r['domain'] for r in p['routes']}
-        self.assertIn('one-backup.standby.example',names)
-        self.assertFalse(names & {'one.example','www.one.example','plain.standby.example'})
+        self.assertTrue({'one-backup.standby.example','plain.standby.example'} <= names)
+        self.assertFalse(names & {'one.example','www.one.example'})
         self.raw['sites'][0]['hosts']['backup']['site_host']='not a host'
         with self.assertRaisesRegex(config.ConfigError,'invalid site_host'): self.inventory()
+
+    def test_default_staging_names_override_length_and_collisions(self):
+        self.add_stack('one');self.add_stack('two');self.add_stack('net','multisite')
+        self.add_site('one','one');self.add_site('two','two');self.add_site('news','net',2)
+        for site in self.raw['sites']:
+            site['hosts']['backup'].pop('host')
+        self.raw['sites'][0]['domains']=['www.Shop.Example.com','shop.example.com']
+        self.raw['origins']['backup'].update(standby_domain='standby.example', staging_suffix='b1')
+        inv=self.inventory()
+        self.assertEqual(inv.site('one').host_on('backup')['host'],'shopexamplecom-b1.standby.example')
+        self.assertTrue(inv.site('one').host_on('backup')['host_default'])
+        self.assertEqual(inv.site('two').host_on('backup')['host'],'twoexample-b1.standby.example')
+        self.assertEqual(inv.site('news').host_on('backup')['host'],'newsexample-b1.standby.example')
+        self.assertNotIn('host',self.raw['sites'][0]['hosts']['backup'])      # raw inventory untouched
+        # suffix defaults to the node name
+        del self.raw['origins']['backup']['staging_suffix']
+        self.assertEqual(self.inventory().site('two').host_on('backup')['host'],'twoexample-backup.standby.example')
+        # explicit host wins
+        self.raw['sites'][1]['hosts']['backup']['host']='custom.standby.example'
+        inv=self.inventory()
+        self.assertEqual(inv.site('two').host_on('backup')['host'],'custom.standby.example')
+        self.assertNotIn('host_default',inv.site('two').host_on('backup'))
+        # collisions are refused with the fix in the message
+        self.raw['sites'][1]['hosts']['backup']['host']='newsexample-backup.standby.example'
+        with self.assertRaisesRegex(config.ConfigError,'collides with site'): self.inventory()
+        del self.raw['sites'][1]['hosts']['backup']['host']
+        # labels over 63 characters are refused for the default and for overrides
+        self.raw['sites'][1]['domains']=['a'*60+'.example']
+        with self.assertRaisesRegex(config.ConfigError,'default staging name label .* longer than 63'): self.inventory()
+        self.raw['sites'][1]['hosts']['backup']['host']='b'*64+'.standby.example'
+        with self.assertRaisesRegex(config.ConfigError,'host label .* longer than 63'): self.inventory()
+        self.raw['sites'][1]['hosts']['backup']['host']='two.standby.example'
+        # without a standby domain there is no default: host stays required
+        del self.raw['origins']['backup']['standby_domain']
+        with self.assertRaisesRegex(config.ConfigError,'host is required'): self.inventory()
+        self.raw['origins']['backup']['standby_domain']='standby.example'
+        with self.assertRaisesRegex(config.ConfigError,'staging_suffix'):
+            self.raw['origins']['backup']['staging_suffix']='Not Valid';self.inventory()
+        self.raw['origins']['backup']['staging_suffix']='b1'
+        # routes publish the default names; staging_only never includes production domains
+        self.raw['sites'][0]['primary']='backup'
+        inv=self.inventory()
+        from unittest.mock import MagicMock
+        cf=MagicMock();cf.zone_id.return_value='zone';cf.dns_records.return_value=[]
+        accounts={'customer':config.CfAccount(1,'customer','acct','secret'),
+                  'standby':config.CfAccount(2,'standby','acct2','secret2',True)}
+        with patch.object(routes,'Cloudflare',return_value=cf):
+            full={r['domain'] for r in routes.plan(inv,'backup',accounts)['routes']}
+            only={r['domain'] for r in routes.plan(inv,'backup',accounts,staging_only=True)['routes']}
+        self.assertEqual(only,{'shopexamplecom-b1.standby.example','two.standby.example','newsexample-b1.standby.example'})
+        self.assertEqual(full-only,{'www.shop.example.com','shop.example.com'})
 
     def test_legacy_stack_is_addressed_by_container_name_next_to_other_stacks(self):
         # Alone on a node, the legacy stack keeps its configured service.

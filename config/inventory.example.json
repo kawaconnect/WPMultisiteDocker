@@ -23,6 +23,7 @@
       "kind": "node",
       "agent": "https://ops.standby.example.net",
       "standby_domain": "standby.example.net",
+      "staging_suffix": "na",
       "stacks": {
         "main": {
           "path": "/opt/docker/wordpressmultisite",

@@ -321,6 +321,35 @@ class RegistryTests(unittest.TestCase):
 
     # ------------------------------------------------------------ inventory ops
 
+    def test_site_add_uses_the_default_staging_name(self):
+        raw = json.loads(self.inv_file.read_text())
+        raw['origins']['node-a'].update(standby_domain='standby.example.net', staging_suffix='na1')
+        self.inv_file.write_text(json.dumps(raw))
+        self.add_stack('shop', domain='shop.example.com')
+        self.add_stack('net', 'multisite')
+        self.set_facts('net', blogs=[{'blog_id': 2, 'domain': 'newsexamplecom-na1.standby.example.net', 'path': '/',
+                                      'url': 'https://newsexamplecom-na1.standby.example.net/', 'name': 'News'}])
+        registry.refresh()
+        unmapped = [m for m in registry.changes(0)['changes'] if m['uid'] == 'node-a:shop:1'][-1]['site']
+        self.assertEqual(unmapped['staging_host'], 'shopexamplecom-na1.standby.example.net')
+        r = registry.site_add('shop', 'shop', domains=['www.shop.example.com', 'shop.example.com'], cf_account='customer')
+        self.assertEqual(r['host']['host'], 'shopexamplecom-na1.standby.example.net')
+        # no host stored: the rule applies; the stack keeps its production siteurl
+        entry = json.loads(self.inv_file.read_text())['sites'][0]['hosts']['node-a']
+        self.assertEqual(entry, {'stack': 'shop', 'site_host': 'shop.example.com'})
+        inv = config.load_inventory(self.inv_file)
+        self.assertEqual(inv.site('shop').host_on('node-a')['host'], 'shopexamplecom-na1.standby.example.net')
+        self.assertEqual(inv.site('shop').site_host_on('node-a'), 'shop.example.com')
+        # a blog already installed under its default name needs neither host nor site_host
+        registry.site_add('news', 'net', blog_id=2, domains=['news.example.com'], cf_account='customer')
+        entry = json.loads(self.inv_file.read_text())['sites'][1]['hosts']['node-a']
+        self.assertEqual(entry, {'stack': 'net', 'blog_id': 2})
+        # an explicit host is an override and is kept
+        registry.site_add('news', 'net', blog_id=2, host='news-test.standby.example.net')
+        inv = config.load_inventory(self.inv_file)
+        self.assertEqual(inv.site('news').host_on('node-a')['host'], 'news-test.standby.example.net')
+        self.assertNotIn('host_default', inv.site('news').host_on('node-a'))
+
     def test_site_add_and_remove_update_inventory_and_registry(self):
         self.add_stack('shop')
         self.add_stack('net', 'multisite')

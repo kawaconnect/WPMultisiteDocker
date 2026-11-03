@@ -2,6 +2,18 @@
 
 Versions are git tags (`vX.Y.Z`). This repo has no build; tags mark reviewed states of the stack and scripts.
 
+## [0.0.11] - 2026-11-03
+
+### Added
+- Default staging hostnames (wpops 0.2.3). A site's name on a node is `<production domain without www., dots removed>-<staging_suffix>.<standby_domain>` unless its host entry sets `host`, which stays an override. `staging_suffix` is a new node origin setting (default: the node name). Example: example-store.com on a node with suffix `node1` and standby domain standby.example.net is `examplestorecom-node1.standby.example.net`.
+- The inventory is refused when a staging label is longer than 63 characters or two sites on one node share a hostname; the message says which host entry to override.
+- `wpops site add` stores no `host` when the default applies and records `site_host` from the stack; `wpops stack init` returns the stack's staging name; registry members carry `staging_host`.
+- `wpops tunnels ensure` publishes every staging name after starting the connectors (staging-only routes: standby-zone CNAME, tunnel ingress, host alias). It never touches production domains.
+- Docs: docs/deployments.md, "Staging hostnames". Tests for the rule, the override, label length, collisions and staging-only routes.
+
+### Changed
+- A host that is not one of the site's production domains counts as a staging name for routes, whether or not `site_host` is set.
+
 ## [0.0.10] - 2026-11-03
 
 ### Changed

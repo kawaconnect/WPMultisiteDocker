@@ -9,7 +9,7 @@ from .failover import write_aliases
 from . import state
 
 
-def plan(inv, node, accounts=None):
+def plan(inv, node, accounts=None, staging_only=False):
     accounts = accounts if accounts is not None else cf_accounts()
     origin = inv.origin(node)
     clients = {n: Cloudflare(a.token, a.account_id, a.name) for n, a in accounts.items()}
@@ -18,13 +18,13 @@ def plan(inv, node, accounts=None):
         host = site.host_on(node)
         if not host:
             continue
-        # A staging name (host differs from the siteurl host) never carries
-        # production traffic, so it is published even while the site is
+        # A staging name (not one of the site's production domains) never
+        # carries production traffic, so it is published even while the site is
         # disabled; `enabled: false` keeps gating production domains and failover.
-        staging = site.site_host_on(node) != host['host'].lower()
-        if not site.enabled and not staging:
+        staging = host['host'].lower() not in site.domains
+        if not staging and (staging_only or not site.enabled):
             continue
-        names = list(dict.fromkeys([host['host'], *(site.domains if site.enabled and site.primary == node else [])]))
+        names = list(dict.fromkeys([host['host'], *(site.domains if site.enabled and site.primary == node and not staging_only else [])]))
         for domain in names:
             if domain in seen:
                 continue
@@ -64,10 +64,10 @@ def plan(inv, node, accounts=None):
     return {'node': node, 'routes': rows, 'refused': refused}
 
 
-def apply(inv, node, accounts=None):
+def apply(inv, node, accounts=None, staging_only=False):
     accounts = accounts if accounts is not None else cf_accounts()
     with state.locked('failover'):
-        p = plan(inv, node, accounts)
+        p = plan(inv, node, accounts, staging_only=staging_only)
         if p['refused']:
             raise ConfigError('routing refused: ' + str(p['refused']))
         from .stacks import ps

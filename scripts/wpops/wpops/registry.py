@@ -34,8 +34,8 @@ from typing import Any
 from . import __version__, notify, siteguard as sg, state
 from .config import ConfigError, Inventory, Origin, load_env, load_inventory, node_config
 
-MEMBER_FIELDS = ("node", "stack", "mode", "blog_id", "slug", "name", "url", "host", "domains", "primary",
-                 "failover_to", "cf_account", "mapped", "managed")
+MEMBER_FIELDS = ("node", "stack", "mode", "blog_id", "slug", "name", "url", "host", "staging_host", "domains",
+                 "primary", "failover_to", "cf_account", "mapped", "managed")
 CHANGES_KEEP = 1000
 _facts_lock = threading.Lock()
 
@@ -287,6 +287,8 @@ def build_members(inv: Inventory, node: str, facts: dict[str, Any]) -> dict[str,
                 "slug": site.slug if site else None,
                 "name": (site.name if site and site.name != site.slug else "") or b["name"] or (site.slug if site else host),
                 "url": url, "host": host,
+                # mapped: the name routes publish; unmapped: what `site add` would give it
+                "staging_host": (h or {}).get("host") if site else origin.default_host(host),
                 "domains": list(site.domains) if site else [host],
                 "primary": site.primary if site else node,
                 "failover_to": site.failover_to if site else "",
@@ -680,18 +682,28 @@ def site_add(slug: str, stack: str, host: str = "", domains: list[str] | None = 
         if mode == "single" and blog_id not in (None, 1):
             raise ConfigError("a single-site stack has no blog id")
         facts = _read("registry-facts.json", {}).get(stack) or {}
-        if not host:
-            if mode == "single":
-                host = _stack_host(origin, stack, facts)
-            else:
-                b = next((b for b in facts.get("blogs") or [] if int(b["blog_id"]) == blog_id), None)
-                if not b:
-                    raise ConfigError(f"blog {blog_id} not known in stack {stack}; pass --host")
-                host = b["domain"]
-        host = host.lower()
+        # The stack's own hostname for this site (its siteurl host).
+        if mode == "single":
+            own = _stack_host(origin, stack, facts)
+        else:
+            b = next((b for b in facts.get("blogs") or [] if int(b["blog_id"]) == blog_id), None)
+            own = b["domain"] if b else ""
+            if not own and not host:
+                raise ConfigError(f"blog {blog_id} not known in stack {stack}; pass --host")
+        own = (own or "").lower()
         raw = json.loads(json.dumps(inv.raw))
-        entry = {"stack": stack, "host": host, **({"blog_id": blog_id} if mode == "multisite" else {})}
         existing = next((s for s in raw.setdefault("sites", []) if s.get("slug") == slug), None)
+        site_domains = domains or (existing or {}).get("domains") or ([own] if own else [host.lower()])
+        default = origin.default_host(site_domains[0]) if site_domains else ""
+        entry: dict[str, Any] = {"stack": stack, **({"blog_id": blog_id} if mode == "multisite" else {})}
+        if host and host.lower() != default:
+            entry["host"] = host.lower()          # explicit override
+        elif not default:
+            entry["host"] = (host or own).lower()  # node without a standby domain: the stack's own name
+        published = entry.get("host") or default
+        if own and own != published:
+            entry["site_host"] = own              # serve the published name as an alias of the siteurl host
+        host = published
         if existing:
             existing.setdefault("hosts", {})[node] = entry
             if domains:
@@ -704,13 +716,13 @@ def site_add(slug: str, stack: str, host: str = "", domains: list[str] | None = 
             if not cf_account:
                 raise ConfigError("a new site needs --cf-account (the Cloudflare account of its zones)")
             raw["sites"].append({"slug": slug, "name": name or slug, "primary": primary or node,
-                                 "cf_account": cf_account, "domains": domains or [host],
+                                 "cf_account": cf_account, "domains": site_domains,
                                  "hosts": {node: entry}, **({"failover_to": failover_to} if failover_to else {})})
             created = True
         save_inventory(raw, INVENTORY_FILE)
         state.audit("local", "registry.site_add", {"slug": slug, "stack": stack, "host": host, "blog_id": blog_id})
     r = refresh()
-    return {"slug": slug, "created": created, "host": entry, "revision": r["revision"]}
+    return {"slug": slug, "created": created, "host": {**entry, "host": host}, "revision": r["revision"]}
 
 
 def site_remove(slug: str, everywhere: bool = False) -> dict[str, Any]:

@@ -180,7 +180,9 @@ def initialise(name: str, email: str, user: str = 'admin', scheme: str = 'https'
     output = '\n'.join(line for line in result.stdout.splitlines()
                        if env['WP_ADMIN_PASSWORD'] not in line).strip()
     return {'stack': name, 'status': 'installed', 'output': output,
-            'credentials': str(path / '.env')}
+            'credentials': str(path / '.env'),
+            # what `wpops site add <slug> --stack <name>` maps it to and routes publish
+            'staging_host': origin.default_host(env['WP_DOMAIN_CURRENT_SITE'])}
 
 
 def set_login(name: str, slug: str, blog_id: int | None = None) -> dict:

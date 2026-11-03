@@ -121,8 +121,31 @@ def ensure(start: bool = True, log=print) -> dict[str, Any]:
                            capture_output=True, text=True, timeout=600)
         log((r.stdout + r.stderr).strip()[-800:])
         results["_compose"] = r.returncode
+        if r.returncode == 0:
+            results["_staging"] = publish_staging(log)
     state.audit("local", "tunnels.ensure", {k: v for k, v in results.items()})
     return results
+
+
+def publish_staging(log=print) -> dict[str, Any]:
+    """Publish every site's staging name on this node (DNS in the standby zone,
+    tunnel ingress, host alias). Production domains are never touched here."""
+    from . import routes
+    from .config import ConfigError
+    inv = load_inventory()
+    node = node_config()["node"]
+    try:
+        p = routes.plan(inv, node, staging_only=True)
+        if p["refused"]:
+            log(f"staging names not published: {p['refused']}")
+            return {"ok": False, "refused": p["refused"]}
+        if p["routes"]:
+            routes.apply(inv, node, staging_only=True)
+        log(f"staging names published: {len(p['routes'])}")
+        return {"ok": True, "published": [r["domain"] for r in p["routes"]]}
+    except (ConfigError, CfError) as exc:
+        log(f"staging names not published: {exc}")
+        return {"ok": False, "error": str(exc)}
 
 
 def status() -> list[dict[str, Any]]:

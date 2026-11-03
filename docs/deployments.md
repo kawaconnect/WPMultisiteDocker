@@ -112,7 +112,7 @@ A site can use a different stack on each node. Example site fragment:
   "domains": ["shop.example.com", "www.shop.example.com"],
   "hosts": {
     "primary": {"host": "shop.example.com"},
-    "node-a": {"stack": "shop", "host": "shop.standby.example.net"},
+    "node-a": {"stack": "shop", "site_host": "shop.example.com"},
     "node-b": {"stack": "shared-network", "blog_id": 7, "host": "shop.other-standby.example.net"}
   }
 }
@@ -122,27 +122,55 @@ Define `primary` as an external origin with the A/CNAME targets that identify
 its production DNS. Define `node-b` as a node with its stacks and tunnels if
 using it. Omit unused origins/host entries. A node can itself be a site's
 `primary`, so this supports active primary stacks as well as standby copies.
-Set `host` to the site's actual installed hostname on that origin. Multisite
-hosts require a positive `blog_id`.
+On an external origin, set `host` to the site's hostname there. On a node,
+`host` is optional (see "Staging hostnames" below). Multisite hosts require a
+positive `blog_id`. All selected sites must have mappings for the destination
+node. `--stack` on failover cannot bypass that mapping.
 
-To publish a stack under a staging name while WordPress keeps its production
-siteurl (for example a node holding a copy of `shop.example.com` that should be
-reachable as `shopexamplecom-node-a.standby.example.net`), set `host` to the
-staging name and `site_host` to the siteurl host:
+### Staging hostnames
 
-```json
-"node-a": {"stack": "shop", "host": "shopexamplecom-node-a.standby.example.net", "site_host": "shop.example.com"}
+Every site gets a staging hostname on every node, in the node's standby zone.
+By default it is derived from the site's first production domain:
+
+```
+<domain without "www.", lower case, dots removed>-<staging_suffix>.<standby_domain>
 ```
 
-`wpops routes apply` publishes `host` (DNS in the standby zone, tunnel ingress
-to the stack) and writes it into the stack's host-alias map, so requests for the
-staging name are answered with staging URLs and nothing in the database
-changes. Failover and restore treat `site_host` as the stack's own hostname.
-Without `site_host`, `host` is the siteurl host, as before.
-A staging name is published even while the site has `enabled: false`, so a
-prepared copy can be checked before cutover; its production domains stay out of
-routes and failover until the site is enabled. All selected sites must have mappings for
-the destination node. `--stack` on failover cannot bypass that mapping.
+`example-store.com` on a node with `"standby_domain": "standby.example.net"` and
+`"staging_suffix": "node1"` is `examplestorecom-node1.standby.example.net`. Set both on
+the node's origin. Without `staging_suffix` the node name is used; without
+`standby_domain` there is no default, and every host entry needs `host`.
+
+- **Override:** an explicit `hosts.<node>.host` wins over the default. Use it when
+  the default label would be longer than 63 characters or would collide with
+  another site's name on that node; the inventory is refused in both cases and
+  the error names the site to change.
+- **`site_host`:** the hostname WordPress itself uses (its siteurl), when that is
+  not the staging name. A stack that keeps its production siteurl
+  (`example-store.com`) sets `"site_host": "example-store.com"`; the staging name is then
+  served as a host alias, with staging URLs in every response and nothing changed
+  in the database. Without `site_host` the stack is installed under the staging
+  name itself (a standby multisite whose blogs use it as their domain).
+- **Automatic:** `wpops site add <slug> --stack <stack>` stores no `host` (the rule
+  applies) and records `site_host` from the stack when it differs. `wpops stack
+  init` prints the name a stack will get, and the registry shows `staging_host`
+  for every member, mapped or not. `wpops tunnels ensure` and `wpops routes
+  apply` publish the names: a CNAME in the standby zone to this node's tunnel,
+  the tunnel ingress rule, and the host-alias entry.
+- Staging names never carry production traffic, so they are published even while
+  a site has `enabled: false`; its production domains stay out of routes and
+  failover until it is enabled.
+
+```json
+"origins": {"node-a": {"kind": "node", "standby_domain": "standby.example.net", "staging_suffix": "na", "...": "..."}},
+"sites": [{"slug": "shop", "domains": ["shop.example.com", "www.shop.example.com"],
+           "hosts": {"node-a": {"stack": "shop", "site_host": "shop.example.com"}}}]
+```
+
+publishes `shopexamplecom-na.standby.example.net` and serves it from the `shop`
+stack while its siteurl stays `https://shop.example.com`.
+
+### Stack details
 
 For an existing root stack, configure its absolute `path`, `mode`, and
 `service: "http://nginx:80"`. On a node with more than one stack, wpops routes

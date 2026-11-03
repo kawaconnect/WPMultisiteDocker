@@ -89,6 +89,7 @@ origins:
     agent: https://ops.standby.example.net    # bot → agent (internet)
     ssh: root@192.0.2.10                  # bot → agent (LAN), optional
     standby_domain: standby.example.net
+    staging_suffix: "n2"                  # staging names <domain-without-dots>-n2.<standby_domain>
     stacks:
       main:  {path: /opt/docker/wordpressmultisite, mode: multisite, service: "http://nginx:80"}
     tunnels:                                # per Cloudflare account, created by cf-setup
@@ -103,7 +104,7 @@ sites:
     domains: [example-shop.com, www.example-shop.com, example-shop.net, www.example-shop.net]
     hosts:                                  # how each origin serves it
       azure:  {host: example-shop.com}
-      node2: {stack: main, blog_id: 11, host: example-shop.standby.example.net}
+      node2: {stack: main, blog_id: 11}    # host defaults to example-shopcom-n2.standby.example.net
 ```
 
 Rules the agent enforces:
