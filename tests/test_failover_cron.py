@@ -43,5 +43,25 @@ class CronFollowsTraffic(unittest.TestCase):
         self.assertEqual(calls, [("shop", ("stop", "wp-cron"))])
 
 
+class WpCliWithCronStopped(unittest.TestCase):
+    def wp_args(self, running):
+        from wpops import stacks
+        seen = []
+        def fake_compose(origin, name, *args, **kw):
+            seen.append(args)
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+        services = [{"service": "nginx", "state": "running"}] + ([{"service": "wp-cron", "state": "running"}] if running else [])
+        origin = SimpleNamespace(stacks={"shop": {}})
+        with patch("wpops.stacks.ps", return_value=services), patch("wpops.stacks.compose", side_effect=fake_compose):
+            stacks.wp(origin, "shop", "option", "get", "home")
+        return seen[-1]
+
+    def test_exec_when_running(self):
+        self.assertEqual(self.wp_args(True)[:4], ("exec", "-T", "wp-cron", "wp"))
+
+    def test_one_off_container_when_stopped(self):
+        self.assertEqual(self.wp_args(False)[:7], ("run", "--rm", "--no-deps", "-T", "--entrypoint", "wp", "wp-cron"))
+
+
 if __name__ == "__main__":
     unittest.main()

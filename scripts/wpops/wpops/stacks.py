@@ -41,7 +41,13 @@ def compose(origin: Origin, name: str, *args: str, timeout: int | None = 3600, c
 def wp(origin: Origin, name: str, *args: str, timeout: int = 3600, url: str | None = None) -> subprocess.CompletedProcess:
     """Run WP-CLI inside the stack's CLI container (service 'wp-cron' here, 'cli' for instances)."""
     mode = origin.stacks[name].get("cli_service") or "wp-cron"
-    cmd = ["exec", "-T", mode, "wp", *args, "--allow-root"]
+    running = any(c.get("service") == mode and c.get("state") == "running" for c in ps(origin, name))
+    if running:
+        cmd = ["exec", "-T", mode, "wp", *args, "--allow-root"]
+    else:
+        # A standby keeps wp-cron stopped: run WP-CLI in a one-off container of
+        # the same service instead, without starting the cron loop.
+        cmd = ["run", "--rm", "--no-deps", "-T", "--entrypoint", "wp", mode, *args, "--allow-root"]
     if url:
         cmd.insert(-1, f"--url={url}")
     return compose(origin, name, *cmd, timeout=timeout, check=False)

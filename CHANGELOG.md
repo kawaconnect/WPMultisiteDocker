@@ -2,6 +2,11 @@
 
 Versions are git tags (`vX.Y.Z`). This repo has no build; tags mark reviewed states of the stack and scripts.
 
+## [0.0.15] - 2026-11-03
+
+### Fixed
+- WP-CLI on a stack whose wp-cron is stopped (a standby) failed with `service "wp-cron" is not running`, so `wpops restore apply` could not run there. wpops 0.2.7 runs WP-CLI in a one-off container of the same service (`compose run --rm --no-deps --entrypoint wp wp-cron`) when wp-cron is not running. The cron loop is never started.
+
 ## [0.0.14] - 2026-11-03
 
 ### Added

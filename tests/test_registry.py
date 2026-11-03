@@ -498,10 +498,16 @@ args = sys.argv[1:]
 wp = json.load(open('fake-wp.json')) if os.path.exists('fake-wp.json') else {}
 if args[:1] == ['compose'] and 'ps' in args:
     print(json.dumps({'Name': 'nginx-1', 'Service': 'nginx', 'State': 'running', 'Health': 'healthy'}))
+    if os.environ.get('FAKE_CRON_STOPPED') != '1':
+        print(json.dumps({'Name': 'wp-cron-1', 'Service': 'wp-cron', 'State': 'running', 'Health': ''}))
     sys.exit(0)
 if 'wp' not in args:
     sys.exit(0)
-w = args[args.index('wp') + 1:]
+if '--entrypoint' in args:
+    # compose run --rm --no-deps -T --entrypoint wp wp-cron <wp args>
+    w = args[args.index('--entrypoint') + 3:]
+else:
+    w = args[args.index('wp') + 1:]
 if w[:1] == ['eval']:
     print('WPOPS_FACTS:' + json.dumps(wp['facts']))
 elif w[:2] == ['siteguardbackup', 'health_api_key'] and '--format=json' in w:
