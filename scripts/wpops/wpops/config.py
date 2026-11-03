@@ -212,12 +212,21 @@ class Site:
     primary: str
     cf_account: str
     domains: list[str]
-    hosts: dict[str, dict[str, Any]]            # origin -> {host, stack?, blog_id?}
+    hosts: dict[str, dict[str, Any]]            # origin -> {host, stack?, blog_id?, site_host?}
     failover_to: str = ""                       # preferred node for this site (optional)
     enabled: bool = True
 
     def host_on(self, origin: str) -> dict[str, Any] | None:
         return self.hosts.get(origin)
+
+    def site_host_on(self, origin: str) -> str:
+        """The hostname the stack's WordPress uses for itself (its siteurl) on `origin`.
+
+        `host` is the name the node publishes the site under. When that is a
+        staging name and WordPress keeps its production siteurl, the inventory
+        sets `site_host` to the siteurl host and `host` is served as an alias."""
+        h = self.hosts.get(origin) or {}
+        return str(h.get("site_host") or h.get("host") or "").lower()
 
 
 @dataclass
@@ -332,6 +341,8 @@ def _validate_inventory(inv: Inventory) -> None:
                 raise ConfigError(f"site '{s.slug}': hosts.{oname}.host is required")
             if not _HOST_RE.fullmatch(h['host'].lower()):
                 raise ConfigError(f"site '{s.slug}': invalid host '{h['host']}'")
+            if h.get("site_host") is not None and not _HOST_RE.fullmatch(str(h['site_host']).lower()):
+                raise ConfigError(f"site '{s.slug}': invalid site_host '{h['site_host']}'")
 
 
 def load_inventory(path: Path = INVENTORY_FILE) -> Inventory:

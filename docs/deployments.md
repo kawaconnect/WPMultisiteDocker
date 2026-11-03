@@ -123,7 +123,22 @@ its production DNS. Define `node-b` as a node with its stacks and tunnels if
 using it. Omit unused origins/host entries. A node can itself be a site's
 `primary`, so this supports active primary stacks as well as standby copies.
 Set `host` to the site's actual installed hostname on that origin. Multisite
-hosts require a positive `blog_id`. All selected sites must have mappings for
+hosts require a positive `blog_id`.
+
+To publish a stack under a staging name while WordPress keeps its production
+siteurl (for example a node holding a copy of `shop.example.com` that should be
+reachable as `shopexamplecom-node-a.standby.example.net`), set `host` to the
+staging name and `site_host` to the siteurl host:
+
+```json
+"node-a": {"stack": "shop", "host": "shopexamplecom-node-a.standby.example.net", "site_host": "shop.example.com"}
+```
+
+`wpops routes apply` publishes `host` (DNS in the standby zone, tunnel ingress
+to the stack) and writes it into the stack's host-alias map, so requests for the
+staging name are answered with staging URLs and nothing in the database
+changes. Failover and restore treat `site_host` as the stack's own hostname.
+Without `site_host`, `host` is the siteurl host, as before. All selected sites must have mappings for
 the destination node. `--stack` on failover cannot bypass that mapping.
 
 For an existing root stack, configure its absolute `path`, `mode`, and

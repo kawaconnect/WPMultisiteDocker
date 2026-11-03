@@ -2,6 +2,15 @@
 
 Versions are git tags (`vX.Y.Z`). This repo has no build; tags mark reviewed states of the stack and scripts.
 
+## [0.0.9] - 2026-11-03
+
+### Added
+- Staging hostnames for stacks that keep their production siteurl (wpops 0.2.1): an inventory host entry may set `site_host` (the hostname WordPress uses as its siteurl) next to `host` (the name the node publishes). `wpops routes apply` publishes `host` and the agent writes it into the stack's host-alias map, so a single-site or multisite copy of a production site can be checked at a staging name without a search-replace. See docs/deployments.md, "Add logical sites".
+
+### Changed
+- The host-alias map no longer contains entries for a stack's own siteurl host.
+- Failover aliases and restore source matching use `site_host` when it is set.
+
 ## [0.0.8] - 2026-11-02
 
 ### Fixed

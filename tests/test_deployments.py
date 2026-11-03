@@ -302,6 +302,37 @@ class DeploymentTests(unittest.TestCase):
             with self.assertRaisesRegex(config.ConfigError,'routing refused'): routes.apply(inv,'backup',accounts)
             cf.merge_tunnel_ingress.assert_not_called();cf.create_record.assert_not_called()
 
+    def test_staging_host_is_an_alias_of_the_production_siteurl(self):
+        self.add_stack('one');self.add_stack('net','multisite');self.add_stack('plain')
+        self.add_site('one','one');self.add_site('news','net',2);self.add_site('plain','plain')
+        self.raw['sites'][0]['hosts']['backup'].update(host='one-backup.standby.example',site_host='one.example')
+        self.raw['sites'][1]['hosts']['backup'].update(host='news-backup.standby.example',site_host='news.example')
+        inv=self.inventory()
+        self.assertEqual(inv.site('one').site_host_on('backup'),'one.example')
+        self.assertEqual(inv.site('plain').site_host_on('backup'),'plain.standby.example')
+        failover.write_aliases(inv,'backup')
+        read=lambda st: json.loads(failover.alias_file(inv.origin('backup'),st).read_text())['aliases']
+        self.assertEqual(read('one'),{'one-backup.standby.example':{'site':'one','host':'one.example'}})
+        self.assertEqual(read('net'),{'news-backup.standby.example':{'site':'news','host':'news.example','blog_id':2}})
+        # host == siteurl host: nothing to alias, exactly as before
+        self.assertEqual(read('plain'),{})
+        # primary on this node: production domains are the siteurl, only www needs the alias
+        self.raw['sites'][0]['primary']='backup'
+        inv=self.inventory();failover.write_aliases(inv,'backup')
+        self.assertEqual(set(read('one')),{'one-backup.standby.example','www.one.example'})
+        # the staging name is what routes publish, in the standby zone
+        from unittest.mock import MagicMock
+        cf=MagicMock();cf.zone_id.return_value='zone';cf.dns_records.return_value=[]
+        accounts={'customer':config.CfAccount(1,'customer','acct','secret'),
+                  'standby':config.CfAccount(2,'standby','acct2','secret2',True)}
+        self.raw['sites'][0]['primary']='primary';inv=self.inventory()
+        with patch.object(routes,'Cloudflare',return_value=cf):
+            p=routes.plan(inv,'backup',accounts)
+        self.assertIn('one-backup.standby.example',{r['domain'] for r in p['routes']})
+        self.assertNotIn('one.example',{r['domain'] for r in p['routes']})
+        self.raw['sites'][0]['hosts']['backup']['site_host']='not a host'
+        with self.assertRaisesRegex(config.ConfigError,'invalid site_host'): self.inventory()
+
     def test_legacy_stack_is_addressed_by_container_name_next_to_other_stacks(self):
         # Alone on a node, the legacy stack keeps its configured service.
         self.raw['origins']['backup']['stacks']['legacy']={'path':str(self.root/'WordPress.Multisite'),'mode':'multisite','service':'http://nginx:80'}

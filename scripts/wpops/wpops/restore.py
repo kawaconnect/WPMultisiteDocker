@@ -64,7 +64,7 @@ def build_batch_map(inv: Inventory, man: dict[str, Any], node: str, sites: list[
     out = []
     for slug in sites:
         site = inv.site(slug)
-        src_host = (site.host_on(man.get("source_origin", man["source"])) or {}).get("host", "").lower()
+        src_host = site.site_host_on(man.get("source_origin", man["source"]))
         dst = site.host_on(node) or {}
         if not src_host or src_host not in by_domain:
             raise RestoreError(f"site '{slug}': source host '{src_host}' is not in the backup's site list")

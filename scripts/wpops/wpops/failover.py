@@ -215,19 +215,32 @@ def alias_file(origin: Origin, stack: str) -> Path:
 
 
 def write_aliases(inv: Inventory, this_node: str) -> dict[str, dict[str, Any]]:
-    """Rebuild the host-alias maps for every stack on this node from the overrides."""
+    """Rebuild the host-alias maps for every stack on this node: published names that
+    differ from the siteurl host, native domains of sites this node is primary for,
+    and failover overrides."""
     origin = inv.origin(this_node)
     per_stack: dict[str, dict[str, Any]] = {name: {} for name in origin.stacks}
     # A node can also be primary. Native www/alternate domains need the same
     # alias handling without creating a temporary failover override.
+    def add(st: str, hostname: str, entry: dict[str, Any]) -> None:
+        # A hostname that is the stack's own siteurl host needs no alias.
+        if hostname.lower() != entry['host']:
+            per_stack[st][hostname.lower()] = entry
+
     for site in inv.sites:
         host = site.host_on(this_node)
-        if site.enabled and site.primary == this_node and host:
-            entry = {'site': site.slug, 'host': host['host']}
-            if host.get('blog_id'):
-                entry['blog_id'] = int(host['blog_id'])
+        if not site.enabled or not host or host.get('stack') not in per_stack:
+            continue
+        entry = {'site': site.slug, 'host': site.site_host_on(this_node)}
+        if host.get('blog_id'):
+            entry['blog_id'] = int(host['blog_id'])
+        # Published name differs from the siteurl host (a staging name such as
+        # shop-node.standby.example for a stack whose siteurl is shop.example):
+        # serve it as an alias so the database keeps the production URLs.
+        add(host['stack'], host['host'], entry)
+        if site.primary == this_node:
             for domain in site.domains:
-                per_stack[host['stack']][domain] = entry
+                add(host['stack'], domain, entry)
     for domain, ov in state.overrides().items():
         if ov.get("to") != this_node:
             continue
@@ -239,12 +252,12 @@ def write_aliases(inv: Inventory, this_node: str) -> dict[str, dict[str, Any]]:
         st = ov.get("stack") or host.get("stack") or ""
         if st not in per_stack:
             continue
-        entry: dict[str, Any] = {"site": site.slug, "host": host.get("host", "")}
+        entry: dict[str, Any] = {"site": site.slug, "host": site.site_host_on(this_node)}
         if host.get("blog_id"):
             entry["blog_id"] = int(host["blog_id"])
         # All sibling hostnames must work the instant apex DNS is switched.
         for hostname in site.domains:
-            per_stack[st][hostname] = entry
+            add(st, hostname, entry)
     for st, aliases in per_stack.items():
         f = alias_file(origin, st)
         if not f.parent.exists():
