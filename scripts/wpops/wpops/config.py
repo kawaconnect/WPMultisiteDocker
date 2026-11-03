@@ -135,6 +135,10 @@ NODE_DEFAULTS: dict[str, Any] = {
     "failover": {
         "default_to": "",                 # origin to use when a caller does not say --to
         "tunnel_service": "http://nginx:80",
+        # Standby node: wp-cron stays stopped while the node holds no traffic.
+        # true = failover apply starts wp-cron on each stack it switches to,
+        # rollback stops it again once no domain of that stack is served here.
+        "cron_follows_traffic": False,
     },
     "registry": {
         "enabled": True,                  # keep the site registry (GET /v1/registry) up to date

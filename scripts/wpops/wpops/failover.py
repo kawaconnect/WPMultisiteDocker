@@ -275,6 +275,27 @@ def write_aliases(inv: Inventory, this_node: str) -> dict[str, dict[str, Any]]:
     return per_stack
 
 
+def _set_cron(inv: Inventory, this_node: str, stacks: set[str], start: bool, log) -> list[str]:
+    """Start or stop wp-cron on these stacks when the node is configured for it."""
+    from .config import node_config as _nc
+    if not stacks or not (_nc().get("failover") or {}).get("cron_follows_traffic"):
+        return []
+    from .stacks import compose
+    origin = inv.origin(this_node)
+    changed = []
+    for st in sorted(stacks):
+        if st not in origin.stacks or not origin.stacks[st].get("managed"):
+            continue
+        args = ("up", "-d", "--no-deps", "wp-cron") if start else ("stop", "wp-cron")
+        r = compose(origin, st, *args, check=False, timeout=180)
+        if r.returncode == 0:
+            changed.append(st)
+            log(f"wp-cron {'started' if start else 'stopped'} on {st}")
+        else:
+            log(f"wp-cron on {st}: {(r.stderr or r.stdout or '').strip()[-200:]}")
+    return changed
+
+
 # ------------------------------------------------------------------ apply
 
 def apply(inv: Inventory, p: Plan, actor: str, this_node: str, accounts: dict | None = None,
@@ -359,7 +380,9 @@ def apply(inv: Inventory, p: Plan, actor: str, this_node: str, accounts: dict | 
                     state.save_overrides(ovs)
                 failed.append({'domain': c.domain, 'error': str(exc)})
                 log(f'FAILED {c.domain}: {exc}')
-    state.audit(actor, "failover.apply", {"to": p.to_origin, "done": done, "failed": failed})
+    switched_stacks = {c.stack for c in p.changes if any(d['domain'] == c.domain and d['status'] in ('switched', 'already-active') for d in done)}
+    cron = _set_cron(inv, this_node, switched_stacks, True, log)
+    state.audit(actor, "failover.apply", {"to": p.to_origin, "done": done, "failed": failed, "cron_started": cron})
     switched = [d["domain"] for d in done if d.get("status") == "switched"]
     if switched or failed:
         notify.notify(
@@ -419,7 +442,7 @@ def rollback(inv: Inventory, actor: str, this_node: str, sites: list[str] | None
                 removed.setdefault((ov["cf_account"], ov["tunnel_id"]), []).extend(inv.site(ov["site"]).domains)
                 del ovs[domain]
                 state.save_overrides(ovs)
-                done.append({"domain": domain, "status": "restored", "to": ov["from"]})
+                done.append({"domain": domain, "status": "restored", "to": ov["from"], "stack": ov.get("stack", "")})
                 log(f"restored {domain} -> {ov['from']}")
             except (CfError, Exception) as exc:  # noqa: BLE001
                 ov["status"] = "rollback-failed"
@@ -442,7 +465,10 @@ def rollback(inv: Inventory, actor: str, this_node: str, sites: list[str] | None
             write_aliases(inv, this_node)
         except Exception as exc:  # noqa: BLE001
             failed.append({"aliases": this_node, "error": str(exc)})
-    state.audit(actor, "failover.rollback", {"done": done, "failed": failed})
+    serving = {ov.get("stack") for ov in state.overrides().values() if ov.get("to") == this_node}
+    idle = {d.get("stack") for d in done if d.get("status") == "restored" and d.get("stack")} - serving
+    cron = _set_cron(inv, this_node, idle, False, log)
+    state.audit(actor, "failover.rollback", {"done": done, "failed": failed, "cron_stopped": cron})
     restored = [d["domain"] for d in done if d.get("status") == "restored"]
     if restored or failed:
         notify.notify(

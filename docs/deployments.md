@@ -267,6 +267,11 @@ wpops failover plan --all --to node-a
 wpops failover rollback --sites shop --yes
 ```
 
+On a standby node that keeps wp-cron stopped (no duplicate e-mails or
+scheduled jobs while another node is production), set
+`"failover": {"cron_follows_traffic": true}` in `config/wpops.json`: apply
+then starts wp-cron on each stack it switches to, and rollback stops it again.
+
 Failover checks local stack readiness, backs up DNS/tunnel configuration, and
 prepares ingress and host aliases before changing DNS. `www` CNAME aliases are
 included and their original relationships are restored on rollback. The tunnel

@@ -2,6 +2,11 @@
 
 Versions are git tags (`vX.Y.Z`). This repo has no build; tags mark reviewed states of the stack and scripts.
 
+## [0.0.14] - 2026-11-03
+
+### Added
+- `failover.cron_follows_traffic` in config/wpops.json (wpops 0.2.6, default false). On a standby node whose stacks keep wp-cron stopped, `wpops failover apply` starts wp-cron on every stack it switched domains to, and `wpops failover rollback` stops it again once none of that stack's domains are served by the node. Only managed stacks are touched. The audit log records which stacks changed.
+
 ## [0.0.13] - 2026-11-03
 
 ### Fixed
