@@ -552,3 +552,21 @@ def sources_to_pull(inv: Inventory) -> list[str]:
     cfg = node_config()["backup"]
     wanted = cfg.get("sources") or list(inv.sources())
     return [s for s in wanted if s in inv.sources()]
+
+
+def auto_apply_target(inv: Inventory, source: str, this_node: str) -> tuple[str, str] | None:
+    """(site slug, local stack) a pulled set from `source` should be restored onto
+    when backup.auto_apply is on, or None. Only a source profile naming its
+    stack on another node qualifies, mapped through the site that runs on that
+    stack there and on a single-site stack here."""
+    src = inv.backup_sources.get(source)
+    if not src or not src.stack or src.origin == this_node:
+        return None
+    here = inv.origin(this_node)
+    for site in inv.sites:
+        there = site.host_on(src.origin) or {}
+        mine = site.host_on(this_node) or {}
+        if there.get("stack") == src.stack and mine.get("stack") in here.stacks \
+                and here.stacks[mine["stack"]].get("mode") == "single" and not mine.get("blog_id"):
+            return site.slug, mine["stack"]
+    return None

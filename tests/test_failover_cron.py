@@ -63,5 +63,31 @@ class WpCliWithCronStopped(unittest.TestCase):
         self.assertEqual(self.wp_args(False)[:7], ("run", "--rm", "--no-deps", "-T", "--entrypoint", "wp", "wp-cron"))
 
 
+class AutoApplyTarget(unittest.TestCase):
+    def inv(self):
+        from wpops import config
+        site = SimpleNamespace(slug="shop", host_on=lambda o: {"prod": {"stack": "shop"}, "standby": {"stack": "shop"}}.get(o))
+        net = SimpleNamespace(slug="news", host_on=lambda o: {"prod": {"stack": "net"}, "standby": {"stack": "main", "blog_id": 2}}.get(o))
+        origins = {"prod": SimpleNamespace(stacks={"shop": {"mode": "single"}, "net": {"mode": "multisite"}}),
+                   "standby": SimpleNamespace(stacks={"shop": {"mode": "single"}, "main": {"mode": "multisite"}})}
+        return SimpleNamespace(
+            backup_sources={"prod-shop": config.BackupSource("prod-shop", "prod", "https://shop.example.com", "shop"),
+                            "prod-net": config.BackupSource("prod-net", "prod", "https://net.example.com", "net"),
+                            "prod-any": config.BackupSource("prod-any", "prod", "https://x.example.com", "")},
+            sites=[site, net], origin=lambda n: origins[n])
+
+    def test_single_stack_maps_to_the_site_stack_here(self):
+        from wpops import backup
+        self.assertEqual(backup.auto_apply_target(self.inv(), "prod-shop", "standby"), ("shop", "shop"))
+
+    def test_no_target_for_blogs_profiles_without_stack_or_own_node(self):
+        from wpops import backup
+        inv = self.inv()
+        self.assertIsNone(backup.auto_apply_target(inv, "prod-net", "standby"))
+        self.assertIsNone(backup.auto_apply_target(inv, "prod-any", "standby"))
+        self.assertIsNone(backup.auto_apply_target(inv, "prod-shop", "prod"))
+        self.assertIsNone(backup.auto_apply_target(inv, "unknown", "standby"))
+
+
 if __name__ == "__main__":
     unittest.main()

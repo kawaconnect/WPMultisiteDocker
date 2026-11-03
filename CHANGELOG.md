@@ -2,6 +2,11 @@
 
 Versions are git tags (`vX.Y.Z`). This repo has no build; tags mark reviewed states of the stack and scripts.
 
+## [0.0.16] - 2026-11-03
+
+### Added
+- `backup.auto_apply` now works (wpops 0.2.8). After each successful scheduled pull, the agent restores the set onto this node's stack for the same site. This applies to sources whose profile names a stack on another node, restored onto a single-site stack here. A site this node is serving through a failover is skipped. A failed restore counts as a failed source in the run summary.
+
 ## [0.0.15] - 2026-11-03
 
 ### Fixed

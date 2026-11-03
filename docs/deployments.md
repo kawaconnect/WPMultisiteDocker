@@ -314,6 +314,11 @@ required except for loopback sources. Profile names must differ from origin
 names. Omit a legacy origin-level `sync_api` when profiles replace it, to avoid
 pulling the same source twice in an unrestricted schedule.
 
+On a standby node, `"auto_apply": true` in `config/wpops.json` `backup`
+restores every scheduled pull onto the matching local single-site stack (the
+site whose host on the source origin is the profile's `stack`). Sites this
+node currently serves through a failover are skipped.
+
 ```bash
 wpops backup sources
 wpops backup pull --source primary-shop

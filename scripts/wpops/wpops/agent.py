@@ -348,6 +348,24 @@ class Agent:
         except (failover.FailoverError, ConfigError) as exc:
             raise ApiError(400, str(exc)) from None
 
+    def _auto_apply(self, src: str, pull_job: "jobs.Job", res: dict) -> dict:
+        """Standby refresh: restore the set just pulled onto this node's stack for
+        that site. Skipped while the site is served from this node (a failover),
+        so content edited during a failover is never overwritten."""
+        node = self.node()
+        target = bk.auto_apply_target(self.inv, src, node)
+        set_ref = (pull_job.result or {}).get("set")
+        if not target or not set_ref:
+            return res
+        slug, stack = target
+        if any(ov.get("site") == slug and ov.get("to") == node for ov in state.overrides().values()):
+            return {**res, "applied": "skipped: site is served from this node"}
+        job = jobs.Job("restore.apply", {"set": set_ref, "stack": stack, "all": True, "scheduled": True}, "scheduler")
+        job.run(lambda j: restore.apply(j, self.inv, node, set_ref, stack, all_sites=True))
+        if job.status != "succeeded":
+            return {"status": "failed", "error": f"pulled, but restore onto {stack} failed: {job.error}", "job": job.id}
+        return {**res, "applied": stack}
+
     # ------------------------------------------------------------- scheduler
     def scheduler(self) -> None:
         last_housekeeping = 0.0
@@ -368,6 +386,8 @@ class Agent:
                         job = jobs.Job("backup.pull", {"source": src, "label": "scheduled", "scheduled": True}, "scheduler")
                         job.run(lambda j, s=src: bk.pull(j, self.inv, s, "scheduled " + time.strftime("%Y-%m-%d")))
                         results[src] = {"status": job.status, "error": job.error, "job": job.id}
+                        if job.status == "succeeded" and node_config()["backup"].get("auto_apply"):
+                            results[src] = self._auto_apply(src, job, results[src])
                     bk.mark_run(results)
                     failed = [{"source": s, "error": (r.get("error") or "")[:300], "job": r.get("job")}
                               for s, r in results.items() if not s.startswith("_") and r["status"] != "succeeded"]
