@@ -13,10 +13,12 @@ docker-compose.yml):
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
 import subprocess
+import sys
 import threading
 import time
 import urllib.parse
@@ -61,19 +63,23 @@ def _parse_env(path: Path) -> dict[str, str]:
 # ------------------------------------------------------------------ 1Password
 #
 # A .env value of the form op://<vault>/<item>/<field> is a 1Password secret
-# reference. It is resolved at runtime with the 1Password CLI (`op`) and a
-# read-only service account token from OP_TOKEN_FILE. Resolved values live only
-# in this process's memory; they are never written to disk.
+# reference. 1Password limits service accounts to a small number of reads per
+# hour and per day, so references are NOT read on every command: one batched
+# `op inject` call resolves every reference of this node's .env files into a
+# root-only cache on tmpfs (CACHE_FILE; memory, cleared on reboot, never on
+# disk). Every wpops process reads the cache. It is refilled only when a .env
+# file changes, a reference is missing, or `wpops secrets refresh` runs. When
+# 1Password cannot be reached, the cached values keep working and new attempts
+# back off (BACKOFF_MIN doubling to BACKOFF_MAX), so nothing hammers the API.
 
 OP_REF_PREFIX = "op://"
 OP_TOKEN_FILE = Path(os.environ.get("WPOPS_OP_TOKEN_FILE") or "/etc/wpops/op-service-account-token")
 OP_BIN = os.environ.get("WPOPS_OP_BIN") or "op"
-# Private runtime directory (tmpfs). The op CLI keeps its config here, so it
-# works under the agent's systemd sandbox (ProtectHome) as well.
 RUNTIME_DIR = Path(os.environ.get("WPOPS_RUNTIME_DIR") or "/run/wpops")
-OP_CACHE_TTL = 900          # seconds; a rotated secret is picked up within this time
-_op_cache: dict[str, tuple[float, str]] = {}
+BACKOFF_MIN = 600           # seconds after a failed read before the next automatic attempt
+BACKOFF_MAX = 3600
 _op_lock = threading.Lock()
+_warned: set[str] = set()
 
 
 class SecretError(ConfigError):
@@ -82,6 +88,74 @@ class SecretError(ConfigError):
 
 def is_op_ref(value: str) -> bool:
     return isinstance(value, str) and value.startswith(OP_REF_PREFIX)
+
+
+def cache_dir() -> Path:
+    return RUNTIME_DIR / "cache"
+
+
+def _private_dir(path: Path) -> Path:
+    path.mkdir(mode=0o700, parents=True, exist_ok=True)
+    os.chmod(path, 0o700)
+    return path
+
+
+def _read_cache_json(name: str) -> dict[str, Any]:
+    try:
+        return json.loads((cache_dir() / name).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+
+
+def _write_cache_json(name: str, data: dict[str, Any]) -> None:
+    d = _private_dir(cache_dir())
+    _private_dir(RUNTIME_DIR)
+    tmp = d / f".{name}.{os.getpid()}.tmp"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        json.dump(data, fh)
+    os.replace(tmp, d / name)
+
+
+def load_cache() -> dict[str, Any]:
+    """{"values": {ref: secret}, "sources": {env file: sha256}, "filled_at", "origin"}."""
+    c = _read_cache_json("secrets.json")
+    c.setdefault("values", {})
+    c.setdefault("sources", {})
+    return c
+
+
+def backoff_state() -> dict[str, Any]:
+    return _read_cache_json("backoff.json")
+
+
+def _file_digest(path: Path) -> str:
+    try:
+        return hashlib.sha256(path.read_bytes()).hexdigest()
+    except OSError:
+        return ""
+
+
+def node_env_files() -> list[Path]:
+    """The .env files whose references this node resolves: the root .env and
+    every stacks/<name>/.env (not stacks/_removed)."""
+    files = [ENV_FILE] if ENV_FILE.exists() else []
+    stacks = REPO_DIR / "stacks"
+    if stacks.is_dir():
+        files += sorted(p for p in stacks.glob("*/.env") if not p.parent.name.startswith("_"))
+    return files
+
+
+def file_refs(path: Path) -> dict[str, str]:
+    """KEY -> reference for the op:// values of a .env file."""
+    return {k: v for k, v in _parse_env(path).items() if is_op_ref(v)}
+
+
+def cache_fresh(path: Path, cache: dict[str, Any] | None = None) -> bool:
+    cache = cache if cache is not None else load_cache()
+    refs = set(file_refs(path).values())
+    return (cache["sources"].get(str(path)) == _file_digest(path)
+            and refs <= set(cache["values"]))
 
 
 def _op_env() -> dict[str, str]:
@@ -96,109 +170,147 @@ def _op_env() -> dict[str, str]:
     if not token:
         raise SecretError(f"1Password: {OP_TOKEN_FILE} is empty")
     env["OP_SERVICE_ACCOUNT_TOKEN"] = token
-    cfg_dir = RUNTIME_DIR / "op"
     try:
-        RUNTIME_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
-        cfg_dir.mkdir(mode=0o700, exist_ok=True)
-        os.chmod(RUNTIME_DIR, 0o700)
-        env["OP_CONFIG_DIR"] = str(cfg_dir)
+        # op keeps its configuration here, which also works in the agent's sandbox.
+        env["OP_CONFIG_DIR"] = str(_private_dir(_private_dir(RUNTIME_DIR) / "op"))
     except OSError:
-        pass                    # op falls back to its default config directory
+        pass
     env["OP_CACHE"] = "false"
     return env
-
-
-def _op_read(refs: list[str]) -> dict[str, str]:
-    """Resolve references with one `op inject` call (one `op read` each as fallback)."""
-    env = _op_env()
-    marker = "@@wpops-op-value@@"   # op inject drops control characters
-    template = "".join(f"{marker}{{{{ {r} }}}}\n" for r in refs)
-    try:
-        r = subprocess.run([OP_BIN, "inject"], input=template, env=env, capture_output=True,
-                           text=True, timeout=60)
-    except FileNotFoundError:
-        raise SecretError(f"1Password: the op CLI ({OP_BIN}) is not installed") from None
-    except subprocess.TimeoutExpired:
-        raise SecretError("1Password: op inject timed out (is 1Password reachable?)") from None
-    if r.returncode == 0:
-        parts = r.stdout.split(marker)[1:]
-        if len(parts) == len(refs) and all(p.endswith("\n") for p in parts):
-            return {ref: p[:-1] for ref, p in zip(refs, parts)}
-    elif len(refs) == 1:
-        raise SecretError(f"1Password: cannot resolve {refs[0]}: {_op_error(r.stderr)}")
-    out: dict[str, str] = {}
-    for ref in refs:
-        try:
-            r = subprocess.run([OP_BIN, "read", "--no-newline", ref], env=env, capture_output=True,
-                               text=True, timeout=60)
-        except subprocess.TimeoutExpired:
-            raise SecretError(f"1Password: op read {ref} timed out (is 1Password reachable?)") from None
-        if r.returncode != 0:
-            raise SecretError(f"1Password: cannot resolve {ref}: {_op_error(r.stderr)}")
-        out[ref] = r.stdout
-    return out
 
 
 def _op_error(stderr: str) -> str:
     # op's messages name the reference, never its value; keep the last line only.
     lines = [ln.strip() for ln in (stderr or "").splitlines() if ln.strip()]
-    return (lines[-1] if lines else "unknown error")[:300]
+    msg = (lines[-1] if lines else "unknown error")[:300]
+    if "Too many requests" in msg or "rate-limit" in msg:
+        msg += " (1Password rate limit; `op service-account ratelimit` shows when it resets)"
+    return msg
 
 
-def resolve_refs(refs: list[str] | set[str]) -> dict[str, str]:
-    """Resolve 1Password references (cached in memory for OP_CACHE_TTL seconds).
+def _op_read(refs: list[str]) -> dict[str, str]:
+    """Resolve references with ONE `op inject` call (never one call per value)."""
+    env = _op_env()
+    marker = "@@wpops-op-value@@"   # op inject drops control characters
+    template = "".join(f"{marker}{{{{ {r} }}}}\n" for r in refs)
+    try:
+        r = subprocess.run([OP_BIN, "inject"], input=template, env=env, capture_output=True,
+                           text=True, timeout=120)
+    except FileNotFoundError:
+        raise SecretError(f"1Password: the op CLI ({OP_BIN}) is not installed") from None
+    except subprocess.TimeoutExpired:
+        raise SecretError("1Password: op inject timed out (is 1Password reachable?)") from None
+    if r.returncode != 0:
+        raise SecretError(f"1Password: {_op_error(r.stderr)}")
+    parts = r.stdout.split(marker)[1:]
+    if len(parts) != len(refs) or not all(p.endswith("\n") for p in parts):
+        raise SecretError("1Password: unexpected op inject output (a value with a line break?)")
+    return {ref: p[:-1] for ref, p in zip(refs, parts)}
 
-    If 1Password cannot be reached when a cached value has expired, the cached
-    value is used, so a cloud outage does not stop a running agent."""
-    wanted = sorted(set(refs))
-    if not wanted:
-        return {}
-    now = time.monotonic()
+
+def refresh_cache(files: list[Path] | None = None) -> dict[str, Any]:
+    """Read every reference of this node's .env files from 1Password in one
+    batched call and replace the cache. Raises SecretError (and records the
+    failure for the backoff) when 1Password cannot be read."""
+    files = files if files is not None else node_env_files()
     with _op_lock:
-        missing = [r for r in wanted if r not in _op_cache or now - _op_cache[r][0] > OP_CACHE_TTL]
-        if missing:
+        refs_by_file = {p: file_refs(p) for p in files}
+        wanted = sorted({r for refs in refs_by_file.values() for r in refs.values()})
+        try:
+            values = _op_read(wanted) if wanted else {}
+        except SecretError as exc:
+            b = backoff_state()
+            failures = int(b.get("failures") or 0) + 1
+            delay = min(BACKOFF_MAX, BACKOFF_MIN * 2 ** (failures - 1))
+            _write_cache_json("backoff.json", {**b, "failures": failures, "error": str(exc),
+                                               "failed_at": time.time(), "next_try": time.time() + delay})
+            raise
+        cache = {"values": values, "sources": {str(p): _file_digest(p) for p in files},
+                 "filled_at": time.time(), "origin": "1password", "refs": len(wanted)}
+        _write_cache_json("secrets.json", cache)
+        b = backoff_state()
+        _write_cache_json("backoff.json", {"alerted": False, "was_alerted": bool(b.get("alerted"))}
+                          if b.get("alerted") else {})
+        return {"files": len(files), "refs": len(wanted), "filled_at": cache["filled_at"]}
+
+
+def _values_for(path: Path, refs: set[str]) -> tuple[dict[str, str], set[str]]:
+    """Cached values for these references of `path`; refills the cache when it
+    is stale (respecting the backoff). Returns (values, missing refs)."""
+    cache = load_cache()
+    if refs and not cache_fresh(path, cache):
+        b = backoff_state()
+        if time.time() >= float(b.get("next_try") or 0):
             try:
-                fresh = _op_read(missing)
-            except SecretError:
-                if any(r not in _op_cache for r in missing):
-                    raise
-                fresh = {}
-            for r, v in fresh.items():
-                _op_cache[r] = (now, v)
-        return {r: _op_cache[r][1] for r in wanted}
+                refresh_cache()
+                cache = load_cache()
+            except SecretError as exc:
+                _warn_once(str(exc))
+        else:
+            _warn_once(f"1Password: not retried before {time.strftime('%H:%M:%S', time.localtime(b['next_try']))} "
+                       f"(last error: {b.get('error', '')[:200]}); using cached values")
+    values = {r: cache["values"][r] for r in refs if r in cache["values"]}
+    return values, refs - set(values)
 
 
-def clear_secret_cache() -> None:
-    with _op_lock:
-        _op_cache.clear()
+def _warn_once(msg: str) -> None:
+    if msg not in _warned:
+        _warned.add(msg)
+        print(f"warning: {msg}", file=sys.stderr)
+
+
+def resolve_refs(refs: list[str] | set[str], path: Path = ENV_FILE) -> dict[str, str]:
+    """Resolve references through the cache; SecretError if any is unavailable."""
+    values, missing = _values_for(path, set(refs))
+    if missing:
+        raise SecretError(_missing_message(missing))
+    return values
+
+
+def _missing_message(missing: set[str]) -> str:
+    b = backoff_state()
+    why = f" (last error: {b['error']})" if b.get("error") else ""
+    return (f"1Password: {len(missing)} secret(s) not available: {', '.join(sorted(missing))}{why}. "
+            "Run `wpops secrets refresh` once 1Password is reachable.")
 
 
 def load_env(path: Path = ENV_FILE, resolve: bool = True) -> dict[str, str]:
     """Parse a docker-compose style .env (KEY=VALUE, optional quotes, # comments).
 
-    With resolve=True, op://... values are replaced by the secrets they refer to
-    (1Password). resolve=False returns the references as written, for callers
-    that only need non-secret keys."""
+    With resolve=True, op://... values are replaced by their secrets from the
+    cache (see above). A secret that is not available at all is left out of the
+    result with a warning, so callers that do not need it keep working (a
+    failover needs only the Cloudflare tokens). resolve=False returns the
+    references as written, for callers that only need non-secret keys."""
     env = _parse_env(path)
-    if resolve:
-        refs = {v for v in env.values() if is_op_ref(v)}
-        if refs:
-            values = resolve_refs(refs)
-            env = {k: values.get(v, v) if is_op_ref(v) else v for k, v in env.items()}
-    return env
+    if not resolve:
+        return env
+    refs = {v for v in env.values() if is_op_ref(v)}
+    if not refs:
+        return env
+    values, missing = _values_for(path, refs)
+    if missing:
+        _warn_once(_missing_message(missing))
+    return {k: values[v] if is_op_ref(v) else v for k, v in env.items()
+            if not is_op_ref(v) or v in values}
 
 
-def secret_env(path: Path) -> dict[str, str]:
-    """Only the keys of a .env file that are 1Password references, resolved.
+def secret_env(path: Path, needed: set[str] | None = None) -> dict[str, str]:
+    """The keys of a .env file that are 1Password references, resolved.
 
     Passed as process environment to `docker compose`, where it takes precedence
-    over the file's op:// strings during interpolation."""
-    raw = _parse_env(path)
-    refs = {k: v for k, v in raw.items() if is_op_ref(v)}
+    over the file's op:// strings during interpolation. `needed` is the set of
+    variables the compose files use (None: all); a needed secret that is not
+    available raises SecretError instead of letting compose use the op:// text."""
+    refs = file_refs(path)
     if not refs:
         return {}
-    values = resolve_refs(set(refs.values()))
-    return {k: values[v] for k, v in refs.items()}
+    values, missing = _values_for(path, set(refs.values()))
+    missing_keys = {k for k, r in refs.items() if r in missing and (needed is None or k in needed)}
+    if missing_keys:
+        raise SecretError(_missing_message({refs[k] for k in missing_keys}) +
+                          f" Needed by compose: {', '.join(sorted(missing_keys))}.")
+    return {k: values[r] for k, r in refs.items() if r in values}
 
 
 # Cloudflare API base URL. CF_API_URL (environment, else .env) points wpops at

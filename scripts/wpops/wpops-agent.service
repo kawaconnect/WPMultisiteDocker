@@ -1,8 +1,8 @@
 # wpops agent, install with: scripts/wpops/install-agent.sh
 [Unit]
 Description=wpops WordPress node agent
-After=network-online.target docker.service
-Wants=network-online.target
+After=network-online.target docker.service wpops-secrets.service
+Wants=network-online.target wpops-secrets.service
 
 [Service]
 Type=simple

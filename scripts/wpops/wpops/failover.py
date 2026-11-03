@@ -287,7 +287,11 @@ def _set_cron(inv: Inventory, this_node: str, stacks: set[str], start: bool, log
         if st not in origin.stacks or not origin.stacks[st].get("managed"):
             continue
         args = ("up", "-d", "--no-deps", "wp-cron") if start else ("stop", "wp-cron")
-        r = compose(origin, st, *args, check=False, timeout=180)
+        try:
+            r = compose(origin, st, *args, check=False, timeout=180)
+        except ConfigError as exc:      # e.g. a secret 1Password could not supply
+            log(f"wp-cron on {st}: {exc}")
+            continue
         if r.returncode == 0:
             changed.append(st)
             log(f"wp-cron {'started' if start else 'stopped'} on {st}")

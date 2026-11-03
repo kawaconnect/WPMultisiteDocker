@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import subprocess
 from pathlib import Path
@@ -34,12 +35,44 @@ def compose(origin: Origin, name: str, *args: str, timeout: int | None = 3600, c
         if key.startswith('COMPOSE_'):
             env.pop(key)
     env.setdefault("COMPOSE_INTERACTIVE_NO_CLI", "1")
-    # Secrets in the stack's .env are 1Password references (op://...). Compose
-    # gets the resolved values as process environment, which takes precedence
-    # over the .env file in interpolation. Nothing is written to disk.
-    env.update(secret_env(path / ".env"))
+    # Secrets in the stack's .env are 1Password references (op://...). A command
+    # that creates containers gets the resolved values (from the tmpfs cache)
+    # as process environment, which takes precedence over the .env file in
+    # interpolation. Commands that only look at or act on existing containers
+    # do not need them and never touch 1Password.
+    if needs_secrets(args):
+        env.update(secret_env(path / ".env", compose_variables(path)))
     return subprocess.run(cmd, cwd=path, env=env, text=True, timeout=timeout, check=check,
                           capture_output=capture, input=input_text)
+
+
+# Compose commands that never create a container: interpolated secrets are not
+# used (`config` would print them, so it gets the references only).
+NO_SECRET_COMMANDS = {"ps", "logs", "exec", "stop", "start", "restart", "kill", "pause", "unpause", "top",
+                      "images", "port", "ls", "version", "events", "rm", "down", "wait", "attach", "stats",
+                      "cp", "config"}
+
+
+def needs_secrets(args: tuple[str, ...] | list[str]) -> bool:
+    """False for compose commands that do not create containers (by the first
+    argument; anything else, including an option first, gets the secrets)."""
+    return not args or args[0] not in NO_SECRET_COMMANDS
+
+
+def compose_variables(path: Path) -> set[str] | None:
+    """Variables the stack's compose files interpolate, or None if unknown."""
+    from .config import _parse_env
+    files = (_parse_env(path / ".env").get("COMPOSE_FILE") or "").split(os.pathsep)
+    files = [f for f in files if f] or [n for n in ("compose.yaml", "compose.yml", "docker-compose.yml",
+                                                   "docker-compose.yaml") if (path / n).exists()][:1]
+    names: set[str] = set()
+    try:
+        for f in files:
+            text = (path / f).read_text(encoding="utf-8")
+            names |= set(re.findall(r"\$\{?([A-Za-z_][A-Za-z0-9_]*)", text))
+    except OSError:
+        return None
+    return names if files else None
 
 
 def wp(origin: Origin, name: str, *args: str, timeout: int = 3600, url: str | None = None) -> subprocess.CompletedProcess:

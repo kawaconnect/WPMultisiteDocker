@@ -8,6 +8,7 @@ import json
 import os
 import subprocess
 import sys
+import time
 from typing import Any
 
 from . import __version__, backup as bk, failover, jobs, notify, restore, state
@@ -239,24 +240,38 @@ def cmd_tunnels(args: argparse.Namespace) -> int:
 
 
 def cmd_secrets(args: argparse.Namespace) -> int:
-    from . import vault
-    r = vault.check(resolve=not args.no_resolve)
+    from . import config as cfgmod, vault
+    if args.action == "refresh":
+        if args.boot:
+            r = vault.refresh_boot(log=lambda m: print(m, file=sys.stderr))
+            _out(args, r, "ok" if r["ok"] else "1Password not reachable; the agent retries")
+            return 0                    # boot must not fail: running containers do not need it
+        r = cfgmod.refresh_cache()
+        _out(args, r, f"cache filled: {r['refs']} references from {r['files']} .env files (one 1Password call)")
+        return 0
+    r = vault.check(fresh=args.fresh)
     lines = []
+    if "refresh" in r:
+        lines.append(f"refresh: {r['refresh'].get('error') or str(r['refresh'].get('refs')) + ' references read'}")
+    c = r["cache"]
+    filled = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(c["filled_at"])) if c.get("filled_at") else "never"
+    lines.append(f"cache    {c['file']}: {c['values']} values, filled {filled} ({c['origin']})"
+                 + (f"; last 1Password error: {c['last_error']}" if c.get("last_error") else ""))
     for f in r["files"]:
-        state_ = "ok" if f["ok"] else "PROBLEM"
-        extra = []
+        state_ = "ok" if f["ok"] and not f["warn"] else "WARN" if f["ok"] else "PROBLEM"
+        extra = [f"cache {f['cache']}"] if f.get("cache") else []
         if f["plaintext_keys"]:
             extra.append("plaintext: " + ",".join(f["plaintext_keys"]))
+        if f.get("not_cached"):
+            extra.append("not cached: " + ",".join(f["not_cached"]))
         if f.get("empty"):
             extra.append("empty: " + ",".join(f["empty"]))
-        if f.get("error"):
-            extra.append(f["error"])
         lines.append(f"{state_:<8} {f['refs']:>3} refs  {f['file']}  {'; '.join(extra)}".rstrip())
     t = r["tunnels"]
     lines.append(f"{'ok' if t['ok'] else 'PROBLEM':<8} tunnels  {t['file']}  "
                  + ("literal secrets: " + ",".join(t["literal_tokens"]) if t["literal_tokens"] else t.get("error", "no secrets in the file")))
     _out(args, r, "\n".join(lines))
-    return 0 if r["ok"] else 1
+    return 0 if r["ok"] and not r["warnings"] else 1
 
 
 def cmd_stack(args: argparse.Namespace) -> int:
@@ -534,8 +549,10 @@ def build_parser() -> argparse.ArgumentParser:
     s = sub.add_parser("serve", help="run the HTTP agent"); s.add_argument("--bind", action="append", help="extra bind address"); s.set_defaults(fn=cmd_serve)
     s = sub.add_parser("notify", help="send a test notification"); s.add_argument("action", choices=["test"]); s.set_defaults(fn=cmd_notify)
     s = sub.add_parser("tunnels", help="per-account Cloudflare tunnels on this node"); s.add_argument("action", choices=["status", "ensure"]); s.add_argument("--no-start", action="store_true"); s.set_defaults(fn=cmd_tunnels)
-    s = sub.add_parser("secrets", help="check that .env secrets are 1Password references that resolve")
-    s.add_argument("action", choices=["check"]); s.add_argument("--no-resolve", action="store_true", help="only look for plaintext, do not ask 1Password")
+    s = sub.add_parser("secrets", help="1Password references in .env and their tmpfs cache (docs/secrets.md)")
+    s.add_argument("action", choices=["check", "refresh"])
+    s.add_argument("--fresh", action="store_true", help="check: refill the cache from 1Password first (one call)")
+    s.add_argument("--boot", action="store_true", help="refresh: only if the cache is not fresh; retry, never fail")
     s.set_defaults(fn=cmd_secrets)
     s = sub.add_parser("setup", help="first-time setup on this node"); s.add_argument("--node"); s.set_defaults(fn=cmd_setup)
     return p

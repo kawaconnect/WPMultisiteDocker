@@ -427,6 +427,45 @@ class Agent:
             if self._stop.wait(60):
                 return
 
+    def secrets_loop(self) -> None:
+        """Keep the 1Password cache (tmpfs) filled. It is read again only when a
+        .env file changed or a value is missing, never on a timer; failures back
+        off (config.BACKOFF_MIN..MAX). One alert while secrets are missing, one
+        when they are back."""
+        from . import config as c
+        last_error = ""
+        while True:
+            try:
+                files = [p for p in c.node_env_files() if c.file_refs(p)]
+                b = c.backoff_state()
+                if any(not c.cache_fresh(p) for p in files) and time.time() >= float(b.get("next_try") or 0):
+                    try:
+                        c.refresh_cache(c.node_env_files())
+                    except c.SecretError:
+                        pass                # recorded in the backoff state
+                b = c.backoff_state()
+                values = set(c.load_cache()["values"])
+                incomplete = [str(p) for p in files if not set(c.file_refs(p).values()) <= values]
+                if b.get("error") and incomplete and not b.get("alerted"):
+                    notify.notify("secrets.unavailable", f"[wpops] {self.node()}: secrets not available from 1Password",
+                                  f"wpops on {self.node()} cannot read secrets from 1Password and has no cached "
+                                  f"copy for {len(incomplete)} .env file(s). Running containers are not affected; "
+                                  "creating containers, failover and backup pulls that need them fail until it "
+                                  f"recovers. It retries with backoff.\n\nLast error: {b['error']}",
+                                  {"files": incomplete, "error": b["error"]})
+                    c._write_cache_json("backoff.json", {**b, "alerted": True})
+                elif b.get("was_alerted") and not incomplete:
+                    notify.notify("secrets.restored", f"[wpops] {self.node()}: secrets available again",
+                                  "The 1Password cache is filled again.", {})
+                    c._write_cache_json("backoff.json", {})
+                last_error = ""
+            except Exception as exc:  # noqa: BLE001
+                if str(exc) != last_error:
+                    last_error = str(exc)
+                    notify.record_event("scheduler.error", {"error": f"secrets: {exc}"})
+            if self._stop.wait(300):
+                return
+
     def stop(self) -> None:
         self._stop.set()
 
@@ -555,6 +594,7 @@ def serve(extra_binds: list[str] | None = None) -> None:
         print(f"wpops agent {__version__} listening on {b}:{port}", flush=True)
     threading.Thread(target=agent.scheduler, name="scheduler", daemon=True).start()
     threading.Thread(target=agent.registry_loop, name="registry", daemon=True).start()
+    threading.Thread(target=agent.secrets_loop, name="secrets", daemon=True).start()
     state.audit("local", "agent.start", {"binds": binds, "port": port})
     try:
         while True:

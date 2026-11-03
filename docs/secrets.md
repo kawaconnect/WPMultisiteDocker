@@ -24,23 +24,51 @@ Names, ids, ports, hostnames and flags stay as plain values.
   service account token in `/etc/wpops/op-service-account-token` (root, 0600).
   `WPOPS_OP_TOKEN_FILE` points elsewhere; `OP_SERVICE_ACCOUNT_TOKEN` in the
   environment takes precedence.
-- wpops (`config.load_env`) resolves every `op://` value of a file with one
-  `op inject` call. Values are kept in the process's memory only, for 15
-  minutes. If 1Password cannot be reached after that, the values already read
-  keep working; a value never read gives a clear `1Password: ...` error. The op
-  CLI keeps its configuration in `/run/wpops/op` (tmpfs, 0700), which also
-  works inside the agent's systemd sandbox.
-- `scripts/cf-*.sh` resolve references the same way (`op read`). A value that
-  is already in the environment wins; the `cf-backup` container gets its
-  Cloudflare tokens that way.
+- **1Password limits service accounts** (here: 1,000 reads per hour per token
+  and 1,000 per day for the whole account, shared by every service account;
+  `op service-account ratelimit` shows the current use). So wpops does not
+  read 1Password per command. One batched `op inject` call resolves every
+  reference of the node's `.env` files into a cache on tmpfs:
+  `/run/wpops/cache/secrets.json` (directory 0700, file 0600, root only;
+  memory, gone at reboot, never written to disk). Every wpops process, the
+  agent and the cf scripts read that cache.
+- The cache is read again from 1Password only when a `.env` file changes
+  (its sha256 differs from the one recorded), a reference is missing, or
+  `wpops secrets refresh` runs. There is no timer. After rotating a secret in
+  1Password, run `wpops secrets refresh`.
+- At boot, `wpops-secrets.service` (oneshot, before the agent) fills the cache
+  if it is not fresh. It retries 3 times (30 s, 90 s) and never fails the boot.
+  Running containers do not need it.
+- When 1Password cannot be read (outage, rate limit), cached values keep
+  working, including when they are stale, so a failover from the standby works
+  as long as the cache was filled since boot. Further automatic attempts back
+  off: 10 minutes, doubling to 1 hour (`/run/wpops/cache/backoff.json`). The
+  agent retries in the background and sends one `secrets.unavailable` alert
+  while values are missing, and one `secrets.restored` when they are back.
+- A secret that is not available at all: `load_env` leaves the key out with a
+  warning, so callers that do not need it keep working (failover needs only the
+  Cloudflare tokens). Compose refuses to create containers when a variable its
+  files use is unavailable, rather than passing the `op://` text.
+- `scripts/cf-*.sh` resolve only `CF_*` references: from the environment
+  (cf-backup), else the wpops cache, else one `op read`.
+
+### Reads per day
+
+A full refill reads every referenced item once: about 35 items per node (10
+Cloudflare accounts, 23 stacks, the node item). In normal operation
+(scheduled backups, bot status polls, registry timers, failover plans,
+compose commands) the cache is used and **no reads** happen. Reads happen
+only at boot, after a `.env` change, or on `wpops secrets refresh`.
 
 ## Docker Compose
 
 Compose reads the stack's `.env` for interpolation, and would see the
-`op://` strings. Every compose call wpops makes (`wpops stack up|stop|compose`,
-WP-CLI, restores, failover cron, tunnels) passes the resolved secrets as
-process environment, which takes precedence over `.env` in interpolation.
-Nothing is written to disk.
+`op://` strings. Every compose command wpops runs that creates containers
+(`up`, `run`, `create`: stack up, restores, WP-CLI in a one-off container,
+failover cron, tunnels) gets the resolved secrets from the cache as process
+environment, which takes precedence over `.env` in interpolation. Commands
+that only look at or act on existing containers (`ps`, `logs`, `exec`, `stop`,
+`restart`, `config`, ...) get no secrets.
 
 **Run compose through wpops:**
 
@@ -67,11 +95,14 @@ connectors only with `wpops tunnels ensure`.
 ## Checking
 
 ```bash
-scripts/wpops/bin/wpops secrets check            # every reference resolves; no plaintext secret keys
-scripts/wpops/bin/wpops secrets check --no-resolve   # plaintext only, without asking 1Password
+scripts/wpops/bin/wpops secrets check            # cache state per .env file, plaintext keys, tunnel file (no 1Password reads)
+scripts/wpops/bin/wpops secrets check --fresh    # refill the cache first (one 1Password call)
+scripts/wpops/bin/wpops secrets refresh          # refill the cache (one call), e.g. after rotating a secret
 ```
 
-It prints key names and counts, never values, and exits 1 on any problem.
+`check` prints key names and counts, never values. It exits 1 when a secret is
+missing from the cache, a secret key is in plain text, or a `.env` file
+changed since the cache was filled (stale: run `secrets refresh`).
 
 ## New stacks
 
@@ -81,6 +112,8 @@ text (the node's service account is read-only). Store them in 1Password as
 check` lists such keys until that is done.
 
 ## What still holds secrets on a node (by design)
+
+- The tmpfs cache above (memory only, root only, cleared at reboot).
 
 - Docker keeps every container's environment in its own configuration
   (`docker inspect`, `/var/lib/docker/containers/*/config.v2.json`, root

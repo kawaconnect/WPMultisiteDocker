@@ -51,6 +51,8 @@ FAKE_OP = textwrap.dedent("""\
 class OpTestCase(unittest.TestCase):
     def setUp(self):
         self.tmp = Path(tempfile.mkdtemp())
+        self.repo = self.tmp / "repo"
+        (self.repo / "stacks").mkdir(parents=True)
         self.op = self.tmp / "op"
         self.op.write_text(FAKE_OP)
         self.op.chmod(0o755)
@@ -63,44 +65,78 @@ class OpTestCase(unittest.TestCase):
             patch.object(config, "OP_BIN", str(self.op)),
             patch.object(config, "OP_TOKEN_FILE", self.token),
             patch.object(config, "RUNTIME_DIR", self.tmp / "run"),
+            patch.object(config, "REPO_DIR", self.repo),
+            patch.object(config, "ENV_FILE", self.repo / ".env"),
         ]
         for p in self.patches:
             p.start()
         os.environ.pop("OP_SERVICE_ACCOUNT_TOKEN", None)
-        config.clear_secret_cache()
+        config._warned.clear()
 
     def tearDown(self):
         for p in reversed(self.patches):
             p.stop()
-        config.clear_secret_cache()
 
     def calls(self):
         return self.log.read_text().splitlines() if self.log.exists() else []
 
     def env_file(self, text, name=".env"):
-        path = self.tmp / name
+        path = self.repo / name
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(textwrap.dedent(text))
         return path
 
-
-class LoadEnv(OpTestCase):
-    def test_references_are_resolved_in_one_call_and_cached(self):
-        path = self.env_file("""\
+    def node_files(self):
+        root = self.env_file("""\
+            CF_ACCOUNT_1_NAME=one
+            CF_ACCOUNT_1_ID=abc
+            CF_ACCOUNT_1_TOKEN=op://V/cloudflare-one/credential
+            """)
+        stack = self.env_file("""\
             HTTP_PORT=8081
             MYSQL_PASSWORD="op://V/stack-a/mysql_password"
             REDIS_PASSWORD=op://V/stack-a/redis_password
-            """)
-        env = config.load_env(path)
+            """, "stacks/a/.env")
+        return root, stack
+
+
+class Cache(OpTestCase):
+    def test_one_batched_call_for_the_whole_node_then_cache_only(self):
+        root, stack = self.node_files()
+        env = config.load_env(stack)
         self.assertEqual(env["HTTP_PORT"], "8081")
         self.assertEqual(env["MYSQL_PASSWORD"], "db-pass-123")
         self.assertEqual(env["REDIS_PASSWORD"], 'redis "quoted" pass')
-        config.load_env(path)
+        # The root .env was resolved by the same call; later processes read the cache.
+        self.assertEqual(config.cf_accounts(config.load_env(root))["one"].token, "cf-token-one")
+        for _ in range(5):
+            config.load_env(stack)
         self.assertEqual(self.calls(), ["inject token=True"])
 
+    def test_cache_is_private_tmpfs_style(self):
+        _, stack = self.node_files()
+        config.load_env(stack)
+        d = config.cache_dir()
+        self.assertEqual(stat.S_IMODE(d.stat().st_mode), 0o700)
+        self.assertEqual(stat.S_IMODE((d / "secrets.json").stat().st_mode), 0o600)
+        self.assertEqual(stat.S_IMODE(config.RUNTIME_DIR.stat().st_mode), 0o700)
+
+    def test_changed_env_file_is_read_again(self):
+        _, stack = self.node_files()
+        config.load_env(stack)
+        stack.write_text(stack.read_text() + "WP_MODE=single\n")
+        config.load_env(stack)
+        self.assertEqual(len(self.calls()), 2)
+
+    def test_refresh_command_reads_once(self):
+        self.node_files()
+        r = config.refresh_cache()
+        self.assertEqual((r["files"], r["refs"]), (2, 3))
+        self.assertEqual(len(self.calls()), 1)
+
     def test_resolve_false_keeps_references(self):
-        path = self.env_file("MYSQL_PASSWORD=op://V/stack-a/mysql_password\n")
-        self.assertEqual(config.load_env(path, resolve=False)["MYSQL_PASSWORD"], "op://V/stack-a/mysql_password")
+        _, stack = self.node_files()
+        self.assertEqual(config.load_env(stack, resolve=False)["MYSQL_PASSWORD"], "op://V/stack-a/mysql_password")
         self.assertEqual(self.calls(), [])
 
     def test_plain_files_never_call_op(self):
@@ -108,58 +144,100 @@ class LoadEnv(OpTestCase):
         self.assertEqual(config.load_env(path), {"HTTP_PORT": "8081"})
         self.assertEqual(self.calls(), [])
 
+    def test_down_with_a_cache_keeps_working_and_backs_off(self):
+        root, stack = self.node_files()
+        config.load_env(stack)
+        stack.write_text(stack.read_text() + "WP_MODE=single\n")     # cache now stale
+        with patch.dict(os.environ, {"FAKE_OP_FAIL": "1"}):
+            self.assertEqual(config.load_env(stack)["MYSQL_PASSWORD"], "db-pass-123")
+            for _ in range(5):                                       # within the backoff: no more calls
+                self.assertEqual(config.cf_accounts(config.load_env(root))["one"].token, "cf-token-one")
+        self.assertEqual(len(self.calls()), 2)
+        b = config.backoff_state()
+        self.assertEqual(b["failures"], 1)
+        self.assertIn("1Password", b["error"])
+        self.assertGreaterEqual(b["next_try"] - b["failed_at"], config.BACKOFF_MIN - 1)
+
+    def test_down_without_a_cache(self):
+        root, stack = self.node_files()
+        with patch.dict(os.environ, {"FAKE_OP_FAIL": "1"}):
+            env = config.load_env(stack)                      # missing secrets are left out, with a warning
+            self.assertNotIn("MYSQL_PASSWORD", env)
+            self.assertEqual(env["HTTP_PORT"], "8081")
+            with self.assertRaises(config.SecretError) as cm:  # compose needs them: refuse
+                config.secret_env(stack, {"MYSQL_PASSWORD"})
+        self.assertIn("MYSQL_PASSWORD", str(cm.exception))
+        self.assertIsInstance(cm.exception, config.ConfigError)
+        self.assertEqual(len(self.calls()), 1)               # backoff: one attempt only
+
     def test_unknown_reference_is_a_clear_error(self):
-        path = self.env_file("A=op://V/missing/field\n")
+        self.env_file("A=op://V/missing/field\n")
         with self.assertRaises(config.SecretError) as cm:
-            config.load_env(path)
+            config.refresh_cache()
         self.assertIn("op://V/missing/field", str(cm.exception))
 
-    def test_unreachable_1password_is_a_clear_error(self):
-        path = self.env_file("A=op://V/stack-a/mysql_password\n")
-        with patch.dict(os.environ, {"FAKE_OP_FAIL": "1"}):
-            with self.assertRaises(config.SecretError) as cm:
-                config.load_env(path)
-        self.assertIn("1Password", str(cm.exception))
-        self.assertIsInstance(cm.exception, config.ConfigError)
-
     def test_missing_token_file(self):
-        path = self.env_file("A=op://V/stack-a/mysql_password\n")
+        self.node_files()
         with patch.object(config, "OP_TOKEN_FILE", self.tmp / "absent"):
             with self.assertRaises(config.SecretError) as cm:
-                config.load_env(path)
+                config.refresh_cache()
         self.assertIn("service account token", str(cm.exception))
 
-    def test_stale_value_is_used_when_1password_is_down(self):
-        path = self.env_file("A=op://V/stack-a/mysql_password\n")
-        self.assertEqual(config.load_env(path)["A"], "db-pass-123")
-        with patch.object(config, "OP_CACHE_TTL", -1), patch.dict(os.environ, {"FAKE_OP_FAIL": "1"}):
-            self.assertEqual(config.load_env(path)["A"], "db-pass-123")
+    def test_secret_env_only_needs_what_compose_uses(self):
+        _, stack = self.node_files()
+        stack.write_text(stack.read_text() + "WP_ADMIN_PASSWORD=op://V/stack-a/not-there\n")
+        with self.assertRaises(config.SecretError):
+            config.refresh_cache()
+        # Seeded values for what compose interpolates are enough.
+        config._write_cache_json("secrets.json", {"values": {"op://V/stack-a/mysql_password": "db-pass-123",
+                                                             "op://V/stack-a/redis_password": "r"}, "sources": {}})
+        env = config.secret_env(stack, {"MYSQL_PASSWORD", "REDIS_PASSWORD"})
+        self.assertEqual(env, {"MYSQL_PASSWORD": "db-pass-123", "REDIS_PASSWORD": "r"})
 
-    def test_cf_accounts_get_resolved_tokens(self):
-        path = self.env_file("""\
-            CF_ACCOUNT_1_NAME=one
-            CF_ACCOUNT_1_ID=abc
-            CF_ACCOUNT_1_TOKEN=op://V/cloudflare-one/credential
-            """)
-        acct = config.cf_accounts(config.load_env(path))["one"]
-        self.assertEqual((acct.account_id, acct.token), ("abc", "cf-token-one"))
+    def test_boot_refresh_skips_a_fresh_cache(self):
+        self.node_files()
+        self.assertTrue(vault.refresh_boot(log=lambda m: None)["read"])
+        self.assertFalse(vault.refresh_boot(log=lambda m: None)["read"])
+        self.assertEqual(len(self.calls()), 1)
 
-    def test_runtime_dir_is_private(self):
-        path = self.env_file("A=op://V/stack-a/mysql_password\n")
-        config.load_env(path)
-        mode = stat.S_IMODE((self.tmp / "run").stat().st_mode)
-        self.assertEqual(mode, 0o700)
+    def test_boot_refresh_gives_up_quietly(self):
+        self.node_files()
+        with patch.dict(os.environ, {"FAKE_OP_FAIL": "1"}), patch.object(vault.time, "sleep"):
+            self.assertFalse(vault.refresh_boot(attempts=3, log=lambda m: None)["ok"])
+        self.assertEqual(len(self.calls()), 3)
+
+
+class AgentAlerts(OpTestCase):
+    def run_loop_once(self):
+        from wpops import agent
+        a = object.__new__(agent.Agent)
+        a._stop = SimpleNamespace(wait=lambda s: True)
+        a.node = lambda: "node1"
+        sent = []
+        with patch.object(agent.notify, "notify", side_effect=lambda kind, *a, **k: sent.append(kind)):
+            a.secrets_loop()
+        return sent
+
+    def test_alert_once_then_recovery_once(self):
+        self.node_files()
+        with patch.dict(os.environ, {"FAKE_OP_FAIL": "1"}):
+            self.assertEqual(self.run_loop_once(), ["secrets.unavailable"])
+            b = config.backoff_state()
+            config._write_cache_json("backoff.json", {**b, "next_try": 0})   # backoff elapsed
+            self.assertEqual(self.run_loop_once(), [])                       # still down: no second alert
+        config._write_cache_json("backoff.json", {**config.backoff_state(), "next_try": 0})
+        self.assertEqual(self.run_loop_once(), ["secrets.restored"])
+        self.assertEqual(self.run_loop_once(), [])
+        self.assertEqual(len(self.calls()), 3)                                # never on a timer once filled
 
 
 class ComposeEnvironment(OpTestCase):
-    def test_compose_gets_only_resolved_secrets_as_process_env(self):
-        stack = self.tmp / "stacks" / "a"
-        self.env_file("""\
-            COMPOSE_PROJECT_NAME=wps-a
-            HTTP_PORT=8081
-            MYSQL_PASSWORD="op://V/stack-a/mysql_password"
-            """, "stacks/a/.env")
-        origin = SimpleNamespace(name="n", stacks={"a": {"path": str(stack)}})
+    def run_compose(self, *args):
+        _, stack = self.node_files()
+        compose_file = self.repo / "docker-compose.stack.yml"
+        compose_file.write_text("services:\n  db:\n    environment:\n      P: ${MYSQL_PASSWORD}\n      R: $REDIS_PASSWORD\n")
+        stack.write_text(stack.read_text() + f"COMPOSE_FILE={compose_file}\nCOMPOSE_PROJECT_NAME=wps-a\n")
+        origin = SimpleNamespace(name="n", stacks={"a": {"path": str(stack.parent)}})
         seen = {}
         real_run = subprocess.run
         def fake_run(cmd, **kw):
@@ -169,11 +247,24 @@ class ComposeEnvironment(OpTestCase):
             return SimpleNamespace(returncode=0, stdout="", stderr="")
         with patch.object(stacks.subprocess, "run", side_effect=fake_run), \
              patch.dict(os.environ, {"COMPOSE_PROJECT_NAME": "other"}):
-            stacks.compose(origin, "a", "ps")
+            stacks.compose(origin, "a", *args)
+        return seen
+
+    def test_up_gets_resolved_secrets_as_process_env(self):
+        seen = self.run_compose("up", "-d")
         self.assertEqual(seen["MYSQL_PASSWORD"], "db-pass-123")
         self.assertNotIn("HTTP_PORT", seen)           # compose reads non-secrets from .env itself
         self.assertNotIn("COMPOSE_PROJECT_NAME", seen)
-        self.assertFalse(any(p.is_file() for p in (self.tmp / "run").rglob("*")))  # nothing on disk
+
+    def test_read_only_commands_never_touch_1password(self):
+        for args in (("ps",), ("exec", "-T", "wp-cron", "wp"), ("logs",), ("stop", "wp-cron"), ("config",)):
+            seen = self.run_compose(*args)
+            self.assertNotIn("MYSQL_PASSWORD", seen)
+        self.assertEqual(self.calls(), [])
+
+    def test_compose_variables(self):
+        self.run_compose("ps")
+        self.assertEqual(stacks.compose_variables(self.repo / "stacks" / "a"), {"MYSQL_PASSWORD", "REDIS_PASSWORD"})
 
 
 class TunnelFile(unittest.TestCase):
@@ -245,20 +336,25 @@ class SecretsCheck(OpTestCase):
             MYSQL_PASSWORD=op://V/stack-a/mysql_password
             WPOPS_SYNC_KEY_X=plain-key
             """)
-        r = vault.check_file(path)
+        r = vault.check_file(path, config.load_cache())
         self.assertEqual(r["plaintext_keys"], ["CF_ACCOUNT_1_TOKEN", "WPOPS_SYNC_KEY_X"])
         self.assertFalse(r["ok"])
         self.assertNotIn("plain-token", json.dumps(r))
 
-    def test_all_references_ok(self):
-        path = self.env_file("HTTP_PORT=8081\nMYSQL_PASSWORD=op://V/stack-a/mysql_password\n")
-        self.assertTrue(vault.check_file(path)["ok"])
-
-    def test_unresolvable_reference(self):
-        path = self.env_file("MYSQL_PASSWORD=op://V/nope/x\n")
-        r = vault.check_file(path)
+    def test_cache_states(self):
+        root, stack = self.node_files()
+        r = vault.check()
         self.assertFalse(r["ok"])
-        self.assertIn("op://V/nope/x", r["error"])
+        self.assertEqual({f["cache"] for f in r["files"]}, {"missing"})
+        self.assertEqual(self.calls(), [])                    # check reads the cache only
+        r = vault.check(fresh=True)
+        self.assertTrue(r["ok"])
+        self.assertEqual({f["cache"] for f in r["files"]}, {"fresh"})
+        stack.write_text(stack.read_text() + "WP_MODE=single\n")
+        r = vault.check()
+        self.assertTrue(r["ok"])
+        self.assertEqual(r["warnings"], 1)
+        self.assertNotIn("db-pass-123", json.dumps(r))
 
     def test_literal_tunnel_token_is_flagged(self):
         path = self.env_file(json.dumps({"services": {"cloudflared-a": {"environment": {"TUNNEL_TOKEN": "abc"}}}}),
@@ -291,7 +387,7 @@ class CfCommonScript(OpTestCase):
         return hashlib.sha256(value.encode()).hexdigest()[:16]
 
     def test_reference_is_read_with_op(self):
-        self.assertEqual(self.run_load_config({}), self.digest("cf-token-one"))
+        self.assertEqual(self.run_load_config({"WPOPS_RUNTIME_DIR": str(self.tmp / "empty")}), self.digest("cf-token-one"))
         self.assertEqual(self.calls(), ["read token=True"])
 
     def test_without_op_cli_preset_tokens_are_enough(self):
@@ -308,6 +404,12 @@ class CfCommonScript(OpTestCase):
         r = subprocess.run(["bash", "-c", script], env=dict(os.environ, CF_ACCOUNT_1_TOKEN="from-wpops"),
                            capture_output=True, text=True)
         self.assertEqual((r.returncode, r.stdout), (0, "from-wpops"), r.stderr)
+
+    def test_reference_is_read_from_the_wpops_cache(self):
+        config._write_cache_json("secrets.json", {"values": {"op://V/cloudflare-one/credential": "cached"},
+                                                  "sources": {}})
+        self.assertEqual(self.run_load_config({"WPOPS_RUNTIME_DIR": str(config.RUNTIME_DIR)}), self.digest("cached"))
+        self.assertEqual(self.calls(), [])
 
     def test_value_from_environment_wins(self):
         self.assertEqual(self.run_load_config({"CF_ACCOUNT_1_TOKEN": "from-wpops"}), self.digest("from-wpops"))

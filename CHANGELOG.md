@@ -2,6 +2,19 @@
 
 Versions are git tags (`vX.Y.Z`). This repo has no build; tags mark reviewed states of the stack and scripts.
 
+## [0.0.19] - 2026-11-03
+
+### Changed
+- 1Password is no longer read per command (wpops 0.2.11). 1Password limits service-account reads per hour and per day, and 0.0.17 read on every wpops process. Now one batched `op inject` call resolves every reference of the node's `.env` files into a root-only cache on tmpfs (`/run/wpops/cache/secrets.json`, 0600 in a 0700 directory; memory only, cleared at reboot). Every wpops process, the agent and the cf scripts read it. It is read again only when a `.env` file changes, a reference is missing, or `wpops secrets refresh` runs.
+- When 1Password cannot be read, cached values keep working (also when stale), so failover from a standby works during a 1Password outage or rate limit. Automatic attempts back off from 10 minutes to 1 hour.
+- Compose commands that do not create containers (`ps`, `logs`, `exec`, `stop`, `restart`, `config`, ...) get no secrets. Container-creating commands get only what is available, and refuse when a variable the compose files use is missing.
+- A failover continues when wp-cron cannot be started on a stack because a secret is unavailable; the log says why.
+
+### Added
+- `wpops-secrets.service`: fills the cache at boot before the agent (retries, never fails the boot). `install-agent.sh` installs and enables it.
+- The agent keeps the cache filled in the background, alerts once (`secrets.unavailable`) while secrets are missing and once when they are back (`secrets.restored`).
+- `wpops secrets refresh [--boot]`; `wpops secrets check` now reports the cache state per file without reading 1Password (`--fresh` refills first).
+
 ## [0.0.18] - 2026-11-03
 
 ### Fixed

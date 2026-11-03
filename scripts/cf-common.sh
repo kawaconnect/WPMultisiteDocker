@@ -54,9 +54,15 @@ check_deps() {
 # Config loading (.env based)
 # =============================================================================
 
-# Print the secret a 1Password reference points to (op CLI, service account).
+# Print the secret a 1Password reference points to: from the wpops cache on
+# tmpfs (filled by `wpops secrets refresh`), else with the op CLI (one read).
 op_read() {
     local token_file="${WPOPS_OP_TOKEN_FILE:-/etc/wpops/op-service-account-token}"
+    local cache="${WPOPS_RUNTIME_DIR:-/run/wpops}/cache/secrets.json" value
+    if [ -r "$cache" ] && command -v jq >/dev/null 2>&1; then
+        value=$(jq -r --arg r "$1" '.values[$r] // empty' "$cache" 2>/dev/null) || value=""
+        if [ -n "$value" ]; then printf '%s' "$value"; return 0; fi
+    fi
     command -v op >/dev/null 2>&1 || { log_error "op (1Password CLI) is not installed"; return 1; }
     if [ -n "${OP_SERVICE_ACCOUNT_TOKEN:-}" ]; then
         op read --no-newline "$1"

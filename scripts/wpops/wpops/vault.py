@@ -1,46 +1,42 @@
-"""`wpops secrets check`: are this node's secrets 1Password references, and do they resolve?
+"""`wpops secrets check|refresh`: 1Password references, the tmpfs cache, plaintext.
 
-Looks at the root .env, every stacks/<name>/.env and the tunnel connector
-project. Reports key names and counts only, never values.
+check looks at the root .env, every stacks/<name>/.env and the tunnel
+connector project, using the cache only (no 1Password reads unless --fresh).
+It reports key names and counts, never values.
 """
 
 from __future__ import annotations
 
 import json
 import re
+import time
 from pathlib import Path
 from typing import Any
 
-from .config import ENV_FILE, REPO_DIR, SecretError, _parse_env, clear_secret_cache, is_op_ref, resolve_refs
+from . import config
+from .config import REPO_DIR, SecretError, _parse_env, is_op_ref
 
 # Keys whose values are secrets. Everything else in .env (names, ids, ports,
 # hostnames, flags) is configuration and stays as plain text.
 SECRET_KEY_RE = re.compile(r"(PASSWORD|TOKEN|SECRET|_KEY(_|$)|PASS$|PASSPHRASE|CREDENTIAL)", re.I)
 
 
-def env_files() -> list[Path]:
-    files = [ENV_FILE] if ENV_FILE.exists() else []
-    stacks = REPO_DIR / "stacks"
-    if stacks.is_dir():
-        files += sorted(p for p in stacks.glob("*/.env") if not p.parent.name.startswith("_"))
-    return files
-
-
-def check_file(path: Path, resolve: bool = True) -> dict[str, Any]:
+def check_file(path: Path, cache: dict[str, Any]) -> dict[str, Any]:
     env = _parse_env(path)
     refs = {k: v for k, v in env.items() if is_op_ref(v)}
     plain = sorted(k for k, v in env.items() if SECRET_KEY_RE.search(k) and v and not is_op_ref(v))
-    out: dict[str, Any] = {"file": str(path), "refs": len(refs), "plaintext_keys": plain, "ok": not plain}
-    if resolve and refs:
-        try:
-            values = resolve_refs(set(refs.values()))
-            empty = sorted(k for k, v in refs.items() if not values.get(v))
-            if empty:
-                out["empty"] = empty
-                out["ok"] = False
-        except SecretError as exc:
-            out["error"] = str(exc)
-            out["ok"] = False
+    out: dict[str, Any] = {"file": str(path), "refs": len(refs), "plaintext_keys": plain}
+    missing = sorted(k for k, r in refs.items() if r not in cache["values"])
+    empty = sorted(k for k, r in refs.items() if r in cache["values"] and not cache["values"][r])
+    if refs:
+        out["cache"] = ("missing" if len(missing) == len(refs) else "incomplete" if missing
+                        else "fresh" if config.cache_fresh(path, cache) else "stale")
+    if missing:
+        out["not_cached"] = missing
+    if empty:
+        out["empty"] = empty
+    out["ok"] = not plain and not missing and not empty
+    out["warn"] = out.get("cache") == "stale"
     return out
 
 
@@ -61,9 +57,44 @@ def check_tunnels_file(path: Path | None = None) -> dict[str, Any]:
     return out
 
 
-def check(resolve: bool = True) -> dict[str, Any]:
-    if resolve:
-        clear_secret_cache()        # always ask 1Password, not this process's cache
-    files = [check_file(p, resolve) for p in env_files()]
+def check(fresh: bool = False) -> dict[str, Any]:
+    out: dict[str, Any] = {}
+    if fresh:
+        try:
+            out["refresh"] = config.refresh_cache()
+        except SecretError as exc:
+            out["refresh"] = {"error": str(exc)}
+    cache = config.load_cache()
+    files = [check_file(p, cache) for p in config.node_env_files()]
     tunnels = check_tunnels_file()
-    return {"ok": all(f["ok"] for f in files) and tunnels["ok"], "files": files, "tunnels": tunnels}
+    b = config.backoff_state()
+    out.update({
+        "ok": all(f["ok"] for f in files) and tunnels["ok"] and "error" not in out.get("refresh", {}),
+        "warnings": sum(1 for f in files if f["warn"]),
+        "cache": {"file": str(config.cache_dir() / "secrets.json"), "origin": cache.get("origin", "none"),
+                  "filled_at": cache.get("filled_at"), "values": len(cache["values"]),
+                  "last_error": b.get("error", ""), "next_try": b.get("next_try")},
+        "files": files, "tunnels": tunnels,
+    })
+    return out
+
+
+def refresh_boot(attempts: int = 3, first_delay: float = 30, log=print) -> dict[str, Any]:
+    """At boot: fill the cache if any file is not fresh, retrying with backoff.
+    Gives up quietly after `attempts`; the agent keeps retrying and alerts once."""
+    files = config.node_env_files()
+    if all(config.cache_fresh(p) for p in files if config.file_refs(p)):
+        log("secrets cache is fresh; 1Password not contacted")
+        return {"ok": True, "read": False}
+    delay = first_delay
+    for n in range(1, attempts + 1):
+        try:
+            r = config.refresh_cache(files)
+            log(f"secrets cache filled: {r['refs']} references from {r['files']} files (one 1Password call)")
+            return {"ok": True, "read": True, **r}
+        except SecretError as exc:
+            log(f"attempt {n}/{attempts}: {exc}")
+            if n < attempts:
+                time.sleep(delay)
+                delay *= 3
+    return {"ok": False}
