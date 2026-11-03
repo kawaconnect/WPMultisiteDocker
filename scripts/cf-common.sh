@@ -75,7 +75,7 @@ load_config() {
     fi
 
     # Secret values in .env are 1Password references (op://vault/item/field).
-    # A value already in the environment wins (cf-backup gets its tokens that
+    # A CF_* value already in the environment wins (cf-backup gets its tokens that
     # way from `wpops tunnels ensure`); other references are read with the op
     # CLI and the service account token in /etc/wpops/op-service-account-token.
     local -A _preset=()
@@ -90,8 +90,9 @@ load_config() {
     set +a
     CF_API="${CF_API_URL:-$CF_API}"
 
-    for _k in $(compgen -v); do
-        [[ "$_k" == _* ]] && continue
+    # Only the CF_* settings are used here; other references in .env (database
+    # passwords, sync keys) are left unresolved.
+    for _k in $(compgen -v CF_); do
         _v="${!_k-}"
         [[ "$_v" == op://* ]] || continue
         if [[ -n "${_preset[$_k]+set}" ]]; then

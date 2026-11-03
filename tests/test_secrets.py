@@ -274,6 +274,7 @@ class CfCommonScript(OpTestCase):
             CF_ACCOUNT_1_NAME=one
             CF_ACCOUNT_1_ID=abc
             CF_ACCOUNT_1_TOKEN=op://V/cloudflare-one/credential
+            MYSQL_PASSWORD=op://V/not-for-these-scripts/password
             """, "cf/.env")
         script = (f'source "{ROOT}/scripts/cf-common.sh"; ENV_FILE="{env_file}"; '
                   'load_config --read-only >/dev/null; '
@@ -292,6 +293,21 @@ class CfCommonScript(OpTestCase):
     def test_reference_is_read_with_op(self):
         self.assertEqual(self.run_load_config({}), self.digest("cf-token-one"))
         self.assertEqual(self.calls(), ["read token=True"])
+
+    def test_without_op_cli_preset_tokens_are_enough(self):
+        # The cf-backup container has no op CLI: only CF_* values are needed,
+        # and they come from the environment.
+        env_file = self.env_file("""\
+            CF_ACCOUNT_1_NAME=one
+            CF_ACCOUNT_1_ID=abc
+            CF_ACCOUNT_1_TOKEN=op://V/cloudflare-one/credential
+            MYSQL_PASSWORD=op://V/stack-a/mysql_password
+            """, "cf2/.env")
+        script = (f'source "{ROOT}/scripts/cf-common.sh"; ENV_FILE="{env_file}"; op_read() {{ return 1; }}; '
+                  'load_config --read-only >/dev/null && printf "%s" "$CF_ACCOUNT_1_TOKEN"')
+        r = subprocess.run(["bash", "-c", script], env=dict(os.environ, CF_ACCOUNT_1_TOKEN="from-wpops"),
+                           capture_output=True, text=True)
+        self.assertEqual((r.returncode, r.stdout), (0, "from-wpops"), r.stderr)
 
     def test_value_from_environment_wins(self):
         self.assertEqual(self.run_load_config({"CF_ACCOUNT_1_TOKEN": "from-wpops"}), self.digest("from-wpops"))

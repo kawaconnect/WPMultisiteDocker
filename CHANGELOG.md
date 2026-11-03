@@ -2,6 +2,11 @@
 
 Versions are git tags (`vX.Y.Z`). This repo has no build; tags mark reviewed states of the stack and scripts.
 
+## [0.0.18] - 2026-11-03
+
+### Fixed
+- cf-backup stopped with "op (1Password CLI) is not installed" on a node whose `.env` has other references besides the Cloudflare ones (database passwords, sync keys). `scripts/cf-*.sh` now resolve only `CF_*` values; cf-backup gets them from the environment. wpops 0.2.10.
+
 ## [0.0.17] - 2026-11-03
 
 ### Changed
