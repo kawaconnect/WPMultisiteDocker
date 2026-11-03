@@ -2,6 +2,18 @@
 
 Versions are git tags (`vX.Y.Z`). This repo has no build; tags mark reviewed states of the stack and scripts.
 
+## [0.0.17] - 2026-11-03
+
+### Changed
+- Secrets come from 1Password at runtime (wpops 0.2.9). In the root `.env` and every `stacks/<name>/.env`, a secret value can be an `op://<vault>/<item>/<field>` reference. wpops resolves the references of a file with one `op inject` call, using the read-only service account token in `/etc/wpops/op-service-account-token`, and keeps the values in memory only (15 minutes; values already read keep working while 1Password is unreachable). A reference that cannot be read gives a clear `1Password: ...` error.
+- Every compose call wpops makes gets the resolved secrets as process environment, so nothing is written to disk. Use `wpops stack compose <stack> ...` instead of a plain `docker compose` for anything that creates containers.
+- `docker-compose.wpops-tunnels.json` no longer contains tunnel tokens: connectors use `${TUNNEL_TOKEN_<ACCOUNT>}` and cf-backup `${CF_ACCOUNT_n_TOKEN}`, passed by `wpops tunnels ensure`. An account whose API call fails keeps its running connector untouched.
+- `scripts/cf-*.sh` resolve `op://` values with `op read`; a value already in the environment wins.
+
+### Added
+- `wpops secrets check [--no-resolve]`: every reference resolves, and no secret key (password, token, key) is left in plain text in the `.env` files or the tunnel compose file. Prints names and counts, never values.
+- docs/secrets.md: the 1Password layout, how compose gets the values, and what still holds secrets by design (Docker's container configuration, `wp-config.php`, backup sets).
+
 ## [0.0.16] - 2026-11-03
 
 ### Added

@@ -238,6 +238,27 @@ def cmd_tunnels(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_secrets(args: argparse.Namespace) -> int:
+    from . import vault
+    r = vault.check(resolve=not args.no_resolve)
+    lines = []
+    for f in r["files"]:
+        state_ = "ok" if f["ok"] else "PROBLEM"
+        extra = []
+        if f["plaintext_keys"]:
+            extra.append("plaintext: " + ",".join(f["plaintext_keys"]))
+        if f.get("empty"):
+            extra.append("empty: " + ",".join(f["empty"]))
+        if f.get("error"):
+            extra.append(f["error"])
+        lines.append(f"{state_:<8} {f['refs']:>3} refs  {f['file']}  {'; '.join(extra)}".rstrip())
+    t = r["tunnels"]
+    lines.append(f"{'ok' if t['ok'] else 'PROBLEM':<8} tunnels  {t['file']}  "
+                 + ("literal secrets: " + ",".join(t["literal_tokens"]) if t["literal_tokens"] else t.get("error", "no secrets in the file")))
+    _out(args, r, "\n".join(lines))
+    return 0 if r["ok"] else 1
+
+
 def cmd_stack(args: argparse.Namespace) -> int:
     from . import provision, registry
     from .stacks import compose
@@ -513,6 +534,9 @@ def build_parser() -> argparse.ArgumentParser:
     s = sub.add_parser("serve", help="run the HTTP agent"); s.add_argument("--bind", action="append", help="extra bind address"); s.set_defaults(fn=cmd_serve)
     s = sub.add_parser("notify", help="send a test notification"); s.add_argument("action", choices=["test"]); s.set_defaults(fn=cmd_notify)
     s = sub.add_parser("tunnels", help="per-account Cloudflare tunnels on this node"); s.add_argument("action", choices=["status", "ensure"]); s.add_argument("--no-start", action="store_true"); s.set_defaults(fn=cmd_tunnels)
+    s = sub.add_parser("secrets", help="check that .env secrets are 1Password references that resolve")
+    s.add_argument("action", choices=["check"]); s.add_argument("--no-resolve", action="store_true", help="only look for plaintext, do not ask 1Password")
+    s.set_defaults(fn=cmd_secrets)
     s = sub.add_parser("setup", help="first-time setup on this node"); s.add_argument("--node"); s.set_defaults(fn=cmd_setup)
     return p
 

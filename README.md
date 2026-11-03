@@ -229,6 +229,8 @@ scripts/wpops/bin/wpops setup --node node2        # config skeletons, host-alias
 scripts/wpops/bin/wpops token rotate                # agent bearer token (give it to the bot: /wp node add)
 scripts/wpops/install-agent.sh --bind 172.19.0.1   # systemd unit; bind the docker gateway so cloudflared reaches it
 wpops tunnels ensure                                # idle tunnel per Cloudflare account + docker-compose.tunnels.yml
+wpops secrets check                                 # .env secrets are 1Password op:// references that resolve (docs/secrets.md)
+wpops stack compose <stack> <args>                  # compose with the secrets resolved; never plain `docker compose up`
 wpops status [--live]  /  wpops sites --live       # node health, overrides, tunnels, backups / where DNS points
 wpops failover plan --sites a,b | --all [--to NODE] # dry run, shows refusals (no tunnel, foreign record, ...)
 wpops failover apply ... --yes                      # DNS -> tunnel CNAME, originals saved in state/overrides.json

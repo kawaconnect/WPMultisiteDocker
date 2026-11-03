@@ -244,7 +244,7 @@ def _stack_host(origin: Origin, name: str, facts: dict[str, Any] | None = None) 
     host = urllib.parse.urlsplit(home).hostname if home else ""
     if host:
         return host
-    env = load_env(Path(origin.stacks[name]["path"]) / ".env")
+    env = load_env(Path(origin.stacks[name]["path"]) / ".env", resolve=False)
     return env.get("WP_DOMAIN_CURRENT_SITE") or "localhost"
 
 

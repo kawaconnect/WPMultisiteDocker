@@ -8,7 +8,7 @@ import subprocess
 from pathlib import Path
 from typing import Any
 
-from .config import REPO_DIR, Origin
+from .config import REPO_DIR, Origin, secret_env
 
 PLUGIN_SRC = REPO_DIR / "plugin" / "kc-host-alias"
 
@@ -34,6 +34,10 @@ def compose(origin: Origin, name: str, *args: str, timeout: int | None = 3600, c
         if key.startswith('COMPOSE_'):
             env.pop(key)
     env.setdefault("COMPOSE_INTERACTIVE_NO_CLI", "1")
+    # Secrets in the stack's .env are 1Password references (op://...). Compose
+    # gets the resolved values as process environment, which takes precedence
+    # over the .env file in interpolation. Nothing is written to disk.
+    env.update(secret_env(path / ".env"))
     return subprocess.run(cmd, cwd=path, env=env, text=True, timeout=timeout, check=check,
                           capture_output=capture, input=input_text)
 

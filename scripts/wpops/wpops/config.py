@@ -3,7 +3,8 @@
 Files (all relative to the repo root, which is the directory holding
 docker-compose.yml):
 
-  .env                     secrets: CF_ACCOUNT_n_*, SMTP_*, WPOPS_* (never returned by the API)
+  .env                     CF_ACCOUNT_n_*, SMTP_*, WPOPS_*; secret values are op:// references
+                           to 1Password, resolved at runtime (never returned by the API)
   config/wpops.json        this node: name, agent bind/port, backup schedule, retention, notify
   config/inventory.json    origins and sites (per node, gitignored; same file on every node)
   state/                   overrides.json, jobs/, audit.log, token hash, schedule state
@@ -15,6 +16,9 @@ from __future__ import annotations
 import json
 import os
 import re
+import subprocess
+import threading
+import time
 import urllib.parse
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -34,7 +38,7 @@ class ConfigError(Exception):
     pass
 
 
-def load_env(path: Path = ENV_FILE) -> dict[str, str]:
+def _parse_env(path: Path) -> dict[str, str]:
     """Parse a docker-compose style .env (KEY=VALUE, optional quotes, # comments)."""
     env: dict[str, str] = {}
     if not path.exists():
@@ -54,9 +58,152 @@ def load_env(path: Path = ENV_FILE) -> dict[str, str]:
     return env
 
 
+# ------------------------------------------------------------------ 1Password
+#
+# A .env value of the form op://<vault>/<item>/<field> is a 1Password secret
+# reference. It is resolved at runtime with the 1Password CLI (`op`) and a
+# read-only service account token from OP_TOKEN_FILE. Resolved values live only
+# in this process's memory; they are never written to disk.
+
+OP_REF_PREFIX = "op://"
+OP_TOKEN_FILE = Path(os.environ.get("WPOPS_OP_TOKEN_FILE") or "/etc/wpops/op-service-account-token")
+OP_BIN = os.environ.get("WPOPS_OP_BIN") or "op"
+# Private runtime directory (tmpfs). The op CLI keeps its config here, so it
+# works under the agent's systemd sandbox (ProtectHome) as well.
+RUNTIME_DIR = Path(os.environ.get("WPOPS_RUNTIME_DIR") or "/run/wpops")
+OP_CACHE_TTL = 900          # seconds; a rotated secret is picked up within this time
+_op_cache: dict[str, tuple[float, str]] = {}
+_op_lock = threading.Lock()
+
+
+class SecretError(ConfigError):
+    """A 1Password reference could not be resolved."""
+
+
+def is_op_ref(value: str) -> bool:
+    return isinstance(value, str) and value.startswith(OP_REF_PREFIX)
+
+
+def _op_env() -> dict[str, str]:
+    env = {k: v for k, v in os.environ.items() if not k.startswith("OP_")}
+    token = os.environ.get("OP_SERVICE_ACCOUNT_TOKEN", "").strip()
+    if not token:
+        try:
+            token = OP_TOKEN_FILE.read_text(encoding="utf-8").strip()
+        except OSError as exc:
+            raise SecretError(f"1Password: cannot read the service account token {OP_TOKEN_FILE}: "
+                              f"{exc.strerror or exc}") from None
+    if not token:
+        raise SecretError(f"1Password: {OP_TOKEN_FILE} is empty")
+    env["OP_SERVICE_ACCOUNT_TOKEN"] = token
+    cfg_dir = RUNTIME_DIR / "op"
+    try:
+        RUNTIME_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
+        cfg_dir.mkdir(mode=0o700, exist_ok=True)
+        os.chmod(RUNTIME_DIR, 0o700)
+        env["OP_CONFIG_DIR"] = str(cfg_dir)
+    except OSError:
+        pass                    # op falls back to its default config directory
+    env["OP_CACHE"] = "false"
+    return env
+
+
+def _op_read(refs: list[str]) -> dict[str, str]:
+    """Resolve references with one `op inject` call (one `op read` each as fallback)."""
+    env = _op_env()
+    marker = "@@wpops-op-value@@"   # op inject drops control characters
+    template = "".join(f"{marker}{{{{ {r} }}}}\n" for r in refs)
+    try:
+        r = subprocess.run([OP_BIN, "inject"], input=template, env=env, capture_output=True,
+                           text=True, timeout=60)
+    except FileNotFoundError:
+        raise SecretError(f"1Password: the op CLI ({OP_BIN}) is not installed") from None
+    except subprocess.TimeoutExpired:
+        raise SecretError("1Password: op inject timed out (is 1Password reachable?)") from None
+    if r.returncode == 0:
+        parts = r.stdout.split(marker)[1:]
+        if len(parts) == len(refs) and all(p.endswith("\n") for p in parts):
+            return {ref: p[:-1] for ref, p in zip(refs, parts)}
+    elif len(refs) == 1:
+        raise SecretError(f"1Password: cannot resolve {refs[0]}: {_op_error(r.stderr)}")
+    out: dict[str, str] = {}
+    for ref in refs:
+        try:
+            r = subprocess.run([OP_BIN, "read", "--no-newline", ref], env=env, capture_output=True,
+                               text=True, timeout=60)
+        except subprocess.TimeoutExpired:
+            raise SecretError(f"1Password: op read {ref} timed out (is 1Password reachable?)") from None
+        if r.returncode != 0:
+            raise SecretError(f"1Password: cannot resolve {ref}: {_op_error(r.stderr)}")
+        out[ref] = r.stdout
+    return out
+
+
+def _op_error(stderr: str) -> str:
+    # op's messages name the reference, never its value; keep the last line only.
+    lines = [ln.strip() for ln in (stderr or "").splitlines() if ln.strip()]
+    return (lines[-1] if lines else "unknown error")[:300]
+
+
+def resolve_refs(refs: list[str] | set[str]) -> dict[str, str]:
+    """Resolve 1Password references (cached in memory for OP_CACHE_TTL seconds).
+
+    If 1Password cannot be reached when a cached value has expired, the cached
+    value is used, so a cloud outage does not stop a running agent."""
+    wanted = sorted(set(refs))
+    if not wanted:
+        return {}
+    now = time.monotonic()
+    with _op_lock:
+        missing = [r for r in wanted if r not in _op_cache or now - _op_cache[r][0] > OP_CACHE_TTL]
+        if missing:
+            try:
+                fresh = _op_read(missing)
+            except SecretError:
+                if any(r not in _op_cache for r in missing):
+                    raise
+                fresh = {}
+            for r, v in fresh.items():
+                _op_cache[r] = (now, v)
+        return {r: _op_cache[r][1] for r in wanted}
+
+
+def clear_secret_cache() -> None:
+    with _op_lock:
+        _op_cache.clear()
+
+
+def load_env(path: Path = ENV_FILE, resolve: bool = True) -> dict[str, str]:
+    """Parse a docker-compose style .env (KEY=VALUE, optional quotes, # comments).
+
+    With resolve=True, op://... values are replaced by the secrets they refer to
+    (1Password). resolve=False returns the references as written, for callers
+    that only need non-secret keys."""
+    env = _parse_env(path)
+    if resolve:
+        refs = {v for v in env.values() if is_op_ref(v)}
+        if refs:
+            values = resolve_refs(refs)
+            env = {k: values.get(v, v) if is_op_ref(v) else v for k, v in env.items()}
+    return env
+
+
+def secret_env(path: Path) -> dict[str, str]:
+    """Only the keys of a .env file that are 1Password references, resolved.
+
+    Passed as process environment to `docker compose`, where it takes precedence
+    over the file's op:// strings during interpolation."""
+    raw = _parse_env(path)
+    refs = {k: v for k, v in raw.items() if is_op_ref(v)}
+    if not refs:
+        return {}
+    values = resolve_refs(set(refs.values()))
+    return {k: values[v] for k, v in refs.items()}
+
+
 # Cloudflare API base URL. CF_API_URL (environment, else .env) points wpops at
 # a test double such as tests/e2e/fake_cloudflare.py; leave it unset in production.
-CF_API = (os.environ.get("CF_API_URL") or load_env().get("CF_API_URL")
+CF_API = (os.environ.get("CF_API_URL") or load_env(resolve=False).get("CF_API_URL")
           or "https://api.cloudflare.com/client/v4").rstrip("/")
 
 

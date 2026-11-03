@@ -54,16 +54,56 @@ check_deps() {
 # Config loading (.env based)
 # =============================================================================
 
+# Print the secret a 1Password reference points to (op CLI, service account).
+op_read() {
+    local token_file="${WPOPS_OP_TOKEN_FILE:-/etc/wpops/op-service-account-token}"
+    command -v op >/dev/null 2>&1 || { log_error "op (1Password CLI) is not installed"; return 1; }
+    if [ -n "${OP_SERVICE_ACCOUNT_TOKEN:-}" ]; then
+        op read --no-newline "$1"
+    elif [ -r "$token_file" ]; then
+        OP_SERVICE_ACCOUNT_TOKEN="$(tr -d '[:space:]' < "$token_file")" op read --no-newline "$1"
+    else
+        log_error "no 1Password service account token ($token_file)"
+        return 1
+    fi
+}
+
 load_config() {
     if [ ! -f "$ENV_FILE" ]; then
         log_error ".env not found. Copy .env.example to .env and fill in values."
         exit 1
     fi
 
+    # Secret values in .env are 1Password references (op://vault/item/field).
+    # A value already in the environment wins (cf-backup gets its tokens that
+    # way from `wpops tunnels ensure`); other references are read with the op
+    # CLI and the service account token in /etc/wpops/op-service-account-token.
+    local -A _preset=()
+    local _kv _k _v
+    while IFS= read -r -d '' _kv; do
+        _k="${_kv%%=*}"; _v="${_kv#*=}"
+        [[ "$_v" == op://* ]] || _preset["$_k"]="$_v"
+    done < <(env -0)
+
     set -a
     source "$ENV_FILE"
     set +a
     CF_API="${CF_API_URL:-$CF_API}"
+
+    for _k in $(compgen -v); do
+        [[ "$_k" == _* ]] && continue
+        _v="${!_k-}"
+        [[ "$_v" == op://* ]] || continue
+        if [[ -n "${_preset[$_k]+set}" ]]; then
+            printf -v "$_k" '%s' "${_preset[$_k]}"
+        elif ! _v=$(op_read "$_v"); then
+            log_error "cannot read $_k from 1Password (${!_k})"
+            exit 1
+        else
+            printf -v "$_k" '%s' "$_v"
+        fi
+        export "${_k?}"
+    done
 
     # Validate required CF vars
     if [ "${1:-}" != "--read-only" ] && [ -z "${CF_STANDBY_DOMAIN:-}" ]; then

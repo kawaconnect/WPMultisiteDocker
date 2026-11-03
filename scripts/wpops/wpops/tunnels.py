@@ -6,6 +6,13 @@
   - record the tunnel id in config/inventory.json under this node
   - generate a standalone docker-compose.wpops-tunnels.json connector project
     joined to every configured ingress network
+
+The compose file holds no secrets. Each connector reads TUNNEL_TOKEN from
+${TUNNEL_TOKEN_<ACCOUNT>} and cf-backup its Cloudflare API tokens from
+${CF_ACCOUNT_n_TOKEN}; `ensure` fetches the tunnel tokens from the Cloudflare API
+and passes all of them as process environment to `docker compose up`.
+Start or recreate the connectors with `wpops tunnels ensure`, never with a
+plain `docker compose up` (it would start them without tokens).
 """
 
 from __future__ import annotations
@@ -29,6 +36,7 @@ def ensure(start: bool = True, log=print) -> dict[str, Any]:
     origin = inv.origin(node)
     results: dict[str, Any] = {}
     tokens: list[tuple[str, str]] = []
+    kept: list[str] = []
     changed = False
     compose = REPO_DIR / "docker-compose.wpops-tunnels.json"
     try:
@@ -67,10 +75,10 @@ def ensure(start: bool = True, log=print) -> dict[str, Any]:
         except CfError as exc:
             log(f"{acct.name}: FAILED {exc}")
             results[acct.name] = {"ok": False, "error": str(exc)}
-            # A transient API error must not drop a working connector from the project.
-            old_token = ((previous.get(f"cloudflared-{acct.name}") or {}).get("environment") or {}).get("TUNNEL_TOKEN")
-            if old_token:
-                tokens.append((acct.name, old_token))
+            # A transient API error must not drop a working connector from the
+            # project: keep its service, and leave the running container alone.
+            if f"cloudflared-{acct.name}" in previous:
+                kept.append(acct.name)
                 log(f"{acct.name}: keeping the existing connector")
     if changed:
         raw = inv.raw
@@ -90,11 +98,12 @@ def ensure(start: bool = True, log=print) -> dict[str, Any]:
         if net not in [n["name"] for n in networks.values()]:
             networks[f"stack{len(networks)}"] = {"external": True, "name": net}
     services = {}
-    for name, token in tokens:
+    for name in sorted([n for n, _ in tokens] + kept):
         services[f"cloudflared-{name}"] = {
             "image": "cloudflare/cloudflared:2026.10.0", "restart": "unless-stopped",
             "networks": list(networks), "command": ["tunnel", "--no-autoupdate", "run"],
-            "environment": {"TUNNEL_TOKEN": token},
+            # Interpolated from the environment of `docker compose up` (see ensure).
+            "environment": {"TUNNEL_TOKEN": "${%s}" % token_var(name)},
             "logging": {"driver": "json-file", "options": {"max-size": "10m", "max-file": "3"}},
             "deploy": {"resources": {"limits": {"memory": "128M"}}},
         }
@@ -104,6 +113,9 @@ def ensure(start: bool = True, log=print) -> dict[str, Any]:
         "volumes": [f"{REPO_DIR}/scripts:/app/scripts:ro", f"{REPO_DIR}/config:/app/config:ro",
                     f"{REPO_DIR}/data/cloudflare/backups:/app/data/cloudflare/backups",
                     f"{REPO_DIR}/.env:/app/.env:ro"],
+        # .env holds 1Password references; cf-common.sh keeps these resolved values.
+        "environment": {f"CF_ACCOUNT_{a.index}_TOKEN": "${CF_ACCOUNT_%d_TOKEN}" % a.index
+                        for a in cf_accounts(env).values()},
         "entrypoint": ["/bin/sh", "-c"],
         "command": ["apk add --no-cache bash curl jq openssl && "
                     "ln -sf /bin/true /usr/local/bin/docker && "
@@ -111,13 +123,16 @@ def ensure(start: bool = True, log=print) -> dict[str, Any]:
         "logging": {"driver": "json-file", "options": {"max-size": "10m", "max-file": "3"}},
     }
     state.write_private_text(compose, json.dumps({"services": services, "networks": networks}, indent=2)+"\n")
-    log(f"wrote {compose} ({len(tokens)} connector(s))")
+    log(f"wrote {compose} ({len(tokens)} connector(s), no secrets in the file)")
     if start and tokens:
         from .provision import ensure_edge
         ensure_edge()
         child_env = {k: v for k, v in os.environ.items() if not k.startswith('COMPOSE_')}
+        child_env.update(compose_env(tokens, env))
+        # Only services whose tokens are known now; a kept connector keeps running as it is.
+        targets = [f"cloudflared-{n}" for n, _ in tokens] + ["cf-backup"]
         r = subprocess.run(["docker", "compose", "-p", f"wpops-{node}-tunnels", "-f", str(compose),
-                            "up", "-d", "--quiet-pull"], cwd=REPO_DIR, env=child_env,
+                            "up", "-d", "--quiet-pull", *targets], cwd=REPO_DIR, env=child_env,
                            capture_output=True, text=True, timeout=600)
         log((r.stdout + r.stderr).strip()[-800:])
         results["_compose"] = r.returncode
@@ -125,6 +140,20 @@ def ensure(start: bool = True, log=print) -> dict[str, Any]:
             results["_staging"] = publish_staging(log)
     state.audit("local", "tunnels.ensure", {k: v for k, v in results.items()})
     return results
+
+
+def token_var(account: str) -> str:
+    """Compose variable that carries an account's tunnel token: TUNNEL_TOKEN_<ACCOUNT>."""
+    return "TUNNEL_TOKEN_" + "".join(ch if ch.isalnum() else "_" for ch in account.upper())
+
+
+def compose_env(tokens: list[tuple[str, str]], env: dict[str, str]) -> dict[str, str]:
+    """Process environment for `docker compose up` of the connector project:
+    the tunnel tokens and the resolved Cloudflare API tokens for cf-backup."""
+    out = {token_var(name): token for name, token in tokens}
+    for a in cf_accounts(env).values():
+        out[f"CF_ACCOUNT_{a.index}_TOKEN"] = a.token
+    return out
 
 
 def publish_staging(log=print) -> dict[str, Any]:

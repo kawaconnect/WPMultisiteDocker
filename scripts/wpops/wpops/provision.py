@@ -76,7 +76,7 @@ def create(name: str, mode: str, domain: str, port: int, login_path: str = '',
         used_networks = set()
         for env in (REPO_DIR / 'stacks').glob('*/.env'):
             from .config import load_env
-            existing = load_env(env)
+            existing = load_env(env, resolve=False)
             used_networks.add(existing.get("STACK_NET"))
             if existing.get("HTTP_PORT") == str(port):
                 raise ConfigError(f'port {port} is already assigned to another stack')
@@ -120,7 +120,9 @@ def create(name: str, mode: str, domain: str, port: int, login_path: str = '',
         tmp = INVENTORY_FILE.with_suffix('.json.tmp')
         tmp.write_text(json.dumps(inv.raw, indent=2)+'\n')
         tmp.replace(INVENTORY_FILE)
-    return {'stack': name, **entry, 'login_path': slug, 'next': f'wpops stack init {name}'}
+    return {'stack': name, **entry, 'login_path': slug, 'next': f'wpops stack init {name}',
+            'secrets': f'{path / ".env"} holds generated passwords in plain text: store them in 1Password '
+                       'and replace them with op:// references (docs/secrets.md)'}
 
 
 def ensure_edge() -> str | None:

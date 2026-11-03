@@ -76,7 +76,7 @@ def loopback_port(origin: Origin, stack: str) -> int | None:
     st = origin.stacks[stack]
     if st.get("http_port"):
         return int(st["http_port"])
-    env = load_env(Path(st["path"]) / ".env")
+    env = load_env(Path(st["path"]) / ".env", resolve=False)
     if env.get("HTTP_PORT", "").isdigit():
         return int(env["HTTP_PORT"])
     return None if st.get("managed") else 8080

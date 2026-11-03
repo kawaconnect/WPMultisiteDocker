@@ -806,7 +806,9 @@ done
             self.assertTrue(tunnels.ensure(start=False,log=lambda _:None)['customer']['ok'])
             self.assertFalse(tunnels.ensure(start=False,log=lambda _:None)['customer']['ok'])
         doc=json.loads((self.root/'docker-compose.wpops-tunnels.json').read_text())
-        self.assertEqual(doc['services']['cloudflared-customer']['environment']['TUNNEL_TOKEN'],'token-1')
+        # The service stays; its token is never written to the file (it is passed at `up`).
+        self.assertEqual(doc['services']['cloudflared-customer']['environment']['TUNNEL_TOKEN'],'${TUNNEL_TOKEN_CUSTOMER}')
+        self.assertNotIn('token-1',(self.root/'docker-compose.wpops-tunnels.json').read_text())
 
     def test_cli_reports_cloudflare_errors_and_passes_compose_through(self):
         from wpops import __main__ as cli
