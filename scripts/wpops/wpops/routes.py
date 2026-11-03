@@ -16,9 +16,15 @@ def plan(inv, node, accounts=None):
     rows, refused, seen = [], [], set()
     for site in inv.sites:
         host = site.host_on(node)
-        if not site.enabled or not host:
+        if not host:
             continue
-        names = list(dict.fromkeys([host['host'], *(site.domains if site.primary == node else [])]))
+        # A staging name (host differs from the siteurl host) never carries
+        # production traffic, so it is published even while the site is
+        # disabled; `enabled: false` keeps gating production domains and failover.
+        staging = site.site_host_on(node) != host['host'].lower()
+        if not site.enabled and not staging:
+            continue
+        names = list(dict.fromkeys([host['host'], *(site.domains if site.enabled and site.primary == node else [])]))
         for domain in names:
             if domain in seen:
                 continue

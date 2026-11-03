@@ -330,6 +330,16 @@ class DeploymentTests(unittest.TestCase):
             p=routes.plan(inv,'backup',accounts)
         self.assertIn('one-backup.standby.example',{r['domain'] for r in p['routes']})
         self.assertNotIn('one.example',{r['domain'] for r in p['routes']})
+        # disabled (prepared, not cut over): the staging name is still published and
+        # aliased, production domains are not, even with this node as primary
+        self.raw['sites'][0].update(enabled=False,primary='backup');self.raw['sites'][2]['enabled']=False
+        inv=self.inventory();failover.write_aliases(inv,'backup')
+        self.assertEqual(read('one'),{'one-backup.standby.example':{'site':'one','host':'one.example'}})
+        with patch.object(routes,'Cloudflare',return_value=cf):
+            p=routes.plan(inv,'backup',accounts)
+        names={r['domain'] for r in p['routes']}
+        self.assertIn('one-backup.standby.example',names)
+        self.assertFalse(names & {'one.example','www.one.example','plain.standby.example'})
         self.raw['sites'][0]['hosts']['backup']['site_host']='not a host'
         with self.assertRaisesRegex(config.ConfigError,'invalid site_host'): self.inventory()
 

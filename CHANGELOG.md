@@ -2,6 +2,11 @@
 
 Versions are git tags (`vX.Y.Z`). This repo has no build; tags mark reviewed states of the stack and scripts.
 
+## [0.0.10] - 2026-11-03
+
+### Changed
+- Staging names (`host` different from `site_host`) are published by `wpops routes apply` and kept in the host-alias map even while the site has `enabled: false`. A prepared site can be checked at its staging name before cutover; `enabled: false` still keeps its production domains out of routes and failover (wpops 0.2.2).
+
 ## [0.0.9] - 2026-11-03
 
 ### Added

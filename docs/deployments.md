@@ -138,7 +138,10 @@ staging name and `site_host` to the siteurl host:
 to the stack) and writes it into the stack's host-alias map, so requests for the
 staging name are answered with staging URLs and nothing in the database
 changes. Failover and restore treat `site_host` as the stack's own hostname.
-Without `site_host`, `host` is the siteurl host, as before. All selected sites must have mappings for
+Without `site_host`, `host` is the siteurl host, as before.
+A staging name is published even while the site has `enabled: false`, so a
+prepared copy can be checked before cutover; its production domains stay out of
+routes and failover until the site is enabled. All selected sites must have mappings for
 the destination node. `--stack` on failover cannot bypass that mapping.
 
 For an existing root stack, configure its absolute `path`, `mode`, and

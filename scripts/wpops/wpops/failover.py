@@ -229,7 +229,7 @@ def write_aliases(inv: Inventory, this_node: str) -> dict[str, dict[str, Any]]:
 
     for site in inv.sites:
         host = site.host_on(this_node)
-        if not site.enabled or not host or host.get('stack') not in per_stack:
+        if not host or host.get('stack') not in per_stack:
             continue
         entry = {'site': site.slug, 'host': site.site_host_on(this_node)}
         if host.get('blog_id'):
@@ -238,7 +238,7 @@ def write_aliases(inv: Inventory, this_node: str) -> dict[str, dict[str, Any]]:
         # shop-node.standby.example for a stack whose siteurl is shop.example):
         # serve it as an alias so the database keeps the production URLs.
         add(host['stack'], host['host'], entry)
-        if site.primary == this_node:
+        if site.enabled and site.primary == this_node:
             for domain in site.domains:
                 add(host['stack'], domain, entry)
     for domain, ov in state.overrides().items():
