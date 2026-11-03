@@ -2,6 +2,11 @@
 
 Versions are git tags (`vX.Y.Z`). This repo has no build; tags mark reviewed states of the stack and scripts.
 
+## [0.0.13] - 2026-11-03
+
+### Fixed
+- Tests: the deployment tests stub the event log as well as notifications, so a pull in a test no longer writes to the repository's state/ directory (the 0.0.12 tag pipeline failed on this). wpops 0.2.5; no behaviour change from 0.0.12.
+
 ## [0.0.12] - 2026-11-03
 
 ### Changed

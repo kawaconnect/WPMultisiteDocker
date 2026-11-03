@@ -42,6 +42,7 @@ class DeploymentTests(unittest.TestCase):
         for obj in (provision,tunnels):
             self.patches.enter_context(patch.object(obj,'load_inventory',lambda: config.load_inventory(self.file)))
         self.patches.enter_context(patch('wpops.notify.notify'))
+        self.patches.enter_context(patch('wpops.notify.record_event'))
         # Tests must not depend on which loopback ports this machine happens to use.
         self.patches.enter_context(patch.object(provision,'port_in_use',return_value=False))
 
