@@ -97,16 +97,10 @@ def ensure(start: bool = True, log=print) -> dict[str, Any]:
         net = st.get("ingress_network") or f"{compose_project(st)}_frontend"
         if net not in [n["name"] for n in networks.values()]:
             networks[f"stack{len(networks)}"] = {"external": True, "name": net}
+    protocol = tunnel_protocol(cfg)
     services = {}
     for name in sorted([n for n, _ in tokens] + kept):
-        services[f"cloudflared-{name}"] = {
-            "image": "cloudflare/cloudflared:2026.10.0", "restart": "unless-stopped",
-            "networks": list(networks), "command": ["tunnel", "--no-autoupdate", "run"],
-            # Interpolated from the environment of `docker compose up` (see ensure).
-            "environment": {"TUNNEL_TOKEN": "${%s}" % token_var(name)},
-            "logging": {"driver": "json-file", "options": {"max-size": "10m", "max-file": "3"}},
-            "deploy": {"resources": {"limits": {"memory": "128M"}}},
-        }
+        services[f"cloudflared-{name}"] = connector_service(name, list(networks), protocol)
     services["cf-backup"] = {
         # Not on the edge network: only connectors may send CF-Connecting-IP there.
         "image": "alpine:3.23", "restart": "unless-stopped",
@@ -140,6 +134,33 @@ def ensure(start: bool = True, log=print) -> dict[str, Any]:
             results["_staging"] = publish_staging(log)
     state.audit("local", "tunnels.ensure", {k: v for k, v in results.items()})
     return results
+
+
+PROTOCOLS = ("", "auto", "http2", "quic")
+
+
+def tunnel_protocol(cfg: dict[str, Any]) -> str:
+    """The node's cloudflared transport from config/wpops.json tunnels.protocol ("" = cloudflared default)."""
+    from .config import ConfigError
+    value = str((cfg.get("tunnels") or {}).get("protocol") or "").strip().lower()
+    if value not in PROTOCOLS:
+        raise ConfigError(f"tunnels.protocol must be one of auto, http2, quic (got {value!r})")
+    return value
+
+
+def connector_service(account: str, networks: list[str], protocol: str = "") -> dict[str, Any]:
+    """Compose service for one account's connector. Holds no secrets."""
+    # Interpolated from the environment of `docker compose up` (see ensure).
+    environment = {"TUNNEL_TOKEN": "${%s}" % token_var(account)}
+    if protocol:
+        environment["TUNNEL_TRANSPORT_PROTOCOL"] = protocol
+    return {
+        "image": "cloudflare/cloudflared:2026.10.0", "restart": "unless-stopped",
+        "networks": networks, "command": ["tunnel", "--no-autoupdate", "run"],
+        "environment": environment,
+        "logging": {"driver": "json-file", "options": {"max-size": "10m", "max-file": "3"}},
+        "deploy": {"resources": {"limits": {"memory": "128M"}}},
+    }
 
 
 def token_var(account: str) -> str:

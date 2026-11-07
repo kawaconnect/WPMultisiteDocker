@@ -358,6 +358,9 @@ def _read_json(path: Path, default: Any) -> Any:
 
 
 NODE_DEFAULTS: dict[str, Any] = {
+    # cloudflared transport: "" or "auto" (QUIC, falling back to HTTP/2), "http2" or "quic".
+    # Use "http2" on nodes whose network drops idle UDP flows (QUIC connections keep timing out).
+    "tunnels": {"protocol": ""},
     "node": "",                      # this node's origin name in the inventory (required)
     "agent": {
         "bind": ["127.0.0.1"],       # extra addresses are added at start (docker gateway)
