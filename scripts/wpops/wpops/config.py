@@ -383,6 +383,7 @@ NODE_DEFAULTS: dict[str, Any] = {
         # Subset of plugins, themes, uploads, others, wpcore; [] = source defaults.
         "entities": ["plugins", "themes", "uploads", "others"],
         "auto_apply": False,              # never applied automatically unless true (per design)
+        "paused": [],                     # sources temporarily skipped by scheduled pulls (e.g. while editing a standby copy); resume to re-enable
     },
     "disk": {
         "min_free_gb": 10,                # alert + refuse pulls/restores below this much free space

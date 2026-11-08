@@ -161,6 +161,17 @@ def cmd_backup(args: argparse.Namespace) -> int:
             info = bk.schedule_info()
         _out(args, info, json.dumps(info, indent=2, default=str))
         return 0
+    if args.action in ("pause", "resume"):
+        names = [x.strip() for x in (args.sources or args.source or "").split(",") if x.strip()]
+        if not names:
+            print("pause/resume needs --source <name> (or --sources a,b)", file=sys.stderr)
+            return 2
+        unknown = [x for x in names if x not in inv.sources()]
+        if unknown:
+            raise ConfigError(f"unknown backup sources: {', '.join(unknown)} (see wpops backup sources)")
+        info = bk.pause_sources(names, paused=(args.action == "pause"))
+        _out(args, info, f"paused sources: {', '.join(info.get('paused') or []) or '(none)'}")
+        return 0
     if args.action == "keep":
         man = bk.mark_keep(args.set, not args.unkeep)
         _out(args, man, f"{args.set}: keep={man['keep']}")
@@ -527,8 +538,8 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--yes", action="store_true")
     s.set_defaults(fn=cmd_failover)
 
-    s = sub.add_parser("backup", help="pull/list/prune/schedule backup sets")
-    s.add_argument("action", choices=["sources", "list", "pull", "prune", "schedule", "keep", "delete"])
+    s = sub.add_parser("backup", help="pull/list/prune/schedule/pause/resume backup sets")
+    s.add_argument("action", choices=["sources", "list", "pull", "prune", "schedule", "pause", "resume", "keep", "delete"])
     s.add_argument("--source"); s.add_argument("--label"); s.add_argument("--latest", action="store_true", help="pull the newest existing set instead of creating one")
     s.add_argument("--nonce", help="pull a specific existing set"); s.add_argument("--retain", type=int); s.add_argument("--dry-run", action="store_true")
     s.add_argument("--set", help="schedule spec (weekly:sun:03:30|daily:03:30|off) or set ref for keep/delete")

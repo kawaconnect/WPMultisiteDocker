@@ -506,6 +506,7 @@ def schedule_info() -> dict[str, Any]:
     st = state.read_json(SCHEDULE_STATE, {})
     return {
         "schedule": cfg.get("schedule"), "retain_sets": cfg.get("retain_sets"), "sources": cfg.get("sources"),
+        "paused": cfg.get("paused", []),
         "auto_apply": cfg.get("auto_apply", False), "last_run": st.get("last_run"), "last_result": st.get("last_result"),
         "next_run": next_run(cfg.get("schedule", "off")),
     }
@@ -522,6 +523,24 @@ def set_schedule(schedule: str | None = None, retain: int | None = None, sources
         cfg["backup"]["retain_sets"] = retain
     if sources is not None:
         cfg["backup"]["sources"] = sources
+    save_node_config(cfg)
+    return schedule_info()
+
+
+def pause_sources(names: list[str], paused: bool = True) -> dict[str, Any]:
+    """Add or remove sources from the paused set. A paused source is skipped by
+    scheduled pulls (and the auto_apply that would follow), so a standby copy can
+    be edited without the next scheduled pull overwriting it. A manual
+    `backup pull --source <name>` still works and never auto-applies, so pausing
+    does not block a deliberate one-off pull. Resume to put it back on the schedule."""
+    cfg = node_config()
+    cur = list(cfg["backup"].get("paused") or [])
+    for n in names:
+        if paused and n not in cur:
+            cur.append(n)
+        elif not paused and n in cur:
+            cur.remove(n)
+    cfg["backup"]["paused"] = cur
     save_node_config(cfg)
     return schedule_info()
 
@@ -551,7 +570,8 @@ def mark_run(result: dict[str, Any]) -> None:
 def sources_to_pull(inv: Inventory) -> list[str]:
     cfg = node_config()["backup"]
     wanted = cfg.get("sources") or list(inv.sources())
-    return [s for s in wanted if s in inv.sources()]
+    paused = set(cfg.get("paused") or [])
+    return [s for s in wanted if s in inv.sources() and s not in paused]
 
 
 def auto_apply_target(inv: Inventory, source: str, this_node: str) -> tuple[str, str] | None:
