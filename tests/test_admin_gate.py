@@ -136,6 +136,18 @@ class Apply(Base):
         self.assertEqual(legacy.read_text(), "old gate")
         self.assertFalse((self.root / "shop/nginx" / gate.CONF).exists())
 
+    def test_node_without_the_gate_leaves_a_hand_installed_gate_alone(self):
+        legacy = self.root / "shop/nginx/kc-authentik-gate.conf"
+        legacy.write_text("hand installed")
+        (self.root / "fresh/nginx" / gate.CONF).write_text("ours, from when the gate was on")
+        off = {"node": "n1", "admin_gate": {"enabled": False, "auth_url": "https://auth.example.net"}}
+        with patch.object(gate, "compose") as c, patch.object(gate, "_nginx_running", return_value=False):
+            r = gate.apply(self.inv, off)
+        self.assertEqual(r["changed"], ["fresh"])
+        self.assertEqual(legacy.read_text(), "hand installed")
+        self.assertFalse((self.root / "fresh/nginx" / gate.CONF).exists())
+        c.assert_not_called()
+
     def test_stopped_stack_gets_files_without_nginx_calls(self):
         r, calls = self.run_apply(running=False)
         self.assertEqual(calls, [])

@@ -102,6 +102,7 @@ stack's Nginx whether or not the gate is on.
 ## Moving from a hand-installed gate
 
 Stacks that carry `kc-authentik-gate.conf` / `kc-gate-php.inc` from the earlier external tool are switched by
-`wpops gate apply`: it writes its own two files and removes those in the same step, tests, and reloads. A stack
-that is not gated under the node's configuration has them removed as well, so set the flags of exempt stacks
-(`wpops stack gate <name> off`) or leave `enabled` false until you have decided.
+`wpops gate apply` once the node has `"enabled": true`: it writes its own two files and removes those in the same
+step, tests, and reloads. On such a node a stack that is not gated under the configuration has them removed as
+well, so set the flags of exempt stacks first (`wpops stack gate <name> off`). While `enabled` is false wpops
+leaves those hand-installed files alone; upgrading wpops never removes a gate by itself.

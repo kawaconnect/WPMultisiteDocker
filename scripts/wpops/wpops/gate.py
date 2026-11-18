@@ -232,9 +232,15 @@ def desired_files(inv: Inventory, node: str, name: str, cfg: dict[str, Any]) -> 
     return {CONF: render(hosts, settings(cfg), login_slugs(path)), PHP_INC: PHP_INC_TEXT}, hosts
 
 
-def _current(nginx: Path) -> dict[str, str]:
+def _owned(cfg: dict[str, Any]) -> tuple[str, ...]:
+    """Files wpops manages in a stack's nginx/ folder. The earlier hand-installed gate is taken over only on a
+    node that has switched the admin gate on: an upgrade alone must never remove a gate somebody installed."""
+    return (CONF, PHP_INC, *LEGACY) if settings(cfg)["enabled"] else (CONF, PHP_INC)
+
+
+def _current(nginx: Path, owned: tuple[str, ...]) -> dict[str, str]:
     out = {}
-    for f in (CONF, PHP_INC, *LEGACY):
+    for f in owned:
         try:
             out[f] = (nginx / f).read_text(encoding="utf-8")
         except OSError:
@@ -242,9 +248,9 @@ def _current(nginx: Path) -> dict[str, str]:
     return out
 
 
-def _write(nginx: Path, files: dict[str, str]) -> None:
+def _write(nginx: Path, files: dict[str, str], owned: tuple[str, ...]) -> None:
     nginx.mkdir(exist_ok=True)
-    for f in (CONF, PHP_INC, *LEGACY):
+    for f in owned:
         if f not in files:
             (nginx / f).unlink(missing_ok=True)
     # The PHP include before the file that includes it, so a reload in between never sees a dangling include.
@@ -269,7 +275,7 @@ def status(inv: Inventory | None = None, cfg: dict[str, Any] | None = None) -> l
         row: dict[str, Any] = {"stack": name, "gated": False, "state": "off", "canonical": "", "hosts": []}
         try:
             files, hosts = desired_files(inv, node, name, cfg)
-            current = _current(stack_path(origin, name) / "nginx")
+            current = _current(stack_path(origin, name) / "nginx", _owned(cfg))
             row.update(gated=bool(files), canonical=hosts["canonical"], hosts=hosts["gated"])
             if files:
                 row["state"] = ("ok" if current == files else "missing" if CONF not in current else "outdated")
@@ -302,14 +308,15 @@ def apply(inv: Inventory | None = None, cfg: dict[str, Any] | None = None, only:
                 continue
             result["gated"] += 1 if files else 0
             with state.locked(f"gate-{name}"):
-                before = _current(nginx)
+                owned = _owned(cfg)
+                before = _current(nginx, owned)
                 if before == files:
                     continue
-                _write(nginx, files)
+                _write(nginx, files, owned)
                 if _nginx_running(origin, name):
                     t = compose(origin, name, "exec", "-T", "nginx", "nginx", "-t", check=False, timeout=60)
                     if t.returncode:
-                        _write(nginx, before)
+                        _write(nginx, before, owned)
                         raise ConfigError("nginx -t failed, previous files restored: "
                                           + (t.stderr or t.stdout or "").strip()[-300:])
                     r = compose(origin, name, "exec", "-T", "nginx", "nginx", "-s", "reload", check=False, timeout=60)
