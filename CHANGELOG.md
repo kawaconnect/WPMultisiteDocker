@@ -2,6 +2,18 @@
 
 Versions are git tags (`vX.Y.Z`). This repo has no build; tags mark reviewed states of the stack and scripts.
 
+## [0.0.20] - 2026-11-18
+
+### Added
+- Admin gate (wpops 0.2.12, docs/admin-gate.md): WordPress admin and login behind Authentik forward auth, owned by wpops. Node setting `admin_gate` in `config/wpops.json` (`enabled`, `auth_url`, `default`), per-stack inventory flag `admin_gate`. wpops writes `stacks/<name>/nginx/admin-gate.conf` for every gated managed stack: when a stack is created, when host aliases are rewritten, after a restore, when a custom login path is set, and from the agent every 10 minutes, so a new or rebuilt stack is never without it. A changed file is tested with `nginx -t` before the reload; a failed test puts the previous files back.
+- `wpops gate status | apply | hosts` and `wpops stack gate <name> on|off|default`. `gate hosts` lists the host names that need a forward-auth provider; wpops itself holds no Authentik credentials.
+- The gate also covers `/wp-login.php` of subdirectory blogs and custom login paths (`wpops stack login`).
+- `wpops backup pause|resume --source` (0.0.19 follow-up, already on the nodes): a paused source is skipped by scheduled pulls.
+- OpenSpec (`openspec/`): changes to this repo start as a proposal there.
+
+### Changed
+- Off by default. A node that does not set `admin_gate.enabled` behaves as before. Files of the earlier hand-installed gate (`kc-authentik-gate.conf`, `kc-gate-php.inc`) are replaced or removed by `wpops gate apply`.
+
 ## [0.0.19] - 2026-11-03
 
 ### Changed

@@ -381,6 +381,12 @@ This restores the normal WordPress login. Re-enable the policy after correcting
 the configured slug. This feature is not an authentication replacement; normal
 WordPress user permissions continue to apply.
 
+### Single sign-on in front of admin and login
+
+A custom login path hides the login form; the [admin gate](admin-gate.md) goes further and serves
+`/wp-admin/`, `/wp-login.php` and the custom path only to people signed in at Authentik. The two work
+together: with the gate on, the custom path is gated as well.
+
 ## 7. Site registry and monitoring
 
 Every stack and every blog of a multisite stack is tracked by the agent

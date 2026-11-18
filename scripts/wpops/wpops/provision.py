@@ -120,7 +120,11 @@ def create(name: str, mode: str, domain: str, port: int, login_path: str = '',
         tmp = INVENTORY_FILE.with_suffix('.json.tmp')
         tmp.write_text(json.dumps(inv.raw, indent=2)+'\n')
         tmp.replace(INVENTORY_FILE)
+    # Gated from the first start on nodes that gate by default (docs/admin-gate.md).
+    from . import gate
+    gated = gate.apply_quietly(only=[name])
     return {'stack': name, **entry, 'login_path': slug, 'next': f'wpops stack init {name}',
+            'admin_gate': ('failed: ' + gated['failed'][name]) if name in gated['failed'] else bool(gated['gated']),
             'secrets': f'{path / ".env"} holds generated passwords in plain text: store them in 1Password '
                        'and replace them with op:// references (docs/secrets.md)'}
 
@@ -216,6 +220,9 @@ def set_login(name: str, slug: str, blog_id: int | None = None) -> dict:
             f.write('\n')
         tmp.replace(file)
         write_login_locations(path, policy)
+    # A custom login path is gated like /wp-login.php.
+    from . import gate
+    gate.apply_quietly(only=[name])
     return {'stack': name, 'blog_id': blog_id, 'login_path': slug,
             'next': f'wpops stack compose {name} exec -T nginx nginx -s reload (if running)'}
 
@@ -257,6 +264,8 @@ def install_runtime(origin, name: str) -> None:
     source = path / 'managed-plugins' / 'wps-hide-login'
     if (source / 'wps-hide-login.php').exists():
         shutil.copytree(source, wp_content(origin, name) / 'plugins' / 'wps-hide-login', dirs_exist_ok=True)
+    from . import gate
+    gate.apply_quietly(only=[name])
 
 
 def remove(name: str, detach_sites: bool = False, keep_files: bool = False) -> dict:

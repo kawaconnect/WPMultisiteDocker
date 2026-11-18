@@ -272,6 +272,9 @@ def write_aliases(inv: Inventory, this_node: str) -> dict[str, dict[str, Any]]:
             f.chmod(0o644)
         except OSError:
             pass
+    # Host names changed: the admin gate lists them (never fails the caller).
+    from . import gate
+    gate.apply_quietly()
     return per_stack
 
 

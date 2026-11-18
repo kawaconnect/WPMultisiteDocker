@@ -408,9 +408,21 @@ class Agent:
         keys when due, in a thread of their own (WP-CLI and disk walks are slow)."""
         facts_thread: threading.Thread | None = None
         last_error = ""
+        gate_next = 0.0
+        gate_failed: dict[str, str] = {}
         while True:
             try:
                 cfg = node_config()
+                # Admin gate: put back a missing or outdated gate file (cheap: compares files).
+                if time.monotonic() >= gate_next:
+                    gate_next = time.monotonic() + 60 * max(1, int((cfg.get("admin_gate") or {}).get("check_interval_min") or 10))
+                    from . import gate
+                    g = gate.apply(cfg=cfg)
+                    # A failure that lasts is reported once, not at every pass.
+                    seen, gate_failed = (g["changed"] or g["failed"] != gate_failed), g["failed"]
+                    if seen:
+                        notify.record_event("gate.failed" if g["failed"] else "gate.repaired",
+                                            {"changed": g["changed"], "failed": g["failed"]})
                 if (cfg.get("registry") or {}).get("enabled", True):
                     registry.refresh_health()
                     due = sorted(set(registry.facts_due(cfg)) | set(registry.enrolment_due(cfg)))

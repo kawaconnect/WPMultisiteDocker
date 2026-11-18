@@ -403,6 +403,14 @@ NODE_DEFAULTS: dict[str, Any] = {
         # rollback stops it again once no domain of that stack is served here.
         "cron_follows_traffic": False,
     },
+    # Admin gate: WordPress admin and login only after an Authentik outpost accepts the request
+    # (docs/admin-gate.md). Per stack, the inventory flag `admin_gate` (true/false) overrides `default`.
+    "admin_gate": {
+        "enabled": False,                 # false = no stack is gated and existing gate files are removed
+        "auth_url": "",                   # https://<Authentik host> whose embedded outpost answers forward auth
+        "default": True,                  # managed stacks without their own flag: gated (true) or not (false)
+        "check_interval_min": 10,         # the agent rewrites a missing or outdated gate file this often
+    },
     "registry": {
         "enabled": True,                  # keep the site registry (GET /v1/registry) up to date
         "facts_interval_min": 360,        # WP/PHP/plugin versions, blogs and disk usage (WP-CLI, du)
@@ -576,6 +584,8 @@ def _validate_inventory(inv: Inventory) -> None:
                 raise ConfigError(f"origin '{o.name}': invalid stack name or mode: {name}")
             if not st.get("path") or not Path(st["path"]).is_absolute():
                 raise ConfigError(f"stack '{name}': path must be absolute")
+            if "admin_gate" in st and not isinstance(st["admin_gate"], bool):
+                raise ConfigError(f"stack '{name}': admin_gate must be true or false")
         if o.staging_suffix and not _SLUG_RE.fullmatch(o.staging_suffix.lower()):
             raise ConfigError(f"origin '{o.name}': staging_suffix must be a lower-case slug")
         if o.standby_domain and not _HOST_RE.fullmatch(o.standby_domain.lower()):

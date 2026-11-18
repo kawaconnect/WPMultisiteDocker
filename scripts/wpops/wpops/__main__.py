@@ -305,6 +305,9 @@ def cmd_stack(args: argparse.Namespace) -> int:
         result = provision.remove(args.name, detach_sites=args.detach_sites, keep_files=args.keep_files)
     elif args.action == 'login':
         result = provision.set_login(args.name, args.path, args.blog_id)
+    elif args.action == 'gate':
+        from . import gate
+        result = gate.set_stack(args.name, {'on': True, 'off': False, 'default': None}[args.state])
     else:
         inv, cfg = load_inventory(), node_config()
         origin = inv.origin(cfg['node'])
@@ -324,6 +327,26 @@ def cmd_stack(args: argparse.Namespace) -> int:
             result = {'stack': args.name, 'output': r.stdout.strip()}
     _out(args, result)
     return 0
+
+
+def cmd_gate(args: argparse.Namespace) -> int:
+    """Admin gate (docs/admin-gate.md): status, apply, hosts."""
+    from . import gate
+    if args.action == 'apply':
+        r = gate.apply(only=[args.stack] if args.stack else None)
+        _out(args, r, f"gated stacks: {r['gated']}; changed: {', '.join(r['changed']) or 'none'}"
+             + ''.join(f"\nFAILED {n}: {e}" for n, e in r['failed'].items()))
+        return 1 if r['failed'] else 0
+    if args.action == 'hosts':
+        rows = gate.hosts()
+        _out(args, rows, '\n'.join(h for r in rows for h in r['hosts']))
+        return 0
+    rows = gate.status()
+    g = gate.settings(node_config())
+    head = f"admin gate: {'enabled, ' + g['auth_url'] if g['enabled'] else 'disabled on this node'}"
+    _out(args, rows, '\n'.join([head] + [f"{r['stack']:<28} {r['state']:<10} {', '.join(r['hosts']) or r.get('error', '')}"
+                                           for r in rows]))
+    return 1 if any(r['state'] in ('missing', 'outdated', 'to-remove', 'error') for r in rows) else 0
 
 
 def _health_flag(h: dict[str, Any]) -> str:
@@ -480,6 +503,9 @@ def build_parser() -> argparse.ArgumentParser:
     s = actions.add_parser('login', help='configure the default or a multisite blog login slug')
     s.add_argument('name'); s.add_argument('--path', required=True); s.add_argument('--blog-id', type=int)
     s.set_defaults(fn=cmd_stack)
+    s = actions.add_parser('gate', help='admin gate for one stack: on, off, or follow the node default')
+    s.add_argument('name'); s.add_argument('state', choices=['on', 'off', 'default'])
+    s.set_defaults(fn=cmd_stack)
     s = actions.add_parser('remove', help='stop and unregister a stack (data is kept; DNS is not touched)')
     s.add_argument('name'); s.add_argument('--yes', action='store_true')
     s.add_argument('--detach-sites', action='store_true', help="also unmap sites that use it on this node")
@@ -492,6 +518,15 @@ def build_parser() -> argparse.ArgumentParser:
         if action == 'compose':
             s.add_argument('args', nargs=argparse.REMAINDER)
         s.set_defaults(fn=cmd_stack)
+
+    gt = sub.add_parser('gate', help='admin gate: WordPress admin and login behind Authentik forward auth')
+    ga = gt.add_subparsers(dest='action', required=True)
+    s = ga.add_parser('status', help='per stack: gated or not, files current (exit 1 when something needs apply)')
+    s.set_defaults(fn=cmd_gate)
+    s = ga.add_parser('apply', help='write or remove gate files to match the configuration; test and reload Nginx')
+    s.add_argument('--stack'); s.set_defaults(fn=cmd_gate)
+    s = ga.add_parser('hosts', help='host names that each need a forward-auth provider in Authentik')
+    s.set_defaults(fn=cmd_gate)
 
     s = sub.add_parser("status", help="node status"); s.add_argument("--live", action="store_true", help="also query Cloudflare DNS"); s.set_defaults(fn=cmd_status)
     s = sub.add_parser('routes', help='publish native primary and standby hosts without taking over foreign DNS')
