@@ -24,6 +24,31 @@ PHP_INC = "admin-gate-php.inc"
 # Files of the external tool this feature replaces; removed when wpops writes or removes its own.
 LEGACY = ("kc-authentik-gate.conf", "kc-gate-php.inc")
 OUTPOST = "/outpost.goauthentik.io"
+# Entry point for the one public use of wp-login.php on a gated site (unlocking a password-protected post).
+# It lives in wp-content next to the host-alias files and is reached only through the gate's own location.
+POSTPASS = "wpops-postpass.php"
+POSTPASS_TEXT = """<?php
+/*
+ * Managed by wpops (admin gate). Do not edit: `wpops gate apply` rewrites this file.
+ *
+ * On a gated site wp-login.php is served only after sign-in. The one thing visitors still need from it is
+ * unlocking a password-protected post. Nginx sends exactly that request (POST, query string action=postpass)
+ * here. WordPress takes its action from the request data, where a body field would override the query string,
+ * so everything except the post password is dropped before wp-login.php runs: this entry point can do nothing
+ * but check a post password.
+ */
+if ( 'POST' !== ( isset( $_SERVER['REQUEST_METHOD'] ) ? $_SERVER['REQUEST_METHOD'] : '' ) ) {
+	http_response_code( 405 );
+	exit;
+}
+$wpops_post_password = ( isset( $_POST['post_password'] ) && is_string( $_POST['post_password'] ) ) ? $_POST['post_password'] : '';
+$_GET     = array( 'action' => 'postpass' );
+$_POST    = array( 'post_password' => $wpops_post_password );
+$_REQUEST = array_merge( $_GET, $_POST );
+$_SERVER['QUERY_STRING'] = 'action=postpass';
+unset( $wpops_post_password );
+require dirname( __DIR__ ) . '/wp-login.php';
+"""
 
 
 def settings(cfg: dict[str, Any]) -> dict[str, Any]:
@@ -156,8 +181,8 @@ def render(hosts: dict[str, Any], g: dict[str, Any], slugs: list[str] | None = N
         'if ($uri ~ "^(?:/[_0-9a-zA-Z-]+)?/wp-login\\.php$") { set $wpops_gate_login 1; }',
         "# Public exception: a visitor unlocking a password-protected post. Only a POST whose whole query string",
         "# is action=postpass qualifies (nginx reads the first `action` argument, PHP the last, so a looser test",
-        "# lets ?action=postpass&action=login through), and it gets a location of its own where a body field",
-        "# cannot change the action either.",
+        "# lets ?action=postpass&action=login through). It runs through an entry point that keeps nothing of the",
+        f"# request but the post password (wp-content/{POSTPASS}), so a body field cannot change the action.",
         'set $wpops_gate_postpass "$wpops_gate_login:$request_method:$args";',
         'if ($wpops_gate_postpass = "1:POST:action=postpass") { set $wpops_gate_login 3; }',
     ]
@@ -188,14 +213,13 @@ def render(hosts: dict[str, Any], g: dict[str, Any], slugs: list[str] | None = N
             "",
         ]
     out += [
-        "# Password-protected posts, not gated. WordPress takes the action from $_REQUEST, where a POST field",
-        "# normally wins over the query string; request_order=PG makes the query string (action=postpass, checked",
-        "# above) win, so this location can only ever run the postpass handler.",
+        "# Password-protected posts, not gated: only the entry point that drops everything but the post password.",
+        "# Without that file the answer is 404, never the login.",
         "location @wpops_gate_postpass {",
         "    limit_req zone=wp_login burst=10 nodelay;",
-        (_FASTCGI_FIXED % {"script": "wp-login.php"}).rstrip("\n"),
-        '    fastcgi_param PHP_ADMIN_VALUE "request_order=PG";',
+        (_FASTCGI_FIXED % {"script": f"wp-content/{POSTPASS}"}).rstrip("\n"),
         "}",
+        f"location = /wp-content/{POSTPASS} {{ return 404; }}",
         "",
         "# Front-end AJAX and form posts stay public (WordPress serves visitors through them).",
         f"location = /wp-admin/admin-ajax.php {{ include /etc/nginx/wpops/{PHP_INC}; }}",
@@ -257,6 +281,30 @@ def _owned(cfg: dict[str, Any]) -> tuple[str, ...]:
     return (CONF, PHP_INC, *LEGACY) if settings(cfg)["enabled"] else (CONF, PHP_INC)
 
 
+def _postpass_sync(wp_content: Path, gated: bool, write: bool) -> bool:
+    """Is wp-content/wpops-postpass.php as it should be (present and ours on a gated stack, absent otherwise)?
+    With `write`, make it so. A stack that is not initialised yet (no wp-content) has nothing to do."""
+    if not wp_content.is_dir():
+        return True
+    f = wp_content / POSTPASS
+    try:
+        have = f.read_text(encoding="utf-8")
+    except OSError:
+        have = None
+    want = POSTPASS_TEXT if gated else None
+    if have == want:
+        return True
+    if write:
+        if want is None:
+            f.unlink(missing_ok=True)
+        else:
+            tmp = wp_content / (POSTPASS + ".tmp")
+            tmp.write_text(want, encoding="utf-8")
+            tmp.chmod(0o644)
+            tmp.replace(f)
+    return False
+
+
 def _current(nginx: Path, owned: tuple[str, ...]) -> dict[str, str]:
     out = {}
     for f in owned:
@@ -296,8 +344,9 @@ def status(inv: Inventory | None = None, cfg: dict[str, Any] | None = None) -> l
             files, hosts = desired_files(inv, node, name, cfg)
             current = _current(stack_path(origin, name) / "nginx", _owned(cfg))
             row.update(gated=bool(files), canonical=hosts["canonical"], hosts=hosts["gated"])
+            helper = _postpass_sync(stack_path(origin, name) / "data" / "wordpress" / "wp-content", bool(files), False)
             if files:
-                row["state"] = ("ok" if current == files else "missing" if CONF not in current else "outdated")
+                row["state"] = ("missing" if CONF not in current else "ok" if current == files and helper else "outdated")
             elif current:
                 row["state"] = "to-remove"
         except ConfigError as exc:
@@ -329,7 +378,12 @@ def apply(inv: Inventory | None = None, cfg: dict[str, Any] | None = None, only:
             with state.locked(f"gate-{name}"):
                 owned = _owned(cfg)
                 before = _current(nginx, owned)
+                # The entry point first: the Nginx config that points at it must never be live without it.
+                helper_ok = _postpass_sync(nginx.parent / "data" / "wordpress" / "wp-content", bool(files), True)
                 if before == files:
+                    if not helper_ok:
+                        result["changed"].append(name)
+                        log(f"admin gate entry point rewritten: {name}")
                     continue
                 _write(nginx, files, owned)
                 if _nginx_running(origin, name):

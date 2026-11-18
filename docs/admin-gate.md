@@ -83,7 +83,7 @@ and the next request works; no reload is needed.
 |---|---|
 | The site itself, `/wp-json/`, `/wp-cron.php` | Visitors, the REST API (plugins, backup sync), scheduled tasks |
 | `/wp-admin/admin-ajax.php`, `/wp-admin/admin-post.php` | WordPress serves front-end AJAX and form posts through them |
-| `POST /wp-login.php?action=postpass` | Visitors unlocking a password-protected page. Only a POST whose whole query string is `action=postpass`; it can run nothing but that handler |
+| `POST /wp-login.php?action=postpass` | Visitors unlocking a password-protected page. Only a POST whose whole query string is `action=postpass`, and it runs through `wp-content/wpops-postpass.php`, which wpops installs: that entry point drops everything except the post password, so it cannot reach the login, lost-password or registration forms. Without the file the answer is 404 |
 
 The REST API with WordPress application passwords is therefore not behind the gate. `xmlrpc.php` is denied by the
 stack's Nginx whether or not the gate is on.

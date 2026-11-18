@@ -19,7 +19,8 @@ outpost's sign-in start for the same host.
 #### Scenario: The password-protected-post exception cannot reach the login
 - **WHEN** a request to `/wp-login.php` carries `action=postpass` together with another `action` argument, is not a
   POST, or carries an `action` field in its body
-- **THEN** it is either sent to the sign-in like any other login request or handled as a postpass request only
+- **THEN** it is either sent to the sign-in like any other login request or handled as a postpass request only,
+  through an entry point that keeps nothing of the request but the post password
 
 #### Scenario: Host name without its own provider
 - **WHEN** a gated path is requested on a host name of the stack that is not one of the stack's gated host names

@@ -99,7 +99,8 @@ class Rendering(Base):
         self.assertIn("set $wpops_gate_auth https://auth.example.net;", conf)
         self.assertIn('if ($wpops_gate_postpass = "1:POST:action=postpass") { set $wpops_gate_login 3; }', conf)
         self.assertNotIn("$arg_action", conf)   # first-argument semantics: ?action=postpass&action=login got through
-        self.assertIn('fastcgi_param PHP_ADMIN_VALUE "request_order=PG";', conf)
+        self.assertIn("fastcgi_param SCRIPT_FILENAME $document_root/wp-content/wpops-postpass.php;", conf)
+        self.assertIn("location = /wp-content/wpops-postpass.php { return 404; }", conf)
 
     def test_invalid_host_name_is_refused(self):
         with self.assertRaises(ConfigError):
@@ -152,6 +153,41 @@ class Apply(Base):
         self.assertFalse((self.root / "fresh/nginx" / gate.CONF).exists())
         c.assert_not_called()
 
+    def test_postpass_entry_point_follows_the_gate(self):
+        for name in ("shop", "exempt"):
+            (self.root / name / "data/wordpress/wp-content").mkdir(parents=True)
+        (self.root / "exempt/data/wordpress/wp-content" / gate.POSTPASS).write_text("left over")
+        self.run_apply()
+        helper = self.root / "shop/data/wordpress/wp-content" / gate.POSTPASS
+        self.assertEqual(helper.read_text(), gate.POSTPASS_TEXT)
+        self.assertFalse((self.root / "exempt/data/wordpress/wp-content" / gate.POSTPASS).exists())
+        # Lost in a restore of wp-content: reported, and put back without touching Nginx.
+        helper.unlink()
+        self.assertEqual({x["stack"]: x["state"] for x in gate.status(self.inv, CFG)}["shop"], "outdated")
+        r, calls = self.run_apply()
+        self.assertEqual((r["changed"], calls), (["shop"], []))
+        self.assertTrue(helper.exists())
+
+    def test_postpass_entry_point_keeps_only_the_post_password(self):
+        if not shutil.which("php"):
+            self.skipTest("php not installed")
+        web = self.root / "web"
+        (web / "wp-content").mkdir(parents=True)
+        (web / "wp-content" / gate.POSTPASS).write_text(gate.POSTPASS_TEXT)
+        (web / "wp-login.php").write_text("<?php echo json_encode(array($_GET, $_POST, $_REQUEST, $_SERVER['QUERY_STRING']));")
+        driver = ("$_SERVER['REQUEST_METHOD']=$argv[1]; $_SERVER['QUERY_STRING']='action=postpass&key=k';"
+                  "$_GET=array('action'=>'postpass','key'=>'k','checkemail'=>'1');"
+                  "$_POST=array('action'=>'login','log'=>'admin','pwd'=>'x','post_password'=>'secret','redirect_to'=>'https://evil.example');"
+                  "$_REQUEST=array_merge($_GET,$_POST); require $argv[2];")
+        out = subprocess.run(["php", "-r", driver, "POST", str(web / "wp-content" / gate.POSTPASS)], capture_output=True, text=True)
+        get, post, request, query = json.loads(out.stdout)
+        self.assertEqual(get, {"action": "postpass"})
+        self.assertEqual(post, {"post_password": "secret"})
+        self.assertEqual(request, {"action": "postpass", "post_password": "secret"})
+        self.assertEqual(query, "action=postpass")
+        out = subprocess.run(["php", "-r", driver, "GET", str(web / "wp-content" / gate.POSTPASS)], capture_output=True, text=True)
+        self.assertEqual(out.stdout, "")
+
     def test_stopped_stack_gets_files_without_nginx_calls(self):
         r, calls = self.run_apply(running=False)
         self.assertEqual(calls, [])
@@ -186,7 +222,8 @@ class LiveNginx(Base):
         conf = self.root / "nginx"
         for d in ("conf.d", "wpops", "wpops-http", "logs", "tmp", "www/wp-admin"):
             (conf / d).mkdir(parents=True)
-        for f in ("wp-login.php", "index.php", "wp-admin/index.php", "wp-admin/admin-ajax.php"):
+        (conf / "www/wp-content").mkdir()
+        for f in ("wp-login.php", "index.php", "wp-admin/index.php", "wp-admin/admin-ajax.php", "wp-content/" + gate.POSTPASS):
             (conf / "www" / f).write_text("<?php")
         mime = Path(nginx).resolve().parents[2] / "etc/nginx/mime.types"
         (conf / "mime.types").write_text(mime.read_text() if mime.exists() else "types { text/html html; }\n")
@@ -224,6 +261,7 @@ get postpass-dup -H 'Host: shop.example' -X POST "$B/wp-login.php?action=postpas
 get postpass-pre -H 'Host: shop.example' -X POST "$B/wp-login.php?action=login&action=postpass"
 get postpass-enc -H 'Host: shop.example' -X POST "$B/wp-login.php?action=postpass%26action=login"
 get admin-pp     -H 'Host: shop.example' -X POST "$B/wp-admin/index.php?action=postpass"
+get helper       -H 'Host: shop.example' -X POST $B/wp-content/wpops-postpass.php
 get ajax         -H 'Host: shop.example' $B/wp-admin/admin-ajax.php
 get home         -H 'Host: shop.example' $B/
 get authed       -H 'Host: shop.example' -H 'Cookie: session=ok' $B/wp-admin/index.php
@@ -248,6 +286,7 @@ kill $AUTH
         # Anything but the exact postpass POST is gated.
         for name in ("postpass-get", "postpass-dup", "postpass-pre", "postpass-enc", "admin-pp"):
             self.assertTrue(got[name].startswith("302 https://shop.example" + start), name + ": " + r.stdout)
+        self.assertEqual(got["helper"].split()[0], "404", r.stdout)   # the entry point is not reachable by its URL
         # A signed-in request passes the gate and reaches PHP, also as a POST to the login.
         self.assertEqual(got["authed"].split()[0], "502", r.stdout)
         self.assertEqual(got["authed-login"].split()[0], "502", r.stdout)
