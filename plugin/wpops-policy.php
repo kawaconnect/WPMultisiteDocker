@@ -1,7 +1,7 @@
 <?php
 /**
  * Plugin Name: wpops Deployment Policy
- * Description: Restore-independent per-blog login paths for WPS Hide Login.
+ * Description: Restore-independent per-blog login paths for WPS Hide Login, and no user listing for anonymous REST clients.
  */
 if (!defined('ABSPATH')) {
     exit;
@@ -39,6 +39,22 @@ add_filter('site_option_active_sitewide_plugins', static function ($plugins) {
         $plugins['wps-hide-login/wps-hide-login.php'] = 1;
     }
     return $plugins;
+});
+
+/* Anonymous visitors cannot list users over REST (/wp-json/wp/v2/users and ?rest_route=...): the answer is the
+ * login names, which is all that password guessing needs. Signed-in users (the editor) and clients that
+ * authenticate with an application password still get the endpoint. A site that publishes its authors through
+ * REST on purpose sets define('WPOPS_ALLOW_ANON_REST_USERS', true) in wp-config.php. */
+add_filter('rest_endpoints', static function ($endpoints) {
+    if ((defined('WPOPS_ALLOW_ANON_REST_USERS') && WPOPS_ALLOW_ANON_REST_USERS) || is_user_logged_in()) {
+        return $endpoints;
+    }
+    foreach (array_keys($endpoints) as $route) {
+        if (0 === strpos($route, '/wp/v2/users')) {
+            unset($endpoints[$route]);
+        }
+    }
+    return $endpoints;
 });
 
 /* Subdomain networks: core gives a new blog http:// URLs (it only copies the

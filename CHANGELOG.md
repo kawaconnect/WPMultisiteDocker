@@ -11,6 +11,11 @@ Versions are git tags (`vX.Y.Z`). This repo has no build; tags mark reviewed sta
 - `wpops backup pause|resume --source` (0.0.19 follow-up, already on the nodes): a paused source is skipped by scheduled pulls.
 - OpenSpec (`openspec/`): changes to this repo start as a proposal there.
 
+### Security
+- From the 2026-11-18 audit. The public exception for password-protected posts on a gated site could reach the login (`?action=postpass&action=login`, or an `action` field in the body). It is now an exact POST-only match that runs through `wp-content/wpops-postpass.php`, an entry point wpops installs that keeps nothing of the request but the post password.
+- Nginx also denies `.log`, `.sh`, `.tgz`, `.7z`, `.rar`, `.orig`, `.save`, `.sqlite`, `.wpress`, a PHP `error_log` file in the web root, `readme.html`, `license.txt` and the sample configs. Reload each stack's Nginx after updating.
+- Anonymous REST clients no longer get `/wp/v2/users` (login names). Signed-in users and application-password clients do. Opt out per site with `define('WPOPS_ALLOW_ANON_REST_USERS', true)`.
+
 ### Changed
 - Off by default. A node that does not set `admin_gate.enabled` behaves as before. Files of the earlier hand-installed gate (`kc-authentik-gate.conf`, `kc-gate-php.inc`) are replaced or removed by `wpops gate apply`.
 
