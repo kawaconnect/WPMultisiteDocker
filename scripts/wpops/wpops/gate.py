@@ -77,7 +77,10 @@ def stack_hosts(inv: Inventory, node: str, name: str) -> dict[str, Any]:
         if domain:
             canonical = domain
             add(domain)
-            add(origin.default_host(domain))
+            # Its staging name too, unless the domain already is a name in the node's own zone.
+            zone = (origin.standby_domain or "").lower()
+            if not (zone and domain.endswith("." + zone)):
+                add(origin.default_host(domain))
     return {"canonical": canonical, "gated": gated,
             "redirect": {d: t for d, t in sorted(redirect.items()) if d not in gated}}
 

@@ -63,6 +63,8 @@ class Decisions(Base):
     def test_stack_without_a_site_uses_its_own_domain(self):
         h = gate.stack_hosts(self.inv, "n1", "fresh")
         self.assertEqual(h["gated"], ["fresh.example", "freshexample-n1.standby.example.net"])
+        (self.root / "fresh" / ".env").write_text('WP_DOMAIN_CURRENT_SITE="draft.standby.example.net"\n')
+        self.assertEqual(gate.stack_hosts(self.inv, "n1", "fresh")["gated"], ["draft.standby.example.net"])
 
     def test_flag_overrides_node_default_and_disabled_gates_nothing(self):
         o = self.inv.origin("n1")
