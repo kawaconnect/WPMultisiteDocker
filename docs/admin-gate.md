@@ -83,7 +83,7 @@ and the next request works; no reload is needed.
 |---|---|
 | The site itself, `/wp-json/`, `/wp-cron.php` | Visitors, the REST API (plugins, backup sync), scheduled tasks |
 | `/wp-admin/admin-ajax.php`, `/wp-admin/admin-post.php` | WordPress serves front-end AJAX and form posts through them |
-| `/wp-login.php?action=postpass` | Visitors unlocking a password-protected page |
+| `POST /wp-login.php?action=postpass` | Visitors unlocking a password-protected page. Only a POST whose whole query string is `action=postpass`; it can run nothing but that handler |
 
 The REST API with WordPress application passwords is therefore not behind the gate. `xmlrpc.php` is denied by the
 stack's Nginx whether or not the gate is on.

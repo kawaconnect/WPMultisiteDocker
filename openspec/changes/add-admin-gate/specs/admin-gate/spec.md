@@ -13,8 +13,13 @@ outpost's sign-in start for the same host.
 
 #### Scenario: Paths that stay public
 - **WHEN** any client requests the site itself, `/wp-json/`, `/wp-admin/admin-ajax.php`, `/wp-admin/admin-post.php`,
-  `/wp-cron.php` or `/wp-login.php?action=postpass`
+  `/wp-cron.php`, or sends a POST to `/wp-login.php` whose whole query string is `action=postpass`
 - **THEN** the request is served without forward auth
+
+#### Scenario: The password-protected-post exception cannot reach the login
+- **WHEN** a request to `/wp-login.php` carries `action=postpass` together with another `action` argument, is not a
+  POST, or carries an `action` field in its body
+- **THEN** it is either sent to the sign-in like any other login request or handled as a postpass request only
 
 #### Scenario: Host name without its own provider
 - **WHEN** a gated path is requested on a host name of the stack that is not one of the stack's gated host names

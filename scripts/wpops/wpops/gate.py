@@ -151,10 +151,15 @@ def render(hosts: dict[str, Any], g: dict[str, Any], slugs: list[str] | None = N
     out += [
         "",
         "# wp-login.php (also of a subdirectory blog): the stack owns `location = /wp-login.php`, so gated",
-        "# requests are handed to a named location. action=postpass (password-protected posts) stays public.",
+        "# requests are handed to a named location.",
         "set $wpops_gate_login 0;",
         'if ($uri ~ "^(?:/[_0-9a-zA-Z-]+)?/wp-login\\.php$") { set $wpops_gate_login 1; }',
-        "if ($arg_action = postpass) { set $wpops_gate_login 0; }",
+        "# Public exception: a visitor unlocking a password-protected post. Only a POST whose whole query string",
+        "# is action=postpass qualifies (nginx reads the first `action` argument, PHP the last, so a looser test",
+        "# lets ?action=postpass&action=login through), and it gets a location of its own where a body field",
+        "# cannot change the action either.",
+        'set $wpops_gate_postpass "$wpops_gate_login:$request_method:$args";',
+        'if ($wpops_gate_postpass = "1:POST:action=postpass") { set $wpops_gate_login 3; }',
     ]
     if slugs:
         pattern = "|".join(re.escape(s) for s in slugs)
@@ -163,8 +168,10 @@ def render(hosts: dict[str, Any], g: dict[str, Any], slugs: list[str] | None = N
     out += [
         "if ($wpops_gate_login = 1) { return 418; }",
         "if ($wpops_gate_login = 2) { return 419; }",
+        "if ($wpops_gate_login = 3) { return 420; }",
         "error_page 418 = @wpops_gate_login;",
         "error_page 419 = @wpops_gate_login_path;",
+        "error_page 420 = @wpops_gate_postpass;",
         "# The hand-off above is itself an error_page jump; this lets the sign-in redirect chain from it.",
         "recursive_error_pages on;",
         "",
@@ -181,6 +188,15 @@ def render(hosts: dict[str, Any], g: dict[str, Any], slugs: list[str] | None = N
             "",
         ]
     out += [
+        "# Password-protected posts, not gated. WordPress takes the action from $_REQUEST, where a POST field",
+        "# normally wins over the query string; request_order=PG makes the query string (action=postpass, checked",
+        "# above) win, so this location can only ever run the postpass handler.",
+        "location @wpops_gate_postpass {",
+        "    limit_req zone=wp_login burst=10 nodelay;",
+        (_FASTCGI_FIXED % {"script": "wp-login.php"}).rstrip("\n"),
+        '    fastcgi_param PHP_ADMIN_VALUE "request_order=PG";',
+        "}",
+        "",
         "# Front-end AJAX and form posts stay public (WordPress serves visitors through them).",
         f"location = /wp-admin/admin-ajax.php {{ include /etc/nginx/wpops/{PHP_INC}; }}",
         f"location = /wp-admin/admin-post.php {{ include /etc/nginx/wpops/{PHP_INC}; }}",

@@ -97,7 +97,9 @@ class Rendering(Base):
         self.assertIn("location ^~ /wp-admin/", conf)
         self.assertIn("(?:staff\\-door)", conf)
         self.assertIn("set $wpops_gate_auth https://auth.example.net;", conf)
-        self.assertIn("if ($arg_action = postpass) { set $wpops_gate_login 0; }", conf)
+        self.assertIn('if ($wpops_gate_postpass = "1:POST:action=postpass") { set $wpops_gate_login 3; }', conf)
+        self.assertNotIn("$arg_action", conf)   # first-argument semantics: ?action=postpass&action=login got through
+        self.assertIn('fastcgi_param PHP_ADMIN_VALUE "request_order=PG";', conf)
 
     def test_invalid_host_name_is_refused(self):
         with self.assertRaises(ConfigError):
@@ -216,7 +218,12 @@ get staging      -H 'Host: shopexample-n1.standby.example.net' $B/wp-admin/
 get blog-login   -H 'Host: shop.example' $B/blog/wp-login.php
 get custom       -H 'Host: shop.example' $B/staff-door/
 get www          -H 'Host: www.shop.example' $B/wp-login.php
-get postpass     -H 'Host: shop.example' "$B/wp-login.php?action=postpass"
+get postpass     -H 'Host: shop.example' -X POST "$B/wp-login.php?action=postpass"
+get postpass-get -H 'Host: shop.example' "$B/wp-login.php?action=postpass"
+get postpass-dup -H 'Host: shop.example' -X POST "$B/wp-login.php?action=postpass&action=login"
+get postpass-pre -H 'Host: shop.example' -X POST "$B/wp-login.php?action=login&action=postpass"
+get postpass-enc -H 'Host: shop.example' -X POST "$B/wp-login.php?action=postpass%26action=login"
+get admin-pp     -H 'Host: shop.example' -X POST "$B/wp-admin/index.php?action=postpass"
 get ajax         -H 'Host: shop.example' $B/wp-admin/admin-ajax.php
 get home         -H 'Host: shop.example' $B/
 get authed       -H 'Host: shop.example' -H 'Cookie: session=ok' $B/wp-admin/index.php
@@ -238,6 +245,9 @@ kill $AUTH
         # Public paths reach PHP (502: no PHP in this test), not the outpost.
         for name in ("postpass", "ajax", "home"):
             self.assertEqual(got[name].split()[0], "502", name + ": " + r.stdout)
+        # Anything but the exact postpass POST is gated.
+        for name in ("postpass-get", "postpass-dup", "postpass-pre", "postpass-enc", "admin-pp"):
+            self.assertTrue(got[name].startswith("302 https://shop.example" + start), name + ": " + r.stdout)
         # A signed-in request passes the gate and reaches PHP, also as a POST to the login.
         self.assertEqual(got["authed"].split()[0], "502", r.stdout)
         self.assertEqual(got["authed-login"].split()[0], "502", r.stdout)
