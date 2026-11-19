@@ -100,7 +100,7 @@ services:
   # ---------------------------------------------------------------------------
   # NOTE: $$ is docker-compose YAML escaping for a literal $ in the container
   wordpress:
-    image: wordpress:7.1.3-php8.3-fpm
+    image: wordpress:7.1.5-php8.3-fpm
     restart: unless-stopped
     networks:
       - frontend
@@ -210,7 +210,7 @@ services:
   # Nginx 1.31, Reverse Proxy + Static Files
   # ---------------------------------------------------------------------------
   nginx:
-    image: nginx:1.31.6-alpine
+    image: nginx:1.31.9-alpine
     restart: unless-stopped
     networks:
       - frontend
@@ -306,7 +306,7 @@ services:
   # Cloudflare DNS Backup, runs every 6 hours, saves on change
   # ---------------------------------------------------------------------------
   cf-backup:
-    image: alpine:3.23
+    image: alpine:3.24
     restart: unless-stopped
     networks:
       - frontend
