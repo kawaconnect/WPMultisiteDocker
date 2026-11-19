@@ -1,6 +1,7 @@
 """Secrets in .env files are 1Password references (op://...) resolved at runtime."""
 import json
 import os
+import shutil
 import stat
 import subprocess
 import sys
@@ -274,7 +275,8 @@ class TunnelFile(unittest.TestCase):
 
     def test_ensure_writes_no_tokens_and_passes_them_at_up(self):
         env = {"CF_ACCOUNT_1_NAME": "one", "CF_ACCOUNT_1_ID": "id1", "CF_ACCOUNT_1_TOKEN": "cf-secret-1",
-               "CF_ACCOUNT_2_NAME": "two", "CF_ACCOUNT_2_ID": "id2", "CF_ACCOUNT_2_TOKEN": "cf-secret-2"}
+               "CF_ACCOUNT_2_NAME": "two", "CF_ACCOUNT_2_ID": "id2", "CF_ACCOUNT_2_TOKEN": "cf-secret-2",
+               "MYSQL_PASSWORD": "db-password-value", "WPOPS_SYNC_KEY_CU01_ONE": "sync-key-value"}
         origin = config.Origin(name="node1", kind="node", stacks={}, tunnels={"one": "t1", "two": "t2"})
         inv = SimpleNamespace(origin=lambda n: origin, raw={})
 
@@ -316,14 +318,28 @@ class TunnelFile(unittest.TestCase):
         self.assertEqual(services["cloudflared-one"]["environment"], {"TUNNEL_TOKEN": "${TUNNEL_TOKEN_ONE}"})
         # "two" failed at the API: its service stays in the file but is not recreated.
         self.assertIn("cloudflared-two", services)
-        self.assertEqual(services["cf-backup"]["environment"],
-                         {"CF_ACCOUNT_1_TOKEN": "${CF_ACCOUNT_1_TOKEN}", "CF_ACCOUNT_2_TOKEN": "${CF_ACCOUNT_2_TOKEN}"})
+        # cf-backup gets the CF_* settings only, as variables; never the .env file.
+        cf_keys = [k for k in env if k.startswith("CF_")]
+        self.assertEqual(services["cf-backup"]["environment"], {k: "${%s}" % k for k in cf_keys})
+        self.assertFalse(any(".env" in v for v in services["cf-backup"]["volumes"]))
+        self.assertNotIn("db-password-value", text)
+        self.assertNotIn("MYSQL_PASSWORD", text)
+        # Built from docker/cf-backup, no install at start, no capabilities.
+        self.assertNotIn("command", services["cf-backup"])
+        self.assertNotIn("entrypoint", services["cf-backup"])
+        self.assertTrue(services["cf-backup"]["image"].startswith("wpops-cf-backup:"))
+        self.assertEqual(services["cf-backup"]["build"]["context"], str(tmp / "docker" / "cf-backup"))
+        self.assertEqual(services["cf-backup"]["cap_drop"], ["ALL"])
+        self.assertTrue(services["cf-backup"]["read_only"])
         self.assertEqual(stat.S_IMODE(compose.stat().st_mode), 0o600)
         (cmd, child_env), = runs
         self.assertEqual(cmd[-2:], ["cloudflared-one", "cf-backup"])
         self.assertEqual(child_env["TUNNEL_TOKEN_ONE"], "tunnel-secret-t1")
         self.assertNotIn("TUNNEL_TOKEN_TWO", child_env)
         self.assertEqual(child_env["CF_ACCOUNT_2_TOKEN"], "cf-secret-2")
+        self.assertEqual(child_env["CF_ACCOUNT_1_NAME"], "one")
+        self.assertNotIn("MYSQL_PASSWORD", child_env)
+        self.assertNotIn("WPOPS_SYNC_KEY_CU01_ONE", child_env)
         self.assertEqual(vault.check_tunnels_file(compose)["literal_tokens"], [])
 
 
@@ -404,6 +420,22 @@ class CfCommonScript(OpTestCase):
         r = subprocess.run(["bash", "-c", script], env=dict(os.environ, CF_ACCOUNT_1_TOKEN="from-wpops"),
                            capture_output=True, text=True)
         self.assertEqual((r.returncode, r.stdout), (0, "from-wpops"), r.stderr)
+
+    def test_backup_runs_from_environment_without_env_file(self):
+        # The cf-backup container gets only CF_* variables and no .env file.
+        script = (f'source "{ROOT}/scripts/cf-common.sh"; ENV_FILE=/nonexistent/.env; op_read() {{ return 1; }}; '
+                  'check_deps jq curl && load_config --read-only >/dev/null && '
+                  'printf "%s|%s|%s" "$(get_account_count)" "$CF_ACCOUNT_1_NAME" "$CF_ACCOUNT_1_TOKEN"')
+        r = subprocess.run(["bash", "-c", script], env=dict(os.environ, CF_ACCOUNT_1_NAME="one", CF_ACCOUNT_1_ID="abc",
+                                                            CF_ACCOUNT_1_TOKEN="tok", CF_ACCOUNT_2_NAME=""),
+                           capture_output=True, text=True)
+        if shutil.which("jq") is None or shutil.which("curl") is None:
+            self.skipTest("jq and curl are needed")
+        self.assertEqual((r.returncode, r.stdout), (0, "1|one|tok"), r.stderr)
+        r = subprocess.run(["bash", "-c", f'source "{ROOT}/scripts/cf-common.sh"; ENV_FILE=/nonexistent/.env; load_config --read-only'],
+                           env={k: v for k, v in os.environ.items() if not k.startswith("CF_")}, capture_output=True, text=True)
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn(".env not found", r.stderr)
 
     def test_reference_is_read_from_the_wpops_cache(self):
         config._write_cache_json("secrets.json", {"values": {"op://V/cloudflare-one/credential": "cached"},

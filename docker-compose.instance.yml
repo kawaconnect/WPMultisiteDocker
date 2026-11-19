@@ -22,7 +22,7 @@ x-wp-config-extra: &wp_config_extra |
   if (!defined('WP_DEBUG_LOG')) define('WP_DEBUG_LOG', true);
   if (!defined('WP_DEBUG_DISPLAY')) define('WP_DEBUG_DISPLAY', false);
   /* Multisite: only for WP_MODE=multisite, and only once the network tables exist */
-  if ('${WP_MODE}' === 'multisite') {
+  if (getenv('WP_MODE') === 'multisite') {
       define('WP_ALLOW_MULTISITE', true);
       $$__ms = @new mysqli('mariadb', DB_USER, DB_PASSWORD, DB_NAME);
       if ($$__ms && !$$__ms->connect_error) {
@@ -30,7 +30,7 @@ x-wp-config-extra: &wp_config_extra |
           if ($$__r && $$__r->num_rows > 0) {
               define('MULTISITE', true);
               define('SUBDOMAIN_INSTALL', false);
-              define('DOMAIN_CURRENT_SITE', '${WP_DOMAIN}');
+              define('DOMAIN_CURRENT_SITE', getenv('WP_DOMAIN'));
               define('PATH_CURRENT_SITE', '/');
               define('SITE_ID_CURRENT_SITE', 1);
               define('BLOG_ID_CURRENT_SITE', 1);
@@ -105,6 +105,9 @@ services:
       WORDPRESS_DB_PASSWORD: ${MYSQL_PASSWORD}
       WORDPRESS_TABLE_PREFIX: wp_
       WORDPRESS_DEBUG: "1"
+      # Read with getenv() in WORDPRESS_CONFIG_EXTRA, never pasted into PHP.
+      WP_MODE: ${WP_MODE}
+      WP_DOMAIN: ${WP_DOMAIN}
       WORDPRESS_CONFIG_EXTRA: *wp_config_extra
     healthcheck:
       test: ["CMD-SHELL", "bash -c 'echo > /dev/tcp/127.0.0.1/9000'"]
@@ -174,6 +177,9 @@ services:
       WORDPRESS_DB_PASSWORD: ${MYSQL_PASSWORD}
       WORDPRESS_TABLE_PREFIX: wp_
       WORDPRESS_DEBUG: "1"
+      # Read with getenv() in WORDPRESS_CONFIG_EXTRA, never pasted into PHP.
+      WP_MODE: ${WP_MODE}
+      WP_DOMAIN: ${WP_DOMAIN}
       WORDPRESS_CONFIG_EXTRA: *wp_config_extra
     entrypoint: ["/bin/sh", "-c", "trap 'exit 0' TERM; while :; do sleep 3600 & wait $$!; done"]
     security_opt: [no-new-privileges:true]

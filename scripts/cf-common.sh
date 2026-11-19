@@ -36,9 +36,12 @@ log_error() { echo "  [ERROR] $*" >&2; }
 # Dependency checks
 # =============================================================================
 
+# check_deps [tool...]: the given tools, or by default everything the
+# scripts that change Cloudflare need. cf-backup.sh only needs jq and curl.
 check_deps() {
-    local missing=()
-    for cmd in jq curl openssl docker; do
+    local missing=() tools=("$@")
+    [ ${#tools[@]} -gt 0 ] || tools=(jq curl openssl docker)
+    for cmd in "${tools[@]}"; do
         if ! command -v "$cmd" &>/dev/null; then
             missing+=("$cmd")
         fi
@@ -75,9 +78,15 @@ op_read() {
 }
 
 load_config() {
+    # Without a .env file the CF_* settings come from the environment alone
+    # (the cf-backup container gets only those, not the whole .env).
+    local _from_env=""
     if [ ! -f "$ENV_FILE" ]; then
-        log_error ".env not found. Copy .env.example to .env and fill in values."
-        exit 1
+        if [ -z "${CF_ACCOUNT_1_NAME:-}" ]; then
+            log_error ".env not found. Copy .env.example to .env and fill in values."
+            exit 1
+        fi
+        _from_env=1
     fi
 
     # Secret values in .env are 1Password references (op://vault/item/field).
@@ -91,9 +100,11 @@ load_config() {
         [[ "$_v" == op://* ]] || _preset["$_k"]="$_v"
     done < <(env -0)
 
-    set -a
-    source "$ENV_FILE"
-    set +a
+    if [ -z "$_from_env" ]; then
+        set -a
+        source "$ENV_FILE"
+        set +a
+    fi
     CF_API="${CF_API_URL:-$CF_API}"
 
     # Only the CF_* settings are used here; other references in .env (database
