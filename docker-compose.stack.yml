@@ -66,14 +66,26 @@ services:
     volumes:
     - ${STACK_DIR:?set STACK_DIR}/data/redis:/data
     - ${WPOPS_REPO_DIR:?set WPOPS_REPO_DIR}/config/redis/redis.conf:/usr/local/etc/redis/redis.conf:ro
-    command: redis-server /usr/local/etc/redis/redis.conf --requirepass ${REDIS_PASSWORD}
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD}
+    # The password goes to redis-server on stdin ("-" = read the config from
+    # stdin; it includes redis.conf), not on its command line: it is not in
+    # `docker inspect` Args, the healthcheck definition or the host's process
+    # list. "-" must be the first argument: the image's entrypoint appends
+    # --loadmodule options after it.
+    entrypoint:
+    - /bin/sh
+    - -c
+    - |
+      p=$$(printf '%s' "$$REDIS_PASSWORD" | sed 's/[\\"]/\\&/g')
+      exec docker-entrypoint.sh redis-server - <<EOF
+      include /usr/local/etc/redis/redis.conf
+      requirepass "$$p"
+      EOF
     healthcheck:
       test:
-      - CMD
-      - redis-cli
-      - -a
-      - ${REDIS_PASSWORD}
-      - ping
+      - CMD-SHELL
+      - REDISCLI_AUTH="$$REDIS_PASSWORD" redis-cli ping | grep -q PONG
       interval: 15s
       timeout: 5s
       retries: 3

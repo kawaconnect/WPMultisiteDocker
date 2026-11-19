@@ -3,4 +3,4 @@
 Stdlib only (Python 3.11+). See docs/wpops-design.md.
 """
 
-__version__ = "0.2.12"
+__version__ = "0.2.13"

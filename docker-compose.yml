@@ -68,9 +68,24 @@ services:
     volumes:
       - ./data/redis:/data
       - ./config/redis/redis.conf:/usr/local/etc/redis/redis.conf:ro
-    command: redis-server /usr/local/etc/redis/redis.conf --requirepass ${REDIS_PASSWORD}
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD}
+    # The password goes to redis-server on stdin ("-" = read the config from
+    # stdin; it includes redis.conf), not on its command line: it is not in
+    # `docker inspect` Args, the healthcheck definition or the host's process
+    # list. "-" must be the first argument: the image's entrypoint appends
+    # --loadmodule options after it.
+    entrypoint:
+      - /bin/sh
+      - -c
+      - |
+        p=$$(printf '%s' "$$REDIS_PASSWORD" | sed 's/[\\"]/\\&/g')
+        exec docker-entrypoint.sh redis-server - <<EOF
+        include /usr/local/etc/redis/redis.conf
+        requirepass "$$p"
+        EOF
     healthcheck:
-      test: ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD}", "ping"]
+      test: ["CMD-SHELL", "REDISCLI_AUTH=\"$$REDIS_PASSWORD\" redis-cli ping | grep -q PONG"]
       interval: 15s
       timeout: 5s
       retries: 3
@@ -121,9 +136,19 @@ services:
       WORDPRESS_DB_USER: ${WORDPRESS_DB_USER}
       WORDPRESS_DB_PASSWORD: ${WORDPRESS_DB_PASSWORD}
       WORDPRESS_TABLE_PREFIX: ${WORDPRESS_TABLE_PREFIX}
+      # Settings reach PHP through the environment (getenv), never pasted into
+      # the PHP source: a quote or backslash in .env cannot break or inject
+      # into wp-config.php.
+      WP_MODE: ${WP_MODE:-multisite}
+      WP_SUBDOMAIN_INSTALL: ${WP_SUBDOMAIN_INSTALL:-true}
+      WP_DOMAIN_CURRENT_SITE: ${WP_DOMAIN_CURRENT_SITE:-localhost}
+      WP_SUNRISE: ${WP_SUNRISE:-false}
+      REDIS_HOST: ${REDIS_HOST:-redis}
+      REDIS_PORT: ${REDIS_PORT:-6379}
+      REDIS_PASSWORD: ${REDIS_PASSWORD}
       WORDPRESS_CONFIG_EXTRA: &wp_config_extra |
         /* Multisite, always allow, activate only when DB tables exist */
-        if ('${WP_MODE:-multisite}' === 'multisite') {
+        if ((getenv('WP_MODE') ?: 'multisite') === 'multisite') {
         define('WP_ALLOW_MULTISITE', true);
 
         /* Detect if multisite tables are present (e.g. after DB sync from production) */
@@ -143,12 +168,12 @@ services:
                     $$__ms_result = $$__ms_check->query("SHOW TABLES LIKE '" . $$__ms_check->real_escape_string($$__ms_prefix) . "blogs'");
                     if ($$__ms_result && $$__ms_result->num_rows > 0) {
                         define('MULTISITE', true);
-                        define('SUBDOMAIN_INSTALL', ${WP_SUBDOMAIN_INSTALL:-true});
-                        define('DOMAIN_CURRENT_SITE', '${WP_DOMAIN_CURRENT_SITE:-localhost}');
+                        define('SUBDOMAIN_INSTALL', getenv('WP_SUBDOMAIN_INSTALL') !== 'false');
+                        define('DOMAIN_CURRENT_SITE', getenv('WP_DOMAIN_CURRENT_SITE') ?: 'localhost');
                         define('PATH_CURRENT_SITE', '/');
                         define('SITE_ID_CURRENT_SITE', 1);
                         define('BLOG_ID_CURRENT_SITE', 1);
-                        if ('${WP_SUNRISE:-false}' === 'true') {
+                        if (getenv('WP_SUNRISE') === 'true') {
                             define('SUNRISE', true);
                         }
                     }
@@ -166,9 +191,9 @@ services:
         }
 
         /* Redis object cache */
-        define('WP_REDIS_HOST', '${REDIS_HOST}');
-        define('WP_REDIS_PORT', ${REDIS_PORT});
-        define('WP_REDIS_PASSWORD', '${REDIS_PASSWORD}');
+        define('WP_REDIS_HOST', getenv('REDIS_HOST') ?: 'redis');
+        define('WP_REDIS_PORT', (int) (getenv('REDIS_PORT') ?: 6379));
+        define('WP_REDIS_PASSWORD', getenv('REDIS_PASSWORD'));
 
         /* Disable built-in cron, external container handles it */
         define('DISABLE_WP_CRON', true);
@@ -279,6 +304,13 @@ services:
       WORDPRESS_DB_USER: ${WORDPRESS_DB_USER}
       WORDPRESS_DB_PASSWORD: ${WORDPRESS_DB_PASSWORD}
       WORDPRESS_TABLE_PREFIX: ${WORDPRESS_TABLE_PREFIX}
+      WP_MODE: ${WP_MODE:-multisite}
+      WP_SUBDOMAIN_INSTALL: ${WP_SUBDOMAIN_INSTALL:-true}
+      WP_DOMAIN_CURRENT_SITE: ${WP_DOMAIN_CURRENT_SITE:-localhost}
+      WP_SUNRISE: ${WP_SUNRISE:-false}
+      REDIS_HOST: ${REDIS_HOST:-redis}
+      REDIS_PORT: ${REDIS_PORT:-6379}
+      REDIS_PASSWORD: ${REDIS_PASSWORD}
       WORDPRESS_CONFIG_EXTRA: *wp_config_extra
     entrypoint: /bin/sh
     command:
@@ -306,24 +338,76 @@ services:
   # Cloudflare DNS Backup, runs every 6 hours, saves on change
   # ---------------------------------------------------------------------------
   cf-backup:
-    image: alpine:3.24
+    # Built once from docker/cf-backup (bash, curl, jq on a pinned Alpine);
+    # nothing is installed at start. Sees only the CF_* settings it needs
+    # (not the whole .env) and runs without capabilities on a read-only root.
+    build: ./docker/cf-backup
+    image: wpops-cf-backup:local
     restart: unless-stopped
     networks:
       - frontend
     volumes:
       - ./scripts:/app/scripts:ro
+      - ./config:/app/config:ro
       - ./data/cloudflare/backups:/app/data/cloudflare/backups
-      - ./.env:/app/.env:ro
-    entrypoint: /bin/sh
-    command:
-      - -c
-      - |
-        apk add --no-cache bash curl jq openssl >/dev/null 2>&1
-        ln -sf /bin/true /usr/local/bin/docker
-        while true; do
-          bash /app/scripts/cf-backup.sh 2>&1 || true
-          sleep 21600
-        done
+    # Only the Cloudflare settings (accounts 1-10), interpolated from .env.
+    environment:
+      CF_STANDBY_DOMAIN: ${CF_STANDBY_DOMAIN:-}
+      CF_CLOUD_IP: ${CF_CLOUD_IP:-}
+      CF_API_URL: ${CF_API_URL:-}
+      CF_ACCOUNT_1_NAME: ${CF_ACCOUNT_1_NAME:-}
+      CF_ACCOUNT_1_ID: ${CF_ACCOUNT_1_ID:-}
+      CF_ACCOUNT_1_TOKEN: ${CF_ACCOUNT_1_TOKEN:-}
+      CF_ACCOUNT_1_STANDBY: ${CF_ACCOUNT_1_STANDBY:-}
+      CF_ACCOUNT_1_DOMAINS: ${CF_ACCOUNT_1_DOMAINS:-}
+      CF_ACCOUNT_2_NAME: ${CF_ACCOUNT_2_NAME:-}
+      CF_ACCOUNT_2_ID: ${CF_ACCOUNT_2_ID:-}
+      CF_ACCOUNT_2_TOKEN: ${CF_ACCOUNT_2_TOKEN:-}
+      CF_ACCOUNT_2_STANDBY: ${CF_ACCOUNT_2_STANDBY:-}
+      CF_ACCOUNT_2_DOMAINS: ${CF_ACCOUNT_2_DOMAINS:-}
+      CF_ACCOUNT_3_NAME: ${CF_ACCOUNT_3_NAME:-}
+      CF_ACCOUNT_3_ID: ${CF_ACCOUNT_3_ID:-}
+      CF_ACCOUNT_3_TOKEN: ${CF_ACCOUNT_3_TOKEN:-}
+      CF_ACCOUNT_3_STANDBY: ${CF_ACCOUNT_3_STANDBY:-}
+      CF_ACCOUNT_3_DOMAINS: ${CF_ACCOUNT_3_DOMAINS:-}
+      CF_ACCOUNT_4_NAME: ${CF_ACCOUNT_4_NAME:-}
+      CF_ACCOUNT_4_ID: ${CF_ACCOUNT_4_ID:-}
+      CF_ACCOUNT_4_TOKEN: ${CF_ACCOUNT_4_TOKEN:-}
+      CF_ACCOUNT_4_STANDBY: ${CF_ACCOUNT_4_STANDBY:-}
+      CF_ACCOUNT_4_DOMAINS: ${CF_ACCOUNT_4_DOMAINS:-}
+      CF_ACCOUNT_5_NAME: ${CF_ACCOUNT_5_NAME:-}
+      CF_ACCOUNT_5_ID: ${CF_ACCOUNT_5_ID:-}
+      CF_ACCOUNT_5_TOKEN: ${CF_ACCOUNT_5_TOKEN:-}
+      CF_ACCOUNT_5_STANDBY: ${CF_ACCOUNT_5_STANDBY:-}
+      CF_ACCOUNT_5_DOMAINS: ${CF_ACCOUNT_5_DOMAINS:-}
+      CF_ACCOUNT_6_NAME: ${CF_ACCOUNT_6_NAME:-}
+      CF_ACCOUNT_6_ID: ${CF_ACCOUNT_6_ID:-}
+      CF_ACCOUNT_6_TOKEN: ${CF_ACCOUNT_6_TOKEN:-}
+      CF_ACCOUNT_6_STANDBY: ${CF_ACCOUNT_6_STANDBY:-}
+      CF_ACCOUNT_6_DOMAINS: ${CF_ACCOUNT_6_DOMAINS:-}
+      CF_ACCOUNT_7_NAME: ${CF_ACCOUNT_7_NAME:-}
+      CF_ACCOUNT_7_ID: ${CF_ACCOUNT_7_ID:-}
+      CF_ACCOUNT_7_TOKEN: ${CF_ACCOUNT_7_TOKEN:-}
+      CF_ACCOUNT_7_STANDBY: ${CF_ACCOUNT_7_STANDBY:-}
+      CF_ACCOUNT_7_DOMAINS: ${CF_ACCOUNT_7_DOMAINS:-}
+      CF_ACCOUNT_8_NAME: ${CF_ACCOUNT_8_NAME:-}
+      CF_ACCOUNT_8_ID: ${CF_ACCOUNT_8_ID:-}
+      CF_ACCOUNT_8_TOKEN: ${CF_ACCOUNT_8_TOKEN:-}
+      CF_ACCOUNT_8_STANDBY: ${CF_ACCOUNT_8_STANDBY:-}
+      CF_ACCOUNT_8_DOMAINS: ${CF_ACCOUNT_8_DOMAINS:-}
+      CF_ACCOUNT_9_NAME: ${CF_ACCOUNT_9_NAME:-}
+      CF_ACCOUNT_9_ID: ${CF_ACCOUNT_9_ID:-}
+      CF_ACCOUNT_9_TOKEN: ${CF_ACCOUNT_9_TOKEN:-}
+      CF_ACCOUNT_9_STANDBY: ${CF_ACCOUNT_9_STANDBY:-}
+      CF_ACCOUNT_9_DOMAINS: ${CF_ACCOUNT_9_DOMAINS:-}
+      CF_ACCOUNT_10_NAME: ${CF_ACCOUNT_10_NAME:-}
+      CF_ACCOUNT_10_ID: ${CF_ACCOUNT_10_ID:-}
+      CF_ACCOUNT_10_TOKEN: ${CF_ACCOUNT_10_TOKEN:-}
+      CF_ACCOUNT_10_STANDBY: ${CF_ACCOUNT_10_STANDBY:-}
+      CF_ACCOUNT_10_DOMAINS: ${CF_ACCOUNT_10_DOMAINS:-}
+    read_only: true
+    tmpfs:
+      - /tmp:noexec,nosuid,size=16m
     security_opt:
       - no-new-privileges:true
     cap_drop:

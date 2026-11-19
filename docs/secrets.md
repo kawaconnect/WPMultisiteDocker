@@ -50,7 +50,10 @@ Names, ids, ports, hostnames and flags stay as plain values.
   Cloudflare tokens). Compose refuses to create containers when a variable its
   files use is unavailable, rather than passing the `op://` text.
 - `scripts/cf-*.sh` resolve only `CF_*` references: from the environment
-  (cf-backup), else the wpops cache, else one `op read`.
+  (cf-backup), else the wpops cache, else one `op read`. Without a `.env` file they take every setting from the
+  environment (the cf-backup container).
+- Redis gets `REDIS_PASSWORD` as environment; its entrypoint passes `requirepass` to `redis-server` on stdin and the
+  healthcheck uses `REDISCLI_AUTH`, so the password is on no command line (`docker inspect` Args, `ps`).
 
 ### Reads per day
 
@@ -86,8 +89,10 @@ harmless, but use wpops for anything that creates or recreates a container.
 ## Tunnel connectors
 
 `docker-compose.wpops-tunnels.json` holds no tokens. Each connector has
-`TUNNEL_TOKEN: ${TUNNEL_TOKEN_<ACCOUNT>}` and cf-backup has
-`CF_ACCOUNT_n_TOKEN: ${CF_ACCOUNT_n_TOKEN}`. `wpops tunnels ensure` fetches
+`TUNNEL_TOKEN: ${TUNNEL_TOKEN_<ACCOUNT>}` and cf-backup has `CF_<NAME>: ${CF_<NAME>}` for
+each Cloudflare setting of the root `.env` (account names, ids, domains, `CF_ACCOUNT_n_TOKEN`), nothing else: the
+`.env` file itself is not mounted, so cf-backup never sees database passwords or sync keys. Its image is built
+from `docker/cf-backup` (nothing is installed at start). `wpops tunnels ensure` fetches
 the tunnel tokens from the Cloudflare API (with the account tokens from
 1Password) and passes them to `docker compose up`. Start or recreate the
 connectors only with `wpops tunnels ensure`.

@@ -32,7 +32,7 @@ echo ""
 
 # ── Validate ──────────────────────────────────────────────────────────────────
 
-check_deps
+check_deps jq curl
 load_config --read-only
 
 ACCOUNT_COUNT=$(get_account_count)

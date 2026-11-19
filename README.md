@@ -109,7 +109,7 @@ This starts mariadb, redis, wordpress, nginx, and wp-cron. Containers boot in de
 ```bash
 docker compose ps
 curl http://localhost:8080/wp-admin/install.php
-docker compose exec redis redis-cli ping
+docker compose exec redis sh -c 'REDISCLI_AUTH="$REDIS_PASSWORD" redis-cli ping'
 ```
 
 ### 6. Complete WordPress install

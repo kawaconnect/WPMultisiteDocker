@@ -4,7 +4,23 @@ Versions are git tags (`vX.Y.Z`). This repo has no build; tags mark reviewed sta
 
 ## [Unreleased]
 
+## [0.0.21] - 2026-11-19
+
 ### Security
+- Redis no longer gets its password on the command line (`--requirepass`) or in the healthcheck (`redis-cli -a`),
+  where it showed in `docker inspect` and in the host's process list on every healthcheck. The password is an
+  environment variable of the redis container: its entrypoint passes `requirepass` to `redis-server` on stdin
+  (the stdin config includes `config/redis/redis.conf`) and the healthcheck uses `REDISCLI_AUTH`. Stack template and
+  root `docker-compose.yml`. Recreate each stack's redis container to apply it (`wpops stack compose <stack> up -d redis`).
+- Root `docker-compose.yml`: `.env` values are no longer pasted into PHP (`WORDPRESS_CONFIG_EXTRA`), where a quote
+  broke `wp-config.php` or injected code. PHP reads them with `getenv()`, as in the stack template; compose passes
+  `WP_MODE`, `WP_SUBDOMAIN_INSTALL`, `WP_DOMAIN_CURRENT_SITE`, `WP_SUNRISE` and `REDIS_*` as environment. Same for
+  `WP_MODE` and `WP_DOMAIN` in `docker-compose.instance.yml`.
+- cf-backup no longer runs `apk add` as root at every start and no longer has the node's `.env` mounted. Its image is
+  built once from `docker/cf-backup/Dockerfile` (pinned Alpine with bash, curl, jq; the tag follows the Dockerfile,
+  so a change builds a new image at the next `wpops tunnels ensure`). It gets only the `CF_*` settings as environment
+  and runs without capabilities on a read-only root (wpops 0.2.13). `scripts/cf-common.sh` takes its settings from
+  the environment when there is no `.env`, and `cf-backup.sh` needs only jq and curl.
 - docs/wpops-design.md: the inventory example uses a documentation address (RFC 5737) and placeholder tunnel ids throughout.
 - `install-agent.sh` accepts only an IP address for `--bind` (the value ends up on the unit's command line) and says so when it is not run as root.
 

@@ -432,7 +432,10 @@ class DeploymentTests(unittest.TestCase):
             doc=json.loads(r.stdout)['services']
             self.assertEqual(doc['wordpress']['environment']['WORDPRESS_CONFIG_EXTRA'],
                              doc['wp-cron']['environment']['WORDPRESS_CONFIG_EXTRA'])
-            self.assertIn("if ('"+mode+"' === 'multisite')",doc['wordpress']['environment']['WORDPRESS_CONFIG_EXTRA'])
+            # The mode reaches PHP through the environment, not pasted into the source.
+            self.assertIn("getenv('WP_MODE')",doc['wordpress']['environment']['WORDPRESS_CONFIG_EXTRA'])
+            self.assertEqual(doc['wordpress']['environment']['WP_MODE'],mode)
+            self.assertEqual(doc['wp-cron']['environment']['WP_MODE'],mode)
 
     def test_agent_accepts_backup_profile_names(self):
         from wpops.agent import Agent
@@ -929,6 +932,39 @@ done
         r=subprocess.run(['docker','compose','config','--format','json'],cwd=result['path'],env=env,text=True,capture_output=True)
         self.assertEqual(r.returncode,0,r.stderr)
         self.assertIn('KILL',json.loads(r.stdout)['services']['wordpress']['cap_add'])
+
+    @unittest.skipUnless(shutil.which('docker'), 'needs the Docker CLI with Compose v2 (no daemon)')
+    def test_env_values_stay_out_of_php_source_and_redis_command_line(self):
+        tricky="x'); system('id'); //"
+        pw='redis-"pass#word\\x'
+        env={**os.environ,'WP_DOMAIN_CURRENT_SITE':tricky,'REDIS_HOST':tricky,'REDIS_PASSWORD':pw}
+        r=subprocess.run(['docker','compose','-f',str(ROOT/'docker-compose.yml'),'--env-file',str(ROOT/'.env.example'),
+                          'config','--format','json'],env=env,capture_output=True,text=True)
+        self.assertEqual(r.returncode,0,r.stderr)
+        doc=json.loads(r.stdout)['services']
+        for svc in ('wordpress','wp-cron'):
+            e=doc[svc]['environment']
+            self.assertNotIn(tricky,e['WORDPRESS_CONFIG_EXTRA'])
+            self.assertNotIn('${',e['WORDPRESS_CONFIG_EXTRA'])
+            self.assertEqual(e['WP_DOMAIN_CURRENT_SITE'],tricky)
+            self.assertEqual(e['REDIS_PASSWORD'],pw)
+        redis=doc['redis']
+        visible=json.dumps([redis.get('command'),redis.get('entrypoint'),redis.get('healthcheck')])
+        self.assertNotIn('pass#word',visible)
+        self.assertEqual(redis['environment']['REDIS_PASSWORD'],pw)
+        self.assertNotIn('pass#word',json.dumps(doc['cf-backup']))
+        self.assertFalse(any('.env' in str(v) for v in doc['cf-backup']['volumes']))
+        self.assertTrue(doc['cf-backup']['read_only'])
+        # The managed stack template.
+        result=provision.create('one','single','one.example',18081)
+        stack_pw=config._parse_env(Path(result['path'])/'.env')['REDIS_PASSWORD']
+        senv={k:v for k,v in os.environ.items() if not k.startswith('COMPOSE_') and k!='WPOPS_REPO_DIR'}
+        r=subprocess.run(['docker','compose','config','--format','json'],cwd=result['path'],env=senv,text=True,capture_output=True)
+        self.assertEqual(r.returncode,0,r.stderr)
+        redis=json.loads(r.stdout)['services']['redis']
+        self.assertNotIn(stack_pw,json.dumps([redis.get('command'),redis.get('entrypoint'),redis.get('healthcheck')]))
+        self.assertEqual(redis['environment']['REDIS_PASSWORD'],stack_pw)
+        self.assertIn('redis-server -',redis['entrypoint'][-1])
 
     def _php(self, code):
         php=os.environ.get('WPOPS_TEST_PHP') or shutil.which('php')

@@ -8,8 +8,8 @@
     joined to every configured ingress network
 
 The compose file holds no secrets. Each connector reads TUNNEL_TOKEN from
-${TUNNEL_TOKEN_<ACCOUNT>} and cf-backup its Cloudflare API tokens from
-${CF_ACCOUNT_n_TOKEN}; `ensure` fetches the tunnel tokens from the Cloudflare API
+${TUNNEL_TOKEN_<ACCOUNT>} and cf-backup its CF_* settings (with the API tokens
+${CF_ACCOUNT_n_TOKEN}); `ensure` fetches the tunnel tokens from the Cloudflare API
 and passes all of them as process environment to `docker compose up`.
 Start or recreate the connectors with `wpops tunnels ensure`, never with a
 plain `docker compose up` (it would start them without tokens).
@@ -101,21 +101,7 @@ def ensure(start: bool = True, log=print) -> dict[str, Any]:
     services = {}
     for name in sorted([n for n, _ in tokens] + kept):
         services[f"cloudflared-{name}"] = connector_service(name, list(networks), protocol)
-    services["cf-backup"] = {
-        # Not on the edge network: only connectors may send CF-Connecting-IP there.
-        "image": "alpine:3.23", "restart": "unless-stopped",
-        "volumes": [f"{REPO_DIR}/scripts:/app/scripts:ro", f"{REPO_DIR}/config:/app/config:ro",
-                    f"{REPO_DIR}/data/cloudflare/backups:/app/data/cloudflare/backups",
-                    f"{REPO_DIR}/.env:/app/.env:ro"],
-        # .env holds 1Password references; cf-common.sh keeps these resolved values.
-        "environment": {f"CF_ACCOUNT_{a.index}_TOKEN": "${CF_ACCOUNT_%d_TOKEN}" % a.index
-                        for a in cf_accounts(env).values()},
-        "entrypoint": ["/bin/sh", "-c"],
-        "command": ["apk add --no-cache bash curl jq openssl && "
-                    "ln -sf /bin/true /usr/local/bin/docker && "
-                    "while true; do bash /app/scripts/cf-backup.sh; sleep 21600; done"],
-        "logging": {"driver": "json-file", "options": {"max-size": "10m", "max-file": "3"}},
-    }
+    services["cf-backup"] = cf_backup_service(env)
     state.write_private_text(compose, json.dumps({"services": services, "networks": networks}, indent=2)+"\n")
     log(f"wrote {compose} ({len(tokens)} connector(s), no secrets in the file)")
     if start and tokens:
@@ -163,6 +149,46 @@ def connector_service(account: str, networks: list[str], protocol: str = "") -> 
     }
 
 
+def cf_backup_dir() -> Path:
+    return REPO_DIR / "docker" / "cf-backup"
+
+
+def cf_backup_image() -> str:
+    """Local image tag of the cf-backup build: changes with its Dockerfile, so
+    `docker compose up` builds a new image only when the Dockerfile changed."""
+    import hashlib
+    try:
+        digest = hashlib.sha256((cf_backup_dir() / "Dockerfile").read_bytes()).hexdigest()[:12]
+    except OSError:
+        digest = "missing"
+    return f"wpops-cf-backup:{digest}"
+
+
+def cf_backup_service(env: dict[str, str]) -> dict[str, Any]:
+    """Compose service for the Cloudflare DNS/tunnel backup. Holds no secrets.
+
+    Built once from docker/cf-backup (nothing installed at start), no
+    capabilities, read-only root. It gets only the CF_* settings, interpolated
+    from the environment of `docker compose up` (see compose_env), never the
+    node's .env with its database passwords and sync keys. Not on the edge
+    network: only connectors may send CF-Connecting-IP there."""
+    keys = sorted(k for k in env if k.startswith("CF_") and k.replace("_", "").isalnum() and k.isupper())
+    return {
+        "build": {"context": str(cf_backup_dir())},
+        "image": cf_backup_image(),
+        "restart": "unless-stopped",
+        "volumes": [f"{REPO_DIR}/scripts:/app/scripts:ro", f"{REPO_DIR}/config:/app/config:ro",
+                    f"{REPO_DIR}/data/cloudflare/backups:/app/data/cloudflare/backups"],
+        "environment": {k: "${%s}" % k for k in keys},
+        "read_only": True,
+        "tmpfs": ["/tmp:noexec,nosuid,size=16m"],
+        "cap_drop": ["ALL"],
+        "security_opt": ["no-new-privileges:true"],
+        "logging": {"driver": "json-file", "options": {"max-size": "10m", "max-file": "3"}},
+        "deploy": {"resources": {"limits": {"memory": "128M"}}},
+    }
+
+
 def token_var(account: str) -> str:
     """Compose variable that carries an account's tunnel token: TUNNEL_TOKEN_<ACCOUNT>."""
     return "TUNNEL_TOKEN_" + "".join(ch if ch.isalnum() else "_" for ch in account.upper())
@@ -172,6 +198,10 @@ def compose_env(tokens: list[tuple[str, str]], env: dict[str, str]) -> dict[str,
     """Process environment for `docker compose up` of the connector project:
     the tunnel tokens and the resolved Cloudflare API tokens for cf-backup."""
     out = {token_var(name): token for name, token in tokens}
+    # Every CF_* setting cf-backup reads (account names, ids, domains, tokens).
+    for k, v in env.items():
+        if k.startswith("CF_") and k.replace("_", "").isalnum() and k.isupper():
+            out[k] = v
     for a in cf_accounts(env).values():
         out[f"CF_ACCOUNT_{a.index}_TOKEN"] = a.token
     return out
