@@ -40,12 +40,31 @@ Docker-based WordPress Multisite with Nginx reverse proxy, MariaDB, Redis object
 | **wp-cron** | wordpress:cli | Runs WP cron every minute via WP-CLI |
 | **cloudflared-\*** | cloudflare/cloudflared | Tunnel connectors (only start with `--profile tunnels`) |
 
+## Requirements
+
+- Linux host with Docker Engine and the Compose plugin v2.20 or newer
+- `bash`, `curl`, `jq` and `openssl` for the `scripts/cf-*.sh` Cloudflare scripts
+- Python 3.10 or newer for `wpops` (standard library only, nothing to install)
+- For tunnels and failover: a Cloudflare account that holds the zones, and an API
+  token per account ([docs/cloudflare-token-setup.md](docs/cloudflare-token-setup.md))
+- Optional: the 1Password CLI (`op`) if `.env` holds `op://` references
+  ([docs/secrets.md](docs/secrets.md)), and an Authentik server for the admin gate
+  ([docs/admin-gate.md](docs/admin-gate.md))
+
+Which guide to follow:
+
+| You want | Read |
+|---|---|
+| One stack from the root `docker-compose.yml` (this page) | Quick Start below |
+| Several independent sites or networks on one node | [docs/deployments.md](docs/deployments.md) |
+| Failover, backup pulls and restores between nodes | "wpops" below and [docs/wpops-design.md](docs/wpops-design.md) |
+
 ## Quick Start
 
 ### 1. Clone and configure
 
 ```bash
-git clone https://github.com/Deenyoro/WPMultisiteDocker.git /opt/docker/wordpressmultisite
+git clone https://github.com/kawaconnect/WPMultisiteDocker.git /opt/docker/wordpressmultisite
 cd /opt/docker/wordpressmultisite
 ```
 
@@ -56,10 +75,16 @@ cp .env.example .env
 vi .env
 ```
 
-At minimum, change these:
+At minimum, change these (`.env.example` ships `changeme_...` placeholders, never start
+a stack with them; `openssl rand -hex 24` gives a suitable value):
 - `MYSQL_ROOT_PASSWORD`: strong random password
 - `MYSQL_PASSWORD`: strong random password
 - `WORDPRESS_DB_PASSWORD`: must match `MYSQL_PASSWORD`
+- `REDIS_PASSWORD`: strong random password
+
+Use letters and digits only for these values: they are substituted into the Compose
+file and the generated `wp-config.php`, where quotes, `$` and spaces break.
+Keep the file private: `chmod 600 .env`.
 - `WP_DOMAIN_CURRENT_SITE`: your primary domain (default: `example.com`)
 - `CF_STANDBY_DOMAIN`: your standby domain
 - `CF_CLOUD_IP`: your production IP
@@ -89,7 +114,11 @@ docker compose exec redis redis-cli ping
 
 ### 6. Complete WordPress install
 
-Visit `http://your-server:8080` and complete the WordPress installation wizard.
+Nginx is published on `127.0.0.1:8080` only, so the port is not reachable from other
+machines. Open the installation wizard on the host itself, through an SSH forward
+(`ssh -L 8080:127.0.0.1:8080 <host>`, then `http://localhost:8080`), or through the
+standby tunnel once it is set up (next section). Finish the wizard promptly: until it
+is done, anyone who can reach the site can claim the admin account.
 
 ## Cloudflare Tunnels
 
@@ -227,7 +256,7 @@ from its HTTP API (`wpops serve`, published through the node's own tunnel as
 ```bash
 scripts/wpops/bin/wpops setup --node node2        # config skeletons, host-alias plugin into every stack
 scripts/wpops/bin/wpops token rotate                # agent bearer token (give it to the bot: /wp node add)
-scripts/wpops/install-agent.sh --bind 172.19.0.1   # systemd unit; bind the docker gateway so cloudflared reaches it
+sudo scripts/wpops/install-agent.sh --bind 172.19.0.1   # systemd unit; bind the docker gateway so cloudflared reaches it
 wpops tunnels ensure                                # idle tunnel per Cloudflare account + docker-compose.tunnels.yml
 wpops secrets check                                 # .env secrets are 1Password op:// references that resolve (docs/secrets.md)
 wpops gate status                                   # admin gate: wp-admin and wp-login behind Authentik sign-in (docs/admin-gate.md)
@@ -419,6 +448,36 @@ Nginx blocks direct access to:
 
 Security headers: `X-Frame-Options: SAMEORIGIN`, `X-Content-Type-Options: nosniff`, `Referrer-Policy: strict-origin-when-cross-origin`. Server version hidden (`server_tokens off`).
 
+What the stack does not do for you:
+
+- The `.env` file holds database, Redis and Cloudflare credentials in plain text unless
+  you use 1Password references ([docs/secrets.md](docs/secrets.md)). Keep it `0600` and
+  out of backups that leave the host.
+- TLS ends at Cloudflare. Nginx speaks plain HTTP on loopback and to the tunnel
+  connectors; do not publish port 8080 on a public interface.
+- The wpops agent runs as root (it drives Docker) and is protected by one bearer token.
+  Bind it to loopback and the Docker gateway only, publish it through the tunnel, set
+  `agent.trusted_proxies`, and rotate the token (`wpops token rotate`) when someone who
+  had it leaves.
+- WordPress, plugin and theme updates are yours to run. Image tags are pinned in the
+  Compose files; update them deliberately.
+
+## Troubleshooting
+
+| Symptom | Check |
+|---|---|
+| `docker compose up` stops at `mariadb` unhealthy | `docker compose logs mariadb`; a changed `MYSQL_*` password does not apply to an existing `data/mysql`, the first start set it |
+| WordPress shows "Error establishing a database connection" | `WORDPRESS_DB_PASSWORD` must equal `MYSQL_PASSWORD`; `docker compose ps` must show mariadb healthy |
+| `curl http://localhost:8080/` is refused or gives 502 | the `wordpress` container is not healthy yet: `docker compose logs wordpress` |
+| A `cf-*.sh` script says a token is invalid | the message names the account; compare its token with [docs/cloudflare-token-setup.md](docs/cloudflare-token-setup.md) |
+| `wpops` says `config/inventory.json not found` | run `wpops setup --node <name>` first ([docs/deployments.md](docs/deployments.md)) |
+| Agent answers 401 | the token was rotated, or was never created: `wpops token rotate` and give the new one to the client |
+| Agent answers 429 "too many failed authentications" | ten bad tokens from one address in ten minutes block that address for the rest of the window; behind the tunnel set `agent.trusted_proxies` so the limit is per caller |
+| Admin pages answer 500 on a gated stack | the host has no forward-auth provider yet: `wpops gate hosts` ([docs/admin-gate.md](docs/admin-gate.md)) |
+
+Logs: `docker compose logs <service>`, `logs/nginx/`, `journalctl -u wpops-agent`,
+`wpops jobs list` and `wpops jobs tail <id>` for pulls, restores and failovers.
+
 ## Resource Limits
 
 | Service | Memory Limit |
@@ -458,8 +517,8 @@ docker compose --profile tunnels stop
 # Backup DNS + tunnel configs
 ./scripts/cf-backup.sh
 
-# Run WP-CLI command
-docker compose exec wordpress wp plugin list --allow-root
+# Run WP-CLI command (WP-CLI lives in the wp-cron container and runs as www-data)
+docker compose exec wp-cron wp plugin list
 
 # Access MariaDB
 docker compose exec mariadb mariadb -u wordpress -p wordpress
