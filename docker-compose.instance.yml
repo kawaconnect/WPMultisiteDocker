@@ -62,7 +62,7 @@ networks:
 
 services:
   mariadb:
-    image: mariadb:11.4.4
+    image: mariadb:11.8.9
     restart: "no"
     networks: [backend]
     volumes:
@@ -122,7 +122,7 @@ services:
           memory: 768M
 
   nginx:
-    image: nginx:1.29.8-alpine
+    image: nginx:1.31.9-alpine
     restart: "no"
     networks:
       frontend: {}
