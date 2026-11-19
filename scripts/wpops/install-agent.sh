@@ -8,13 +8,26 @@
 set -euo pipefail
 HERE="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
 REPO="$(cd "$HERE/../.." && pwd)"
+usage() {
+  echo "usage: $0 [--bind ADDRESS]..."
+  echo "  Installs and starts wpops-agent.service and wpops-secrets.service (run as root)."
+  echo "  --bind ADDRESS  extra IP address the agent listens on, besides agent.bind in"
+  echo "                  config/wpops.json (e.g. the docker gateway 172.19.0.1)"
+}
 BIND_ARGS=""
 while [ $# -gt 0 ]; do
   case "$1" in
-    --bind) BIND_ARGS="$BIND_ARGS --bind $2"; shift 2 ;;
-    *) echo "unknown arg $1" >&2; exit 2 ;;
+    -h|--help) usage; exit 0 ;;
+    --bind)
+      # Written to /etc/default/wpops-agent and expanded on the unit's command line.
+      [[ "${2:-}" =~ ^[0-9A-Fa-f:.]+$ ]] || { echo "--bind needs an IP address" >&2; usage >&2; exit 2; }
+      BIND_ARGS="$BIND_ARGS --bind $2"; shift 2 ;;
+    *) echo "unknown argument: $1" >&2; usage >&2; exit 2 ;;
   esac
 done
+[ "$(id -u)" -eq 0 ] || { echo "run as root: this writes systemd units and /usr/local/bin/wpops" >&2; exit 1; }
+[ -f "$REPO/state/agent-token.sha256" ] \
+  || echo "note: no agent token yet; the agent will not start until you run: wpops token rotate" >&2
 sed "s|/opt/docker/wordpressmultisite|$REPO|g" "$HERE/wpops-agent.service" > /etc/systemd/system/wpops-agent.service
 sed "s|/opt/docker/wordpressmultisite|$REPO|g" "$HERE/wpops-secrets.service" > /etc/systemd/system/wpops-secrets.service
 printf 'WPOPS_BIND_ARGS=%s\n' "$BIND_ARGS" > /etc/default/wpops-agent

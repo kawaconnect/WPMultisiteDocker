@@ -2,6 +2,18 @@
 
 Versions are git tags (`vX.Y.Z`). This repo has no build; tags mark reviewed states of the stack and scripts.
 
+## [Unreleased]
+
+### Security
+- docs/wpops-design.md: the inventory example uses a documentation address (RFC 5737) and placeholder tunnel ids throughout.
+- `install-agent.sh` accepts only an IP address for `--bind` (the value ends up on the unit's command line) and says so when it is not run as root.
+
+### Changed
+- `wpops ... --help` describes every option and the `stack up | stop | list | compose` commands.
+- `install-agent.sh -h` prints usage; it notes when no agent token exists yet.
+- README: requirements, which guide to read, correct clone URL, how to reach the installer on the loopback port, WP-CLI through the `wp-cron` container (the FPM image has none), what the stack leaves to the operator, troubleshooting. `.env.example` says how to generate the passwords and which characters to avoid.
+- docs/wpops-design.md names the real config files (`config/*.json`) and the Python version the tests pass on (3.10).
+
 ## [0.0.20] - 2026-11-18
 
 ### Added
