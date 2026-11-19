@@ -35,7 +35,7 @@ over the LAN or over the internet.
 └────────────────────────────┘                              └─────────────────────────────┘
 ```
 
-### 2.1 Node agent (`scripts/wpops/`, Python 3.11+, stdlib only)
+### 2.1 Node agent (`scripts/wpops/`, Python 3.10+, stdlib only)
 
 Installed on every docker node. One code base, two entry points:
 
@@ -50,9 +50,10 @@ Installed on every docker node. One code base, two entry points:
 Both paths call the same Python functions, so the bot behaves identically
 whether it reaches a node by LAN SSH or by internet HTTPS.
 
-Config lives in `config/wpops.yaml` (node) and `config/inventory.yaml`
+Config lives in `config/wpops.json` (node) and `config/inventory.json`
 (sites and origins, shared between all nodes and the bot; the bot caches a
-copy). Secrets stay in `.env` (Cloudflare tokens, SMTP) and are never
+copy). The examples below are written as YAML to keep them short; the files
+themselves are JSON (`config/*.example.json`). Secrets stay in `.env` (Cloudflare tokens, SMTP) and are never
 returned by the API.
 
 Sub-commands (all idempotent, all with `--dry-run` where they change
@@ -73,7 +74,7 @@ anything, all JSON-capable):
 | `notify test` | Sends the configured e-mail/webhook notification. |
 | `token rotate` / `serve` | Agent management. |
 
-### 2.2 Inventory (`config/inventory.yaml`)
+### 2.2 Inventory (`config/inventory.json`)
 
 ```yaml
 origins:
@@ -165,7 +166,7 @@ sites named inline; `/sg-monitors` still shows every site.
 Backup events: the bot polls each node's `jobs` and posts "backup pulled"
 with size and site count, and e-mails the same through the SMTP already
 configured in the bot (`/setup smtp`). The agent can also e-mail directly
-(`notify.smtp` in `wpops.yaml`) for nodes that run without the bot.
+(`notify.smtp` in `wpops.json`) for nodes that run without the bot.
 
 ### 2.5 Uptime Kuma
 
