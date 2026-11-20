@@ -4,6 +4,10 @@ Versions are git tags (`vX.Y.Z`). This repo has no build; tags mark reviewed sta
 
 ## [Unreleased]
 
+### Docs
+
+- README: example screenshot in `docs/images/` (example data only).
+
 ## [0.0.21] - 2026-11-19
 
 ### Security
