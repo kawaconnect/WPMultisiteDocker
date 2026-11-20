@@ -273,6 +273,8 @@ wpops site add <slug> --stack S [--blog-id N] / site remove <slug> --yes      # 
 wpops siteguard status / siteguard enroll [STACK]   # per-stack SiteGuard health keys held by the agent
 ```
 
+![wpops status and wpops failover plan on a node: stack health, an active override, tunnels, backups, and a plan with one refused site](docs/images/wpops-cli.png)
+
 **Site registry.** The agent tracks every WordPress deployment on the node:
 each single-site stack and each blog of every multisite stack, mapped in the
 inventory or not. Per site it reports slug, domains, stack and mode, health
