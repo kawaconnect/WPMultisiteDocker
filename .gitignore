@@ -29,6 +29,8 @@ plugindev/
 *.png
 *.jpg
 *.jpeg
+# ...except the README pictures
+!docs/images/*.png
 
 # Node / Playwright dependencies (regenerate with `npm install`)
 node_modules/
