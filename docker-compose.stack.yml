@@ -59,7 +59,7 @@ services:
         limits:
           memory: 1G
   redis:
-    image: redis:8.10-alpine
+    image: redis:8.12-alpine
     restart: unless-stopped
     networks:
     - backend
@@ -169,7 +169,7 @@ services:
         limits:
           memory: 1G
   nginx:
-    image: nginx:1.31.9-alpine
+    image: nginx:1.31.10-alpine
     restart: unless-stopped
     networks:
       frontend: {}
